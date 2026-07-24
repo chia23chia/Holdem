@@ -1,0 +1,133 @@
+// Prisma schema — single source of truth for Holdem DB.
+// Web + Server both import PrismaClient from @holdem/db.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================
+// Auth.js required tables (User / Account / Session / VerificationToken)
+// Session table kept even under JWT strategy in case we switch later.
+// ============================================================
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model User {
+  id            String    @id @default(cuid())
+  name          String?
+  nickname      String?   @unique
+  email         String?   @unique
+  emailVerified DateTime?
+  image         String?
+
+  // Domain columns
+  chipsBalance Int      @default(10000)
+  createdAt    DateTime @default(now())
+
+  accounts    Account[]
+  sessions    Session[]
+  ownedRooms  Room[]       @relation("RoomOwner")
+  memberships Membership[]
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+// ============================================================
+// Domain: Rooms
+// ============================================================
+enum RoomStatus {
+  waiting
+  playing
+  closed
+}
+
+model Room {
+  id             String     @id @default(cuid())
+  name           String
+  ownerId        String
+  maxPlayers     Int        @default(9)
+  smallBlind     Int        @default(5)
+  bigBlind       Int        @default(10)
+  buyIn          Int        @default(1000)
+  status         RoomStatus @default(waiting)
+  // Session (Phase 2). NULL = unlimited (no auto-close by time).
+  sessionMinutes Int?
+  sessionEndsAt  DateTime?
+  // Per-player action time budget applied to every hand in this room.
+  // Chosen at room create, then locked for the whole session.
+  actionTimeoutSeconds Int   @default(30)
+  createdAt      DateTime   @default(now())
+
+  owner       User         @relation("RoomOwner", fields: [ownerId], references: [id])
+  memberships Membership[]
+  handLogs    HandLog[]
+
+  @@index([status, createdAt])
+}
+
+model Membership {
+  id           String   @id @default(cuid())
+  userId       String
+  roomId       String
+  seat         Int
+  chipsAtTable Int
+  joinedAt     DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  room Room @relation(fields: [roomId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, roomId])
+  @@unique([roomId, seat])
+}
+
+// One row per completed hand. `data` is a jsonb blob shaped like `HandLogData`
+// in @holdem/shared. Voluntary post-hand reveals update `data.endResult.revealedHoles`.
+model HandLog {
+  id         String   @id @default(cuid())
+  roomId     String
+  handNumber Int      // Sequential within a room, starts at 1
+  startedAt  DateTime
+  endedAt    DateTime @default(now())
+  data       Json
+
+  room Room @relation(fields: [roomId], references: [id], onDelete: Cascade)
+
+  @@unique([roomId, handNumber])
+  @@index([roomId, handNumber])
+}

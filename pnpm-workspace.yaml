@@ -1,0 +1,14 @@
+packages:
+  - web
+  - server
+  - shared
+  - db
+
+# pnpm 11+ supply-chain policy: postinstall build scripts require explicit approval.
+allowBuilds:
+  esbuild: true          # Next.js bundler (native binary)
+  unrs-resolver: true    # ESLint plugin module resolver (native binary)
+  '@prisma/client': true # Prisma client generator
+  '@prisma/engines': true
+  prisma: true
+  bcrypt: false
