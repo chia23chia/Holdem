@@ -1580,6 +1580,8 @@ function phaseLabel(phase: HandStatePublic['phase']): string {
       return '河牌(River)';
     case 'showdown':
       return '攤牌(Showdown)';
+    case 'ended':
+      return '已結束';
   }
 }
 
