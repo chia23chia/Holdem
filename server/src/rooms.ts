@@ -138,9 +138,27 @@ export async function seatUser(
   });
 }
 
-// Rebuy: add another buyIn to this seat's stack + cumulative totalBuyIn.
-// Play-money model — no chipsBalance deduction. Caller decides whether to
-// apply immediately (between hands) or defer via in-memory queue (mid-hand).
+// Rounds down to the leading digit: 1999 -> 1000, 601 -> 600, 42 -> 40.
+// Used to cap rebuys below the table's chip leader (see rebuyChips).
+function roundToLeadingDigit(n: number): number {
+  if (n <= 0) return 0;
+  const magnitude = 10 ** Math.floor(Math.log10(n));
+  return Math.floor(n / magnitude) * magnitude;
+}
+
+// Rebuy rules (play-money, no chipsBalance deduction):
+//  - Only allowed once a seat's chips hit exactly 0 — no topping up a
+//    non-zero stack, however small.
+//  - Amount is capped so a rebuy can never hand out more than the table's
+//    current chip leader: if the leader's stack exceeds the room's buyIn,
+//    the cap rounds DOWN to the leader's leading digit (1999 -> 1000); if
+//    the leader is at or below buyIn (e.g. the original leader stood up and
+//    left with their stack), the cap is just buyIn — which makes this
+//    rebuying player the new leader.
+// Caller decides whether to apply immediately (between hands) or defer via
+// in-memory queue (mid-hand); either way this is the single authoritative
+// check, so a queued rebuy that's no longer eligible by the time the hand
+// ends (e.g. the player didn't actually bust) safely no-ops here.
 export async function rebuyChips(
   userId: string,
   roomId: string,
@@ -157,14 +175,26 @@ export async function rebuyChips(
       where: { userId_roomId: { userId, roomId } },
     });
     if (!membership) return { ok: false, error: '你不在此房間' };
+    if (membership.chipsAtTable > 0) {
+      return { ok: false, error: '籌碼歸零才能加碼' };
+    }
+
+    const { _max } = await tx.membership.aggregate({
+      where: { roomId },
+      _max: { chipsAtTable: true },
+    });
+    const leader = _max.chipsAtTable ?? 0;
+    const amount =
+      leader > room.buyIn ? roundToLeadingDigit(leader) : room.buyIn;
+
     const updated = await tx.membership.update({
       where: { id: membership.id },
       data: {
-        chipsAtTable: { increment: room.buyIn },
-        totalBuyIn: { increment: room.buyIn },
+        chipsAtTable: { increment: amount },
+        totalBuyIn: { increment: amount },
       },
     });
-    return { ok: true, amount: room.buyIn, chipsAtTable: updated.chipsAtTable };
+    return { ok: true, amount, chipsAtTable: updated.chipsAtTable };
   });
 }
 

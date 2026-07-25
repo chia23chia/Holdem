@@ -109,9 +109,10 @@ const autoActionTimers = new Map<string, NodeJS.Timeout>();
 // voluntary reveal fires after the hand was already persisted.
 const lastHandLogIdByRoom = new Map<string, string>();
 
-// Rebuy queue: mid-hand rebuy requests wait here. Applied to Membership.
+// Rebuy queue: mid-hand rebuy requests wait here. Applied to Membership
 // after the hand ends, before the next one starts. Value = number of pending
-// rebuys (each = room.buyIn worth of chips + totalBuyIn).
+// rebuy attempts (each resolved against the zero-chips + chip-leader-cap
+// rule in `rebuyChips` at apply time, so a stale request just no-ops).
 const pendingRebuysByRoom = new Map<string, Map<string, number>>();
 
 function queuePendingRebuy(roomId: string, userId: string): void {
@@ -240,6 +241,72 @@ async function broadcastAfterAction(
   rescheduleAutoAction(roomId);
 }
 
+type StartHandOutcome =
+  | { ok: true }
+  | { ok: false; error: string; needsRebuy?: true };
+
+// Core hand-start logic: validates funded-player count, deals a new hand,
+// and broadcasts it. Shared by the owner-triggered `game:start` handler and
+// the auto-resume-after-rebuy path below, so a room doesn't need the owner
+// to manually retry once a busted player has rebought in.
+async function startHandForRoom(roomId: string): Promise<StartHandOutcome> {
+  const detail = await getRoomDetail(roomId);
+  if (!detail) return { ok: false, error: '房間不存在' };
+  if (hasActiveHand(roomId)) return { ok: false, error: '已在牌局中' };
+  // Players with 0 chips sit out (need a rebuy) — they aren't dealt in,
+  // otherwise they'd be stuck unable to check or call every hand.
+  const playersWithChips = detail.seats.filter((s) => s.chipsAtTable > 0);
+  if (playersWithChips.length < 2) {
+    return {
+      ok: false,
+      error: '需要至少 2 位有籌碼的玩家(0 籌碼玩家請先加值)',
+      needsRebuy: true,
+    };
+  }
+
+  // Wipe any prior ended-hand state before starting fresh.
+  endHand(roomId);
+  // Determine the next hand number now (server authoritative) so the
+  // HandStatePublic broadcast and the eventual HandLog write agree.
+  const priorCount = await countHandLogs(roomId);
+  const hand = startHand(
+    roomId,
+    playersWithChips.map((s) => ({
+      seat: s.seat,
+      userId: s.userId,
+      name: s.name,
+      chipsAtTable: s.chipsAtTable,
+    })),
+    detail.smallBlind,
+    detail.bigBlind,
+    detail.actionTimeoutSeconds,
+    priorCount + 1,
+  );
+
+  // Flip room to 'playing' — blocks ownerCloseRoom until the hand ends.
+  await setRoomStatus(roomId, 'playing');
+  // First hand ever also sets sessionEndsAt.
+  await startSessionIfNeeded(roomId);
+  // Broadcast for both status flip AND (possibly) session start.
+  await broadcastRoomDetail(roomId);
+
+  // Public state → all subscribers (players + spectators).
+  io.to(roomChannel(roomId)).emit('game:started', toPublicState(hand));
+
+  // Private hole cards → each seated player's socket(s) only.
+  const roomSockets = await io.in(roomChannel(roomId)).fetchSockets();
+  for (const rs of roomSockets) {
+    const rsUser = rs.data.user as { userId: string } | undefined;
+    if (!rsUser) continue;
+    const priv = getPrivateFor(hand, rsUser.userId);
+    if (priv) rs.emit('game:hole', priv);
+  }
+
+  // Start the auto-action timer for the first player's turn.
+  rescheduleAutoAction(roomId);
+  return { ok: true };
+}
+
 io.on('connection', (socket) => {
   const user = getUser(socket);
   console.log(`[connect] ${socket.id} user=${user.userId} name=${user.name}`);
@@ -346,8 +413,9 @@ io.on('connection', (socket) => {
     io.to(LOBBY_ROOM).emit('lobby:room-removed', { roomId });
   });
 
-  // Rebuy: +room.buyIn to the caller's chipsAtTable + totalBuyIn.
-  // Mid-hand → queued for hand end. Between-hand → applied immediately.
+  // Rebuy: only allowed once chipsAtTable hits 0; amount is capped at the
+  // chip leader's stack (see rebuyChips for the exact rule). Mid-hand →
+  // queued for hand end. Between-hand → applied immediately.
   socket.on('room:rebuy', async ({ roomId }, cb) => {
     if (hasActiveHand(roomId)) {
       queuePendingRebuy(roomId, user.userId);
@@ -358,6 +426,14 @@ io.on('connection', (socket) => {
     if (!outcome.ok) return cb({ ok: false, error: outcome.error });
     cb({ ok: true });
     await broadcastRoomDetail(roomId);
+
+    // A between-hand rebuy might be exactly what was blocking the next hand
+    // from starting (e.g. a busted-out player topping back up). Auto-resume
+    // instead of making the owner click "開始牌局" again. Gated on at least
+    // one prior hand so this never hijacks the room's very first hand start,
+    // which the owner should still trigger explicitly.
+    const priorHands = await countHandLogs(roomId);
+    if (priorHands > 0) await startHandForRoom(roomId);
   });
 
   // ---- Game (Phase 2) ----
@@ -367,52 +443,13 @@ io.on('connection', (socket) => {
     if (detail.ownerId !== user.userId) {
       return cb({ ok: false, error: '只有房主可以開牌局' });
     }
-    if (hasActiveHand(roomId)) return cb({ ok: false, error: '已在牌局中' });
-    if (detail.seats.length < 2) {
-      return cb({ ok: false, error: '需要至少 2 位玩家' });
+    const outcome = await startHandForRoom(roomId);
+    cb(outcome);
+    // Let everyone (not just the owner) know why nothing's happening —
+    // the busted-out player specifically needs to see this to know to rebuy.
+    if (!outcome.ok && outcome.needsRebuy) {
+      io.to(roomChannel(roomId)).emit('room:error', { message: outcome.error });
     }
-
-    // Wipe any prior ended-hand state before starting fresh.
-    endHand(roomId);
-    // Determine the next hand number now (server authoritative) so the
-    // HandStatePublic broadcast and the eventual HandLog write agree.
-    const priorCount = await countHandLogs(roomId);
-    const hand = startHand(
-      roomId,
-      detail.seats.map((s) => ({
-        seat: s.seat,
-        userId: s.userId,
-        name: s.name,
-        chipsAtTable: s.chipsAtTable,
-      })),
-      detail.smallBlind,
-      detail.bigBlind,
-      detail.actionTimeoutSeconds,
-      priorCount + 1,
-    );
-    cb({ ok: true });
-
-    // Flip room to 'playing' — blocks ownerCloseRoom until the hand ends.
-    await setRoomStatus(roomId, 'playing');
-    // First hand ever also sets sessionEndsAt.
-    await startSessionIfNeeded(roomId);
-    // Broadcast for both status flip AND (possibly) session start.
-    await broadcastRoomDetail(roomId);
-
-    // Public state → all subscribers (players + spectators).
-    io.to(roomChannel(roomId)).emit('game:started', toPublicState(hand));
-
-    // Private hole cards → each seated player's socket(s) only.
-    const roomSockets = await io.in(roomChannel(roomId)).fetchSockets();
-    for (const rs of roomSockets) {
-      const rsUser = rs.data.user as { userId: string } | undefined;
-      if (!rsUser) continue;
-      const priv = getPrivateFor(hand, rsUser.userId);
-      if (priv) rs.emit('game:hole', priv);
-    }
-
-    // Start the auto-action timer for the first player's turn.
-    rescheduleAutoAction(roomId);
   });
 
   socket.on('game:end', async ({ roomId }, cb) => {

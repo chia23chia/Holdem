@@ -18,6 +18,17 @@ import type {
 } from '@holdem/shared';
 import { connectSocket, type TypedSocket } from '@/lib/socket';
 
+// Display-only estimate of the server's rebuy cap (see rebuyChips in
+// server/src/rooms.ts for the authoritative rule): rounds down to the
+// leading digit once the chip leader's stack exceeds the room's buyIn.
+// 1999 -> 1000, 601 -> 600. Mid-hand this can be stale (seats reflect
+// pre-hand chip counts), so it's shown as an estimate, not a promise.
+function roundToLeadingDigit(n: number): number {
+  if (n <= 0) return 0;
+  const magnitude = 10 ** Math.floor(Math.log10(n));
+  return Math.floor(n / magnitude) * magnitude;
+}
+
 export default function RoomPage() {
   const { data: session, status } = useSession();
   const router = useRouter();
@@ -107,6 +118,7 @@ export default function RoomPage() {
           }
         });
         s.on('game:started', (state) => {
+          setError(null); // clear any stale "等待補值" banner now that a hand began
           setGameState(state);
           setHoleCards(null);
           setHandRank(null);
@@ -334,6 +346,20 @@ export default function RoomPage() {
     : [];
   const myHandPlayer =
     gameState?.players.find((p) => p.userId === myUserId) ?? null;
+  const myOccupant = room?.seats.find((s) => s.userId === myUserId) ?? null;
+  // Rebuy only unlocks once chips actually hit 0 — live in-hand chips take
+  // priority since DB chipsAtTable doesn't sync until the hand ends.
+  const myChipsNow = myHandPlayer ? myHandPlayer.chips : (myOccupant?.chipsAtTable ?? 0);
+  const canRebuy = iAmSeated && myChipsNow === 0;
+  const rebuyEstimate = room
+    ? (() => {
+        const leader = room.seats.reduce(
+          (m, s) => Math.max(m, s.chipsAtTable),
+          0,
+        );
+        return leader > room.buyIn ? roundToLeadingDigit(leader) : room.buyIn;
+      })()
+    : 0;
   const itsMyTurn =
     !!gameState &&
     !!myHandPlayer &&
@@ -468,7 +494,7 @@ export default function RoomPage() {
               站起
             </button>
           )}
-          {iAmSeated && room && (
+          {canRebuy && room && (
             <button
               onClick={handleRebuy}
               className="rounded border border-emerald-700 bg-emerald-950 px-3 py-1 text-sm text-emerald-200 hover:bg-emerald-900"
@@ -478,7 +504,7 @@ export default function RoomPage() {
                   : '立即加碼到桌上'
               }
             >
-              加碼 {room.buyIn}
+              加碼(≈{rebuyEstimate})
             </button>
           )}
           {canStartGame && (
@@ -545,9 +571,9 @@ export default function RoomPage() {
                 {iAmSeated && (
                   <MenuItem onClick={handleStandup}>站起</MenuItem>
                 )}
-                {iAmSeated && room && (
+                {canRebuy && room && (
                   <MenuItem onClick={handleRebuy}>
-                    加碼 {room.buyIn}
+                    加碼(≈{rebuyEstimate})
                   </MenuItem>
                 )}
                 {canStartGame && (
@@ -963,9 +989,9 @@ export default function RoomPage() {
       {showRebuyConfirm && room && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
           <div className="w-full max-w-sm rounded-lg border border-slate-700 bg-slate-900 p-6">
-            <h2 className="mb-3 text-lg font-bold">加碼 {room.buyIn}?</h2>
+            <h2 className="mb-3 text-lg font-bold">加碼(預估 {rebuyEstimate})?</h2>
             <p className="mb-4 text-sm text-slate-300">
-              桌上籌碼會增加 {room.buyIn}。
+              桌上籌碼會增加到約 {rebuyEstimate}(依目前檯面籌碼王計算,實際金額以系統回應為準)。
               {gameState && (
                 <span className="mt-2 block text-xs text-amber-300">
                   牌局進行中,將在**下一手開始前**才加到桌上。
@@ -1375,24 +1401,7 @@ function ActionBar({
   const canCheck = toCall === 0;
   const minTotalRaise = currentBet + minRaise;
   const maxTotal = myBet + myChips; // = all-in
-  const [raiseInput, setRaiseInput] = useState(
-    String(Math.min(minTotalRaise, maxTotal)),
-  );
-
-  function preset(fraction: number) {
-    // "1/2 pot" means raise TO currentBet + pot*fraction.
-    const target = Math.min(
-      maxTotal,
-      Math.max(minTotalRaise, currentBet + Math.floor(pot * fraction)),
-    );
-    setRaiseInput(String(target));
-  }
-
-  function submitRaise() {
-    const n = Number(raiseInput);
-    if (!Number.isFinite(n)) return;
-    onAction({ type: 'raise', amount: Math.floor(n) });
-  }
+  const [showRaiseModal, setShowRaiseModal] = useState(false);
 
   return (
     <div className="mt-4 rounded border border-slate-700 bg-slate-950 p-3">
@@ -1408,12 +1417,12 @@ function ActionBar({
           </span>
         )}
       </div>
-      <div className="mb-2 flex flex-wrap gap-2">
+      <div className="flex flex-wrap gap-2">
         <button
           onClick={() => onAction({ type: 'fold' })}
           className="rounded bg-slate-700 px-3 py-2 text-sm font-semibold hover:bg-slate-600"
         >
-          蓋牌
+          棄牌
         </button>
         {canCheck ? (
           <button
@@ -1431,49 +1440,132 @@ function ActionBar({
           </button>
         )}
         <button
-          onClick={() => onAction({ type: 'all-in' })}
-          className="rounded bg-red-700 px-3 py-2 text-sm font-semibold hover:bg-red-600"
+          onClick={() => setShowRaiseModal(true)}
+          className="rounded bg-amber-600 px-3 py-2 text-sm font-semibold text-slate-950 hover:bg-amber-500"
         >
-          All-in {myChips}
+          加註
         </button>
       </div>
-      <div className="flex flex-wrap items-center gap-2">
-        <span className="text-xs text-slate-400">加注:</span>
-        <button
-          onClick={() => preset(0.5)}
-          className="rounded border border-slate-600 px-2 py-1 text-xs hover:bg-slate-800"
-        >
-          1/2 pot
-        </button>
-        <button
-          onClick={() => preset(2 / 3)}
-          className="rounded border border-slate-600 px-2 py-1 text-xs hover:bg-slate-800"
-        >
-          2/3 pot
-        </button>
-        <button
-          onClick={() => preset(1)}
-          className="rounded border border-slate-600 px-2 py-1 text-xs hover:bg-slate-800"
-        >
-          pot
-        </button>
+
+      {showRaiseModal && (
+        <RaiseModal
+          minTotalRaise={minTotalRaise}
+          maxTotal={maxTotal}
+          currentBet={currentBet}
+          pot={pot}
+          myChips={myChips}
+          onCancel={() => setShowRaiseModal(false)}
+          onConfirm={(amount) => {
+            setShowRaiseModal(false);
+            onAction({ type: 'raise', amount });
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+// Raise amount is chosen in its own confirm step (preset fraction, All-in,
+// or a typed number) so a misclick can't fire off an all-in immediately —
+// the player always has to review the amount and press 送出.
+function RaiseModal({
+  minTotalRaise,
+  maxTotal,
+  currentBet,
+  pot,
+  myChips,
+  onCancel,
+  onConfirm,
+}: {
+  minTotalRaise: number;
+  maxTotal: number;
+  currentBet: number;
+  pot: number;
+  myChips: number;
+  onCancel: () => void;
+  onConfirm: (amount: number) => void;
+}) {
+  const [raiseInput, setRaiseInput] = useState(
+    String(Math.min(minTotalRaise, maxTotal)),
+  );
+
+  function presetFraction(fraction: number) {
+    // "1/3 pot" means raise TO currentBet + pot*fraction.
+    const target = Math.min(
+      maxTotal,
+      Math.max(minTotalRaise, currentBet + Math.floor(pot * fraction)),
+    );
+    setRaiseInput(String(target));
+  }
+
+  function presetAllIn() {
+    setRaiseInput(String(maxTotal));
+  }
+
+  function submit() {
+    const n = Number(raiseInput);
+    if (!Number.isFinite(n)) return;
+    onConfirm(Math.floor(n));
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
+      <div className="w-full max-w-sm rounded-lg border border-slate-700 bg-slate-900 p-6">
+        <h2 className="mb-3 text-lg font-bold">加註金額</h2>
+        <div className="mb-3 flex flex-wrap gap-2">
+          <button
+            onClick={() => presetFraction(1 / 3)}
+            className="rounded border border-slate-600 px-3 py-1.5 text-xs hover:bg-slate-800"
+          >
+            1/3 底池
+          </button>
+          <button
+            onClick={() => presetFraction(0.5)}
+            className="rounded border border-slate-600 px-3 py-1.5 text-xs hover:bg-slate-800"
+          >
+            1/2 底池
+          </button>
+          <button
+            onClick={() => presetFraction(2 / 3)}
+            className="rounded border border-slate-600 px-3 py-1.5 text-xs hover:bg-slate-800"
+          >
+            2/3 底池
+          </button>
+          <button
+            onClick={presetAllIn}
+            className="rounded border border-red-700 px-3 py-1.5 text-xs text-red-300 hover:bg-red-950"
+          >
+            All-in
+          </button>
+        </div>
         <input
           type="number"
-          className="w-24 rounded border border-slate-700 bg-slate-900 px-2 py-1 text-sm"
+          autoFocus
+          className="mb-1 w-full rounded border border-slate-700 bg-slate-950 px-3 py-2 text-lg"
           value={raiseInput}
           onChange={(e) => setRaiseInput(e.target.value)}
           min={minTotalRaise}
           max={maxTotal}
         />
-        <button
-          onClick={submitRaise}
-          className="rounded bg-amber-600 px-3 py-1 text-sm font-semibold text-slate-950 hover:bg-amber-500"
-        >
-          加到 →
-        </button>
-      </div>
-      <div className="mt-1 text-[10px] text-slate-500">
-        最少加到 {minTotalRaise} · 底池 {pot} · 你手上 {myChips}
+        <div className="mb-4 text-[10px] text-slate-500">
+          最少加到 {minTotalRaise} · 底池 {pot} · 你手上 {myChips}
+        </div>
+        <div className="flex justify-end gap-2 text-sm">
+          <button
+            type="button"
+            onClick={onCancel}
+            className="rounded border border-slate-700 px-4 py-2 hover:bg-slate-800"
+          >
+            取消
+          </button>
+          <button
+            type="button"
+            onClick={submit}
+            className="rounded bg-amber-600 px-4 py-2 font-semibold text-slate-950 hover:bg-amber-500"
+          >
+            送出
+          </button>
+        </div>
       </div>
     </div>
   );

@@ -37,7 +37,7 @@ docker compose -f docker-compose.prod.yml --env-file .env.prod logs -f --tail=50
 
 - ✅ Phase 1-2 全部完成(OAuth、lobby、rooms、game engine 含下注/showdown/side-pot-simplified/timeout/reconnect/hand-log/rebuy)
 - ✅ Phase 5 已實際部署,`https` 拿到 Let's Encrypt,Google OAuth prod client 已加 `alan-holdem.duckdns.org` callback
-- ⏳ **剛實作但未部署**:play-money 模式 + rebuy + 結算輸贏欄(要 push + pull + rebuild 才會在 prod 生效)
+- ✅ play-money 模式 + rebuy + 結算輸贏欄已部署上 prod(VM 已 pull `b3649f5` 並 rebuild,`holdem-server`/`holdem-web` 已重啟,`/health` 正常)
 - ❌ 未做:Phase 3 chat 系統訊息、Phase 4 SNG、Milestone 2.2c side pot、雲端手牌 log 匯出、跨房 chipsBalance 追蹤
 
 ### 已知踩過的坑(避免重蹈)
@@ -182,11 +182,20 @@ Browser ─┬─ HTTP  ────────────► web (Next.js) :3
 | `userId` | String | FK → User(CASCADE) |
 | `roomId` | String | FK → Room(CASCADE) |
 | `seat` | Int | 1..maxPlayers |
-| `chipsAtTable` | Int | 桌上籌碼(play money;seat 時 = buyIn,每 rebuy +buyIn,牌局結束由 persistHandResult 更新) |
+| `chipsAtTable` | Int | 桌上籌碼(play money;seat 時 = buyIn,牌局結束由 persistHandResult 更新;rebuy 規則見下) |
 | `totalBuyIn` | Int DEFAULT 0 | 累計買入(初始 buyIn + 所有 rebuys),用來算 settlement 輸贏 = chipsAtTable - totalBuyIn |
 | `joinedAt` | DateTime | |
 
 Unique 約束:`(userId, roomId)`(同一玩家在同一房只能坐一個位)+ `(roomId, seat)`(同一座位只能坐一人)。
+
+#### 5.3.1 Rebuy 規則(`rebuyChips`,唯一權威判定點)
+
+- **只有 `chipsAtTable === 0` 才能 rebuy** — 就算自己當初買入比別人少、桌上還剩一點籌碼,也不能加碼,只能等歸零。
+- **加碼金額(= rebuy 後的 `chipsAtTable`)不會超過目前的 chip leader**:
+  - 令 `leader` = 房內所有座位 `chipsAtTable` 的最大值(`Membership.aggregate` 即時算,不含 in-hand 尚未 persist 的籌碼)。
+  - 若 `leader > room.buyIn`:加碼上限 = `leader` 無條件捨去到最高位數(`roundToLeadingDigit`)。例:1999 → 1000、601 → 600、42 → 40。
+  - 否則(`leader <= room.buyIn`,通常代表原本的 chip leader 已經站起離桌把籌碼帶走):加碼上限 = `room.buyIn`,此人加碼後金額 > 現有 leader,直接變成新的 chip leader。
+- 判定完全在 `rebuyChips` 內,`room:rebuy` handler 兩條路徑(手牌中 queue / 手牌外立即)最終都會走到這裡 — 手牌中排隊的請求,到手牌結束才重新驗證資格,若那時已不符合(例如其實沒歸零)就靜默 no-op,不會報錯洗版。
 
 ### 5.4 HandLog(Milestone 2.6)
 
@@ -295,9 +304,9 @@ Server(server/src/auth.ts authMiddleware):
 | `room:leave` | `{roomId}` | — | **僅離開 socket channel**;座位/Membership/chipsAtTable **不動**(session 內可回來繼續)。真的要退出座位要 `room:standup` |
 | `room:subscribe` | `{roomId}` | — | 加入 `room:<id>` 當觀戰(不需要 membership)、emit `room:detail` |
 | `room:standup` | `{roomId}` | — | Unseat(刪 Membership,play money 模式**不退回**任何餘額),保留訂閱變觀戰;手牌進行中拒絕;若空房自動關閉。不依賴 socket-local 狀態,DB Membership 為準 |
-| `room:rebuy` | `{roomId}` | `GameActionResult` | 加碼 `room.buyIn` 到 `chipsAtTable` + `totalBuyIn`。手牌**中** queue 到 `pendingRebuysByRoom` map,`broadcastAfterAction ended` 時 drain 進 DB;手牌**外**立即寫入 DB + 廣播 |
+| `room:rebuy` | `{roomId}` | `GameActionResult` | 僅 `chipsAtTable === 0` 時允許;金額 = 加碼上限(見 §5.3.1),寫入 `chipsAtTable` + `totalBuyIn`。手牌**中** queue 到 `pendingRebuysByRoom` map,`broadcastAfterAction ended` 時 drain 進 DB(逐一重新驗證資格,已不合資格則 no-op);手牌**外**立即寫入 DB + 廣播,並嘗試自動接續開下一手(見 `startHandForRoom`) |
 | `room:close` | `{roomId}` | `CloseRoomResult` | `ownerCloseRoom`(驗權 + 全部退籌 + status=closed)、廣播 `room:closed` |
-| `game:start` | `{roomId}` | `GameActionResult` | 只有房主;server 從 Room 讀 `actionTimeoutSeconds`;發手牌給就座玩家(≥2 人)、廣播 `game:started` + 私人 `game:hole` |
+| `game:start` | `{roomId}` | `GameActionResult` | 只有房主;server 從 Room 讀 `actionTimeoutSeconds`;只發手牌給**有籌碼**(`chipsAtTable > 0`)的就座玩家(≥2 人,否則回錯誤並廣播全房);0 籌碼玩家該手坐山觀虎鬥、廣播 `game:started` + 私人 `game:hole` |
 | `game:end` | `{roomId}` | `GameActionResult` | 房主 debug;強制清掉 hand state、廣播 `game:ended`(不帶 result) |
 | `game:action` | `{roomId, action}` | `GameActionResult` | 當前輪到的玩家送 fold / check / call / raise{amount} / all-in;server 更新 HandState、廣播 `game:state`;若手牌結束則存 chips 到 Membership + 廣播 `game:ended` {result} + 新的 `room:detail` |
 | `game:show-cards` | `{roomId}` | — | 手牌結束後任何曾在該手的玩家(含 fold 者)自願秀牌;server 更新 `endResult.revealedHoles` 加該人的手牌 + handRank(重複呼叫或已被揭露 no-op),再次廣播 `game:ended` {result 更新} |
@@ -522,7 +531,7 @@ DB 持久化延到 Milestone 2.5(斷線寬限)才做。
 `User.chipsBalance` 這個欄位**保留但不動**(留給以後長期追蹤功能用)。當前為每局獨立 play-money:
 
 - **坐下**:`seatUser` 直接把 `chipsAtTable = room.buyIn` + `totalBuyIn = room.buyIn` 寫進 Membership,**不從 chipsBalance 扣**
-- **Rebuy**:`rebuyChips` 加 `room.buyIn` 到 chipsAtTable + totalBuyIn,**不從 chipsBalance 扣**
+- **Rebuy**:`rebuyChips` 依 §5.3.1 的歸零 + chip-leader 上限規則加碼到 chipsAtTable + totalBuyIn,**不從 chipsBalance 扣**
 - **站起 / 空房自動關 / owner close / session expire**:刪 Membership,**不 refund 到 chipsBalance**
 - **Settlement modal**:顯示每人「買入 / 剩下 / 輸贏」,輸贏 = chipsAtTable - totalBuyIn(正綠負紅),純資訊,不動 chipsBalance
 
