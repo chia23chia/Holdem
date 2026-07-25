@@ -2,7 +2,53 @@
 
 Holdem 專案的深度參考文件。README 負責入門(如何啟動),本檔負責描述程式碼結構、契約與設計決策。有架構性變動(新事件、新 model、新 endpoint、新踩坑)才更新。
 
-最後更新:2026-07-24(Phase 2 Milestone 2.2 完成)
+最後更新:2026-07-25(Phase 2 全部子 milestone 完成、Phase 5 已上線、play-money + rebuy 剛實作)
+
+---
+
+## Handoff 快照(給接手者)
+
+- **線上位置**:`https://alan-holdem.duckdns.org`(Oracle Free ARM,`217.142.252.51`,ubuntu 帳號)
+- **SSH**:`ssh -i ~/.ssh/id_rsa ubuntu@217.142.252.51`(私鑰在原機器 + trade-bot 部署機器,新機器要手動搬 `~/.ssh/id_rsa`)
+- **VM 專案位置**:`~/Holdem`(git clone 自 `https://github.com/chia23chia/Holdem.git`,已 pull 到 c42b897 之後的 commits — 見 git log)
+- **VM 環境檔**:`~/Holdem/.env.prod`(chmod 600,不進版控;新機器**不需要**改這個,只有 VM 才有)
+- **共存**:同一台 VM 還跑著 trade-bot(systemd timer,不佔 port,無衝突)
+- **DB**:Postgres 16 in Docker(`holdem-postgres` container),資料 volume `holdem_postgres_data`
+- **DuckDNS token**(短期需要)`32f4f4bf-e479-4e3b-abba-a5f139123413`
+
+### 部署更新流程(新機器上手可跑)
+
+```powershell
+# 本地 push
+cd D:\Alan\project\Holdem
+git add -A && git commit -m "..." && git push
+```
+
+```bash
+# VM 上 pull + rebuild
+ssh -i ~/.ssh/id_rsa ubuntu@217.142.252.51
+cd ~/Holdem
+git pull
+docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --build
+docker compose -f docker-compose.prod.yml --env-file .env.prod logs -f --tail=50
+```
+
+### 現況(2026-07-25)
+
+- ✅ Phase 1-2 全部完成(OAuth、lobby、rooms、game engine 含下注/showdown/side-pot-simplified/timeout/reconnect/hand-log/rebuy)
+- ✅ Phase 5 已實際部署,`https` 拿到 Let's Encrypt,Google OAuth prod client 已加 `alan-holdem.duckdns.org` callback
+- ⏳ **剛實作但未部署**:play-money 模式 + rebuy + 結算輸贏欄(要 push + pull + rebuild 才會在 prod 生效)
+- ❌ 未做:Phase 3 chat 系統訊息、Phase 4 SNG、Milestone 2.2c side pot、雲端手牌 log 匯出、跨房 chipsBalance 追蹤
+
+### 已知踩過的坑(避免重蹈)
+
+- pnpm 11 需要 Node 22(Dockerfile 已改)
+- Prisma 需要 Alpine 裝 openssl(Dockerfile 已改)
+- Auth.js v5 prod 需要 `trustHost: true`(auth.config.ts 已改)
+- Google OAuth 「電腦」類型 client 不能用在域名,要建「網頁應用程式」類型
+- OCI Security List 要記得開 80/443 ingress,host UFW 也要
+- Windows PowerShell 沒 pnpm 時 Claude sandbox 也沒(靠 user shell)
+- `docker compose logs` 也要帶 `--env-file`
 
 ---
 
