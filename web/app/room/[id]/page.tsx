@@ -929,9 +929,10 @@ export default function RoomPage() {
             ) : (
               <div className="flex flex-1 flex-col gap-1 overflow-y-auto rounded bg-slate-950 p-2 text-sm">
                 <HistoryList
-                  history={handHistory}
-                  endResult={endResult}
-                  revealVisible={!!endResult}
+                  hands={hands}
+                  displayedIdx={displayedIdx}
+                  onSelectIdx={setSelectedIdx}
+                  players={gameState?.players ?? []}
                 />
               </div>
             )}
