@@ -31,6 +31,7 @@ export default function RoomPage() {
   const [error, setError] = useState<string | null>(null);
   const [showCloseConfirm, setShowCloseConfirm] = useState(false);
   const [closing, setClosing] = useState(false);
+  const [showRebuyConfirm, setShowRebuyConfirm] = useState(false);
   const [gameState, setGameState] = useState<HandStatePublic | null>(null);
   const [holeCards, setHoleCards] = useState<[Card, Card] | null>(null);
   const [handRank, setHandRank] = useState<string | null>(null);
@@ -373,11 +374,16 @@ export default function RoomPage() {
     });
   }
 
-  function handleEndGame() {
+  function handleRebuy() {
     setMenuOpen(false);
+    setShowRebuyConfirm(true);
+  }
+
+  function handleRebuyConfirm() {
     if (!socketRef.current || !roomId) return;
     setError(null);
-    socketRef.current.emit('game:end', { roomId }, (res) => {
+    setShowRebuyConfirm(false);
+    socketRef.current.emit('room:rebuy', { roomId }, (res) => {
       if (!res.ok) setError(res.error);
     });
   }
@@ -462,6 +468,19 @@ export default function RoomPage() {
               站起
             </button>
           )}
+          {iAmSeated && room && (
+            <button
+              onClick={handleRebuy}
+              className="rounded border border-emerald-700 bg-emerald-950 px-3 py-1 text-sm text-emerald-200 hover:bg-emerald-900"
+              title={
+                gameState
+                  ? '牌局進行中,將在下一手開始前補到桌上'
+                  : '立即加碼到桌上'
+              }
+            >
+              加碼 {room.buyIn}
+            </button>
+          )}
           {canStartGame && (
             <button
               onClick={handleStartGame}
@@ -476,15 +495,6 @@ export default function RoomPage() {
               className="rounded bg-amber-600 px-3 py-1 text-sm font-semibold text-slate-950 opacity-40"
             >
               開始牌局
-            </button>
-          )}
-          {isOwner && gameState && (
-            <button
-              onClick={handleEndGame}
-              className="rounded border border-amber-700 bg-amber-950 px-3 py-1 text-sm text-amber-200 hover:bg-amber-900"
-              title="Milestone 2.1 debug 用,之後拿掉"
-            >
-              結束牌局
             </button>
           )}
           {isOwner && (
@@ -535,6 +545,11 @@ export default function RoomPage() {
                 {iAmSeated && (
                   <MenuItem onClick={handleStandup}>站起</MenuItem>
                 )}
+                {iAmSeated && room && (
+                  <MenuItem onClick={handleRebuy}>
+                    加碼 {room.buyIn}
+                  </MenuItem>
+                )}
                 {canStartGame && (
                   <MenuItem onClick={handleStartGame} accent="amber">
                     開始牌局
@@ -543,11 +558,6 @@ export default function RoomPage() {
                 {isOwner && !gameState && !canStartGame && (
                   <MenuItem disabled accent="amber">
                     開始牌局(需 ≥ 2 人)
-                  </MenuItem>
-                )}
-                {isOwner && gameState && (
-                  <MenuItem onClick={handleEndGame} accent="amber">
-                    結束牌局
                   </MenuItem>
                 )}
                 {isOwner && (
@@ -948,6 +958,38 @@ export default function RoomPage() {
             router.replace('/lobby');
           }}
         />
+      )}
+
+      {showRebuyConfirm && room && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
+          <div className="w-full max-w-sm rounded-lg border border-slate-700 bg-slate-900 p-6">
+            <h2 className="mb-3 text-lg font-bold">加碼 {room.buyIn}?</h2>
+            <p className="mb-4 text-sm text-slate-300">
+              桌上籌碼會增加 {room.buyIn}。
+              {gameState && (
+                <span className="mt-2 block text-xs text-amber-300">
+                  牌局進行中,將在**下一手開始前**才加到桌上。
+                </span>
+              )}
+            </p>
+            <div className="flex justify-end gap-2 text-sm">
+              <button
+                type="button"
+                onClick={() => setShowRebuyConfirm(false)}
+                className="rounded border border-slate-700 px-4 py-2 hover:bg-slate-800"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                onClick={handleRebuyConfirm}
+                className="rounded bg-emerald-600 px-4 py-2 font-semibold hover:bg-emerald-500"
+              >
+                確定加碼
+              </button>
+            </div>
+          </div>
+        </div>
       )}
 
       {showCloseConfirm && room && (
@@ -1482,24 +1524,42 @@ function SettlementModal({
             <thead>
               <tr className="border-b border-slate-700 text-left text-xs text-slate-400">
                 <th className="py-1">玩家</th>
-                <th className="py-1 text-right">桌上籌碼</th>
+                <th className="py-1 text-right">買入</th>
+                <th className="py-1 text-right">剩下</th>
+                <th className="py-1 text-right">輸贏</th>
               </tr>
             </thead>
             <tbody>
-              {summary.players.map((p) => (
-                <tr key={p.userId} className="border-b border-slate-800">
-                  <td className="py-1">{p.name}</td>
-                  <td className="py-1 text-right font-mono">
-                    {p.chipsAtTable}
-                  </td>
-                </tr>
-              ))}
+              {summary.players.map((p) => {
+                const net = p.chipsAtTable - p.totalBuyIn;
+                const netStr =
+                  net > 0 ? `+${net}` : net < 0 ? `${net}` : '±0';
+                const netColor =
+                  net > 0
+                    ? 'text-emerald-400'
+                    : net < 0
+                      ? 'text-red-400'
+                      : 'text-slate-500';
+                return (
+                  <tr key={p.userId} className="border-b border-slate-800">
+                    <td className="py-1">{p.name}</td>
+                    <td className="py-1 text-right font-mono text-slate-400">
+                      {p.totalBuyIn}
+                    </td>
+                    <td className="py-1 text-right font-mono">
+                      {p.chipsAtTable}
+                    </td>
+                    <td
+                      className={`py-1 text-right font-mono font-bold ${netColor}`}
+                    >
+                      {netStr}
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         )}
-        <p className="mb-4 text-[11px] text-slate-500">
-          (Milestone 2.1 尚無下注,籌碼 = 買入)
-        </p>
         <div className="flex justify-end">
           <button
             type="button"

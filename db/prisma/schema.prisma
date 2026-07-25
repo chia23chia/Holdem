@@ -107,6 +107,9 @@ model Membership {
   roomId       String
   seat         Int
   chipsAtTable Int
+  // Cumulative chips brought to this room across seat + rebuys.
+  // Used to compute win/loss = chipsAtTable - totalBuyIn on session settlement.
+  totalBuyIn   Int      @default(0)
   joinedAt     DateTime @default(now())
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)

@@ -81,7 +81,8 @@ export interface SettlementSummary {
   players: Array<{
     userId: string;
     name: string;
-    chipsAtTable: number;
+    chipsAtTable: number; // Final stack when session ended
+    totalBuyIn: number;   // Initial buyIn + all rebuys — for net win/loss display
   }>;
 }
 
@@ -212,6 +213,8 @@ export interface ClientToServerEvents {
   'room:subscribe': (data: { roomId: string }) => void;
   'room:standup': (data: { roomId: string }) => void;
   'room:close': (data: { roomId: string }, cb: (res: CloseRoomResult) => void) => void;
+  // Rebuy — always +room.buyIn. Mid-hand → queued, applied when hand ends.
+  'room:rebuy': (data: { roomId: string }, cb: (res: GameActionResult) => void) => void;
 
   'chat:send': (data: { roomId: string | null; text: string }) => void;
 

@@ -136,7 +136,8 @@ Browser ─┬─ HTTP  ────────────► web (Next.js) :3
 | `userId` | String | FK → User(CASCADE) |
 | `roomId` | String | FK → Room(CASCADE) |
 | `seat` | Int | 1..maxPlayers |
-| `chipsAtTable` | Int | 就座時從 User.chipsBalance 扣 |
+| `chipsAtTable` | Int | 桌上籌碼(play money;seat 時 = buyIn,每 rebuy +buyIn,牌局結束由 persistHandResult 更新) |
+| `totalBuyIn` | Int DEFAULT 0 | 累計買入(初始 buyIn + 所有 rebuys),用來算 settlement 輸贏 = chipsAtTable - totalBuyIn |
 | `joinedAt` | DateTime | |
 
 Unique 約束:`(userId, roomId)`(同一玩家在同一房只能坐一個位)+ `(roomId, seat)`(同一座位只能坐一人)。
@@ -247,7 +248,8 @@ Server(server/src/auth.ts authMiddleware):
 | `room:join` | `{roomId, seat?}` | `JoinRoomResult` | `seatUser`(扣 buyIn);`seat` 省略 = 自動找第一個空位;`seat` 給 = 指定座位(被佔會回錯誤) |
 | `room:leave` | `{roomId}` | — | **僅離開 socket channel**;座位/Membership/chipsAtTable **不動**(session 內可回來繼續)。真的要退出座位要 `room:standup` |
 | `room:subscribe` | `{roomId}` | — | 加入 `room:<id>` 當觀戰(不需要 membership)、emit `room:detail` |
-| `room:standup` | `{roomId}` | — | Unseat + 退籌回 chipsBalance,**保留訂閱**(變觀戰);手牌進行中拒絕;若空房自動關閉。不依賴 socket-local 狀態,DB Membership 為準 |
+| `room:standup` | `{roomId}` | — | Unseat(刪 Membership,play money 模式**不退回**任何餘額),保留訂閱變觀戰;手牌進行中拒絕;若空房自動關閉。不依賴 socket-local 狀態,DB Membership 為準 |
+| `room:rebuy` | `{roomId}` | `GameActionResult` | 加碼 `room.buyIn` 到 `chipsAtTable` + `totalBuyIn`。手牌**中** queue 到 `pendingRebuysByRoom` map,`broadcastAfterAction ended` 時 drain 進 DB;手牌**外**立即寫入 DB + 廣播 |
 | `room:close` | `{roomId}` | `CloseRoomResult` | `ownerCloseRoom`(驗權 + 全部退籌 + status=closed)、廣播 `room:closed` |
 | `game:start` | `{roomId}` | `GameActionResult` | 只有房主;server 從 Room 讀 `actionTimeoutSeconds`;發手牌給就座玩家(≥2 人)、廣播 `game:started` + 私人 `game:hole` |
 | `game:end` | `{roomId}` | `GameActionResult` | 房主 debug;強制清掉 hand state、廣播 `game:ended`(不帶 result) |
@@ -465,14 +467,20 @@ DB 持久化延到 Milestone 2.5(斷線寬限)才做。
 
 ### 11.17 手牌中禁止站起 + Exit-不-unseat(Milestone 2.5 收斂)
 
-`room:standup` handler 若 `hasActiveHand(roomId)` 為真,回 `room:error`「牌局進行中無法站起」。理由:mid-hand 把 player 從 `hand.players` 拔掉會弄亂 `toAct` / `currentPlayerIdx` / 對手期待,實作成本高。之後若真的要放行,設計是 auto-fold + 保留 stack 給 session end 結算。
+`room:standup` handler 若 `hasActiveHand(roomId)` 為真,回 `room:error`「牌局進行中無法站起」。理由:mid-hand 把 player 從 `hand.players` 拔掉會弄亂 `toAct` / `currentPlayerIdx` / 對手期待,實作成本高。
 
-**Disconnect / room:leave 現況(2.5)**:兩個路徑都**不 unseat**。玩家關 tab / 斷線 / 按離開房間都只是離開 socket channel,座位跟 chipsAtTable 留在 DB。手牌中的 turn 靠 `runAutoAction` deadline 自動 check/fold。這樣做的效果:
-- 「贏 20 → 斷線」→ chipsAtTable 保留 1020,session-end settlement 退回
-- 「贏 20 → 站起」(手牌後)→ `unseatUser` 立即退 1020 到 chipsBalance
-- 「贏 20 → 離開房間」→ 座位留著,session-end settlement 退
+**Disconnect / room:leave 現況(2.5)**:兩個路徑都**不 unseat**。玩家關 tab / 斷線 / 按離開房間都只是離開 socket channel,座位跟 chipsAtTable 留在 DB。手牌中的 turn 靠 `runAutoAction` deadline 自動 check/fold。真的要「不玩了」只能 `站起`(等手牌結束)。空房自動關的觸發:「所有人都主動站起 / owner-close / session-expire」。
 
-真的要「不玩了」只能 `站起`(等手牌結束)。空房自動關的觸發變成:「所有人都主動站起 / owner-close / session-expire」。單純大家斷線的房會活到 session 到期為止。
+### 11.18 Play-money 模式(2026-07-25 起)
+
+`User.chipsBalance` 這個欄位**保留但不動**(留給以後長期追蹤功能用)。當前為每局獨立 play-money:
+
+- **坐下**:`seatUser` 直接把 `chipsAtTable = room.buyIn` + `totalBuyIn = room.buyIn` 寫進 Membership,**不從 chipsBalance 扣**
+- **Rebuy**:`rebuyChips` 加 `room.buyIn` 到 chipsAtTable + totalBuyIn,**不從 chipsBalance 扣**
+- **站起 / 空房自動關 / owner close / session expire**:刪 Membership,**不 refund 到 chipsBalance**
+- **Settlement modal**:顯示每人「買入 / 剩下 / 輸贏」,輸贏 = chipsAtTable - totalBuyIn(正綠負紅),純資訊,不動 chipsBalance
+
+長期追蹤功能之後補時,再把 chipsBalance 拉回計算流程(可能 rebuy 從 chipsBalance 扣、settlement 寫回 chipsBalance)。
 
 ---
 

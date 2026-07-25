@@ -86,7 +86,9 @@ export type SeatOutcome =
   | { ok: true; seat: number }
   | { ok: false; error: string };
 
-// Atomically seats user at a free seat, deducting buyIn from their chipsBalance.
+// Atomically seats user at a free seat. Play-money model — chips are given
+// out of thin air (no chipsBalance deduction). totalBuyIn tracks cumulative
+// chips brought in for settlement's win/loss display.
 // If user already seated in the room, returns success with their existing seat.
 export async function seatUser(
   userId: string,
@@ -123,27 +125,52 @@ export async function seatUser(
       if (seat === null) return { ok: false, error: '房間已滿' };
     }
 
-    const user = await tx.user.findUnique({ where: { id: userId } });
-    if (!user) return { ok: false, error: '使用者不存在' };
-    if (user.chipsBalance < room.buyIn) {
-      return { ok: false, error: `籌碼不足(需 ${room.buyIn},持有 ${user.chipsBalance})` };
-    }
-
-    await tx.user.update({
-      where: { id: userId },
-      data: { chipsBalance: { decrement: room.buyIn } },
-    });
     await tx.membership.create({
-      data: { userId, roomId, seat, chipsAtTable: room.buyIn },
+      data: {
+        userId,
+        roomId,
+        seat,
+        chipsAtTable: room.buyIn,
+        totalBuyIn: room.buyIn,
+      },
     });
     return { ok: true, seat };
   });
 }
 
-// Removes user from room and refunds remaining table chips to their balance.
-// Returns whether the room is now empty (caller may want to close it).
-// Idempotent: safe to call twice concurrently (client sends both `room:leave`
-// and `disconnect` on unmount, and React strict mode may double-fire).
+// Rebuy: add another buyIn to this seat's stack + cumulative totalBuyIn.
+// Play-money model — no chipsBalance deduction. Caller decides whether to
+// apply immediately (between hands) or defer via in-memory queue (mid-hand).
+export async function rebuyChips(
+  userId: string,
+  roomId: string,
+): Promise<
+  { ok: true; amount: number; chipsAtTable: number } | { ok: false; error: string }
+> {
+  return prisma.$transaction(async (tx) => {
+    const room = await tx.room.findUnique({
+      where: { id: roomId },
+      select: { buyIn: true },
+    });
+    if (!room) return { ok: false, error: '房間不存在' };
+    const membership = await tx.membership.findUnique({
+      where: { userId_roomId: { userId, roomId } },
+    });
+    if (!membership) return { ok: false, error: '你不在此房間' };
+    const updated = await tx.membership.update({
+      where: { id: membership.id },
+      data: {
+        chipsAtTable: { increment: room.buyIn },
+        totalBuyIn: { increment: room.buyIn },
+      },
+    });
+    return { ok: true, amount: room.buyIn, chipsAtTable: updated.chipsAtTable };
+  });
+}
+
+// Removes user from room. Play-money model — chips vanish (no chipsBalance
+// refund; settlement was already shown for display purposes).
+// Idempotent: safe to call twice concurrently.
 export async function unseatUser(
   userId: string,
   roomId: string,
@@ -153,18 +180,7 @@ export async function unseatUser(
       where: { userId_roomId: { userId, roomId } },
     });
     if (membership) {
-      // deleteMany returns count instead of throwing P2025 on missing row.
-      // Only refund when we actually deleted — otherwise a concurrent tx
-      // already refunded.
-      const { count } = await tx.membership.deleteMany({
-        where: { id: membership.id },
-      });
-      if (count === 1) {
-        await tx.user.update({
-          where: { id: userId },
-          data: { chipsBalance: { increment: membership.chipsAtTable } },
-        });
-      }
+      await tx.membership.deleteMany({ where: { id: membership.id } });
     }
     const remaining = await tx.membership.count({ where: { roomId } });
     return { empty: remaining === 0 };
@@ -220,13 +236,7 @@ export async function ownerCloseRoom(
       const { count } = await tx.membership.deleteMany({
         where: { id: m.id },
       });
-      if (count === 1) {
-        await tx.user.update({
-          where: { id: m.userId },
-          data: { chipsBalance: { increment: m.chipsAtTable } },
-        });
-        kickedUserIds.push(m.userId);
-      }
+      if (count === 1) kickedUserIds.push(m.userId);
     }
     await tx.room.update({
       where: { id: roomId },
@@ -261,18 +271,11 @@ export async function systemCloseRoomWithSettlement(
       userId: m.userId,
       name: displayName(m.user),
       chipsAtTable: m.chipsAtTable,
+      totalBuyIn: m.totalBuyIn,
     }));
 
     for (const m of room.memberships) {
-      const { count } = await tx.membership.deleteMany({
-        where: { id: m.id },
-      });
-      if (count === 1) {
-        await tx.user.update({
-          where: { id: m.userId },
-          data: { chipsBalance: { increment: m.chipsAtTable } },
-        });
-      }
+      await tx.membership.deleteMany({ where: { id: m.id } });
     }
     await tx.room.update({
       where: { id: roomId },
@@ -320,6 +323,7 @@ export async function snapshotSeatedPlayers(
     userId: m.userId,
     name: displayName(m.user),
     chipsAtTable: m.chipsAtTable,
+    totalBuyIn: m.totalBuyIn,
   }));
 }
 

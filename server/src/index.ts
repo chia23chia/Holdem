@@ -16,6 +16,7 @@ import {
   ownerCloseRoom,
   persistHandLog,
   persistHandResult,
+  rebuyChips,
   seatUser,
   setRoomStatus,
   snapshotSeatedPlayers,
@@ -88,6 +89,7 @@ async function finalizeRoomState(roomId: string, empty: boolean) {
     cancelAutoAction(roomId);
     clearRoomState(roomId);
     lastHandLogIdByRoom.delete(roomId);
+    pendingRebuysByRoom.delete(roomId);
     await deleteHandLogsForRoom(roomId);
     await closeRoom(roomId);
     io.to(roomChannel(roomId)).emit('room:closed', { roomId });
@@ -106,6 +108,36 @@ const autoActionTimers = new Map<string, NodeJS.Timeout>();
 // Latest persisted HandLog row id per room; used to patch endResult when a
 // voluntary reveal fires after the hand was already persisted.
 const lastHandLogIdByRoom = new Map<string, string>();
+
+// Rebuy queue: mid-hand rebuy requests wait here. Applied to Membership.
+// after the hand ends, before the next one starts. Value = number of pending
+// rebuys (each = room.buyIn worth of chips + totalBuyIn).
+const pendingRebuysByRoom = new Map<string, Map<string, number>>();
+
+function queuePendingRebuy(roomId: string, userId: string): void {
+  let byUser = pendingRebuysByRoom.get(roomId);
+  if (!byUser) {
+    byUser = new Map();
+    pendingRebuysByRoom.set(roomId, byUser);
+  }
+  byUser.set(userId, (byUser.get(userId) ?? 0) + 1);
+}
+
+async function drainPendingRebuys(roomId: string): Promise<void> {
+  const byUser = pendingRebuysByRoom.get(roomId);
+  if (!byUser || byUser.size === 0) return;
+  const entries = [...byUser.entries()];
+  byUser.clear();
+  for (const [userId, count] of entries) {
+    for (let i = 0; i < count; i++) {
+      try {
+        await rebuyChips(userId, roomId);
+      } catch (err) {
+        console.error('[server] drain rebuy error', err);
+      }
+    }
+  }
+}
 
 
 function cancelAutoAction(roomId: string): void {
@@ -195,6 +227,9 @@ async function broadcastAfterAction(
     }
     // Flip room back to 'waiting' — owner can now close between hands.
     await setRoomStatus(roomId, 'waiting');
+    // Apply any queued rebuys BEFORE broadcasting so clients see the updated
+    // chipsAtTable in the same room:detail push.
+    await drainPendingRebuys(roomId);
     io.to(roomChannel(roomId)).emit('game:ended', {
       roomId,
       result: result ?? undefined,
@@ -300,6 +335,7 @@ io.on('connection', (socket) => {
     cancelAutoAction(roomId);
     clearRoomState(roomId);
     lastHandLogIdByRoom.delete(roomId);
+    pendingRebuysByRoom.delete(roomId);
     await deleteHandLogsForRoom(roomId);
     const settlement = await buildOwnerCloseSettlement(roomId, players);
     cb({ ok: true });
@@ -308,6 +344,20 @@ io.on('connection', (socket) => {
       settlement: settlement ?? undefined,
     });
     io.to(LOBBY_ROOM).emit('lobby:room-removed', { roomId });
+  });
+
+  // Rebuy: +room.buyIn to the caller's chipsAtTable + totalBuyIn.
+  // Mid-hand → queued for hand end. Between-hand → applied immediately.
+  socket.on('room:rebuy', async ({ roomId }, cb) => {
+    if (hasActiveHand(roomId)) {
+      queuePendingRebuy(roomId, user.userId);
+      cb({ ok: true });
+      return;
+    }
+    const outcome = await rebuyChips(user.userId, roomId);
+    if (!outcome.ok) return cb({ ok: false, error: outcome.error });
+    cb({ ok: true });
+    await broadcastRoomDetail(roomId);
   });
 
   // ---- Game (Phase 2) ----
