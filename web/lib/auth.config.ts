@@ -6,6 +6,10 @@ import Google from 'next-auth/providers/google';
 // The full config in `./auth.ts` spreads this and adds the Prisma adapter +
 // DB-backed callbacks.
 export default {
+  // Auth.js v5 refuses to serve requests from hosts it hasn't been told to
+  // trust (guards against Host header injection). Behind our Caddy reverse
+  // proxy on any duckdns / custom domain, we know Host is what Caddy set it to.
+  trustHost: true,
   session: { strategy: 'jwt' },
   providers: [
     Google({
