@@ -1,0 +1,32 @@
+# Socket.IO server image. Runs TS directly via tsx to sidestep the workspace
+# TS-resolution headache (shared/db are source-referenced via `main: ./src/index.ts`).
+# For our scale (friend app) tsx runtime cost is negligible.
+
+FROM node:20-alpine AS base
+RUN corepack enable && corepack prepare pnpm@11.17.0 --activate
+WORKDIR /app
+
+# ---- deps ----
+FROM base AS deps
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY web/package.json ./web/
+COPY server/package.json ./server/
+COPY shared/package.json ./shared/
+COPY db/package.json ./db/
+COPY db/prisma ./db/prisma
+RUN pnpm install --frozen-lockfile
+
+# ---- runtime ----
+FROM base AS runner
+ENV NODE_ENV=production
+COPY --from=deps /app /app
+COPY shared ./shared
+COPY db ./db
+COPY server ./server
+# Regenerate Prisma client for the alpine/musl target inside this image.
+RUN pnpm --filter @holdem/db exec prisma generate --schema=./prisma/schema.prisma
+EXPOSE 3001
+
+# `prisma db push` first (idempotent — no-op if schema already matches),
+# then boot the Socket.IO server. Env vars are supplied by docker-compose.
+CMD ["sh", "-c", "pnpm --filter @holdem/db exec prisma db push --skip-generate --accept-data-loss --schema=./prisma/schema.prisma && pnpm --filter server exec tsx src/index.ts"]

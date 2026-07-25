@@ -17,6 +17,7 @@ import {
   persistHandLog,
   persistHandResult,
   seatUser,
+  setRoomStatus,
   snapshotSeatedPlayers,
   startSessionIfNeeded,
   systemCloseRoomWithSettlement,
@@ -106,6 +107,7 @@ const autoActionTimers = new Map<string, NodeJS.Timeout>();
 // voluntary reveal fires after the hand was already persisted.
 const lastHandLogIdByRoom = new Map<string, string>();
 
+
 function cancelAutoAction(roomId: string): void {
   const t = autoActionTimers.get(roomId);
   if (t) {
@@ -191,6 +193,8 @@ async function broadcastAfterAction(
     } catch (err) {
       console.error('[server] persistHandLog error', err);
     }
+    // Flip room back to 'waiting' — owner can now close between hands.
+    await setRoomStatus(roomId, 'waiting');
     io.to(roomChannel(roomId)).emit('game:ended', {
       roomId,
       result: result ?? undefined,
@@ -259,17 +263,25 @@ io.on('connection', (socket) => {
     }
   });
 
+  // Milestone 2.5 model: "leave room" is navigation only — the player keeps
+  // their seat + chipsAtTable so they can return to the same room later within
+  // the session. They only actually unseat via `room:standup` (between hands)
+  // or when the session closes (settlement).
   socket.on('room:leave', async ({ roomId }) => {
-    await handleLeave(roomId);
+    if (subscribedRoomId === roomId) {
+      await socket.leave(roomChannel(roomId));
+      subscribedRoomId = null;
+    }
   });
 
   // Standup: unseat + refund, keep subscription so user remains a spectator.
+  // Does NOT depend on socket-local `seatedRoomId` — a fresh socket after
+  // reconnect might not have that cached, but their Membership persists in DB.
   socket.on('room:standup', async ({ roomId }) => {
-    if (seatedRoomId !== roomId) return;
     if (hasActiveHand(roomId)) {
-      // Mid-hand standup is deferred to Milestone 2.5 (needs auto-fold + hand
-      // state fixup). For now refuse to avoid corrupt state.
-      socket.emit('room:error', { message: '牌局進行中無法站起,請先蓋牌等這手結束' });
+      socket.emit('room:error', {
+        message: '牌局進行中無法站起,請等這手結束',
+      });
       return;
     }
     const { empty } = await unseatUser(user.userId, roomId);
@@ -330,10 +342,12 @@ io.on('connection', (socket) => {
     );
     cb({ ok: true });
 
-    // First hand ever starts the session countdown. Re-broadcast room detail
-    // so clients pick up the new sessionEndsAt for their timer.
-    const sessionJustStarted = await startSessionIfNeeded(roomId);
-    if (sessionJustStarted) await broadcastRoomDetail(roomId);
+    // Flip room to 'playing' — blocks ownerCloseRoom until the hand ends.
+    await setRoomStatus(roomId, 'playing');
+    // First hand ever also sets sessionEndsAt.
+    await startSessionIfNeeded(roomId);
+    // Broadcast for both status flip AND (possibly) session start.
+    await broadcastRoomDetail(roomId);
 
     // Public state → all subscribers (players + spectators).
     io.to(roomChannel(roomId)).emit('game:started', toPublicState(hand));
@@ -359,8 +373,10 @@ io.on('connection', (socket) => {
     }
     cancelAutoAction(roomId);
     endHand(roomId);
+    await setRoomStatus(roomId, 'waiting');
     cb({ ok: true });
     io.to(roomChannel(roomId)).emit('game:ended', { roomId });
+    await broadcastRoomDetail(roomId);
   });
 
   socket.on('game:action', async ({ roomId, action }, cb) => {
@@ -414,20 +430,11 @@ io.on('connection', (socket) => {
   // ---- Cleanup ----
   socket.on('disconnect', async (reason) => {
     console.log(`[disconnect] ${socket.id} reason=${reason}`);
-    if (seatedRoomId) {
-      await handleLeave(seatedRoomId);
-    }
+    // Milestone 2.5 model: don't unseat on disconnect. The seat + chipsAtTable
+    // are preserved until the session settles. If it's the player's turn mid-
+    // hand, `runAutoAction` (deadline timer) will auto-fold/check on their
+    // behalf. Socket.IO auto-removes the socket from all its channels.
   });
-
-  async function handleLeave(roomId: string) {
-    const { empty } = await unseatUser(user.userId, roomId);
-    seatedRoomId = null;
-    if (subscribedRoomId === roomId) {
-      await socket.leave(roomChannel(roomId));
-      subscribedRoomId = null;
-    }
-    await finalizeRoomState(roomId, empty);
-  }
 });
 
 // Periodic scan: session-expired rooms → auto-close with settlement.

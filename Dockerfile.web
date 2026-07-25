@@ -1,0 +1,40 @@
+# Next.js web image. Full build (next build) then `next start` for prod.
+# transpilePackages in next.config.js handles the @holdem/shared source-import,
+# so we just need the whole workspace at build time.
+
+FROM node:20-alpine AS base
+RUN corepack enable && corepack prepare pnpm@11.17.0 --activate
+WORKDIR /app
+
+# ---- deps ----
+FROM base AS deps
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY web/package.json ./web/
+COPY server/package.json ./server/
+COPY shared/package.json ./shared/
+COPY db/package.json ./db/
+COPY db/prisma ./db/prisma
+RUN pnpm install --frozen-lockfile
+
+# ---- build ----
+FROM deps AS build
+COPY shared ./shared
+COPY db ./db
+COPY web ./web
+ENV NEXT_TELEMETRY_DISABLED=1
+# NEXT_PUBLIC_* vars are baked into the client bundle at build time.
+# Compose passes them via build.args.
+ARG NEXT_PUBLIC_SOCKET_URL
+ENV NEXT_PUBLIC_SOCKET_URL=$NEXT_PUBLIC_SOCKET_URL
+# Prisma client for the alpine/musl target.
+RUN pnpm --filter @holdem/db exec prisma generate --schema=./prisma/schema.prisma
+RUN pnpm --filter web build
+
+# ---- runtime ----
+FROM base AS runner
+ENV NODE_ENV=production
+ENV NEXT_TELEMETRY_DISABLED=1
+COPY --from=build /app /app
+WORKDIR /app/web
+EXPOSE 3000
+CMD ["pnpm", "start"]

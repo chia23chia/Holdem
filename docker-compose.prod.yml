@@ -1,0 +1,101 @@
+# Prod compose — meant to run on the Oracle ARM VM.
+# Requires:
+#   - `.env.prod` file at repo root with real secrets (see .env.prod.example)
+#   - ports 80/443 open in OCI Security List + host firewall
+#   - alan-holdem.duckdns.org DNS record pointing at this VM's public IP
+#
+# Usage:
+#   docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --build
+#   docker compose -f docker-compose.prod.yml --env-file .env.prod logs -f
+#   docker compose -f docker-compose.prod.yml --env-file .env.prod down
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: holdem-postgres
+    environment:
+      POSTGRES_USER: holdem
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: holdem
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U holdem"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    container_name: holdem-server
+    environment:
+      NODE_ENV: production
+      SERVER_PORT: 3001
+      DATABASE_URL: postgresql://holdem:${POSTGRES_PASSWORD}@postgres:5432/holdem
+      CORS_ORIGIN: https://alan-holdem.duckdns.org
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+      args:
+        # Baked into Next.js client bundle at build time.
+        NEXT_PUBLIC_SOCKET_URL: https://alan-holdem.duckdns.org
+    container_name: holdem-web
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://holdem:${POSTGRES_PASSWORD}@postgres:5432/holdem
+      NEXTAUTH_URL: https://alan-holdem.duckdns.org
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET}
+      NEXT_PUBLIC_SOCKET_URL: https://alan-holdem.duckdns.org
+    depends_on:
+      postgres:
+        condition: service_healthy
+      server:
+        condition: service_started
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: holdem-caddy
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"    # HTTP/3
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - web
+      - server
+    restart: unless-stopped
+
+  # Keeps DuckDNS pointing at the VM's public IP (refreshes every 5min).
+  # Oracle Free ARM reserved IPs shouldn't change, but this is a cheap safety net.
+  duckdns:
+    image: linuxserver/duckdns:latest
+    container_name: holdem-duckdns
+    environment:
+      PUID: 1000
+      PGID: 1000
+      TZ: Asia/Tokyo
+      SUBDOMAINS: alan-holdem
+      TOKEN: ${DUCKDNS_TOKEN}
+      LOG_FILE: "false"
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  caddy_data:
+  caddy_config:

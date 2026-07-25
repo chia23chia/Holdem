@@ -245,9 +245,9 @@ Server(server/src/auth.ts authMiddleware):
 | `lobby:subscribe` | — | — | 加入 `lobby` channel、emit 初始 `lobby:rooms` |
 | `lobby:unsubscribe` | — | — | 離開 `lobby` channel |
 | `room:join` | `{roomId, seat?}` | `JoinRoomResult` | `seatUser`(扣 buyIn);`seat` 省略 = 自動找第一個空位;`seat` 給 = 指定座位(被佔會回錯誤) |
-| `room:leave` | `{roomId}` | — | `handleLeave` → `unseatUser`(退籌)、空房自動關 |
+| `room:leave` | `{roomId}` | — | **僅離開 socket channel**;座位/Membership/chipsAtTable **不動**(session 內可回來繼續)。真的要退出座位要 `room:standup` |
 | `room:subscribe` | `{roomId}` | — | 加入 `room:<id>` 當觀戰(不需要 membership)、emit `room:detail` |
-| `room:standup` | `{roomId}` | — | Unseat + 退籌,**保留訂閱**(變觀戰);若空房則關閉 |
+| `room:standup` | `{roomId}` | — | Unseat + 退籌回 chipsBalance,**保留訂閱**(變觀戰);手牌進行中拒絕;若空房自動關閉。不依賴 socket-local 狀態,DB Membership 為準 |
 | `room:close` | `{roomId}` | `CloseRoomResult` | `ownerCloseRoom`(驗權 + 全部退籌 + status=closed)、廣播 `room:closed` |
 | `game:start` | `{roomId}` | `GameActionResult` | 只有房主;server 從 Room 讀 `actionTimeoutSeconds`;發手牌給就座玩家(≥2 人)、廣播 `game:started` + 私人 `game:hole` |
 | `game:end` | `{roomId}` | `GameActionResult` | 房主 debug;強制清掉 hand state、廣播 `game:ended`(不帶 result) |
@@ -350,11 +350,23 @@ Server(server/src/auth.ts authMiddleware):
   - [x] **Milestone 2.2** — No-Limit Hold'em 完整一手:自動貼盲注、preflop 開始下注輪(fold/check/call/raise/all-in)、行動順序(heads-up + 3+ 特殊 first-to-act 處理)、`toAct` set 追蹤還沒行動的人(BB 選項 + 加注重新 reopen action 都靠這個)、flop/turn/river 依 street 發公共牌 + 每街新一輪下注、只剩 1 人未 fold → fold-out 直接贏、走到 showdown → `pokersolver` 判贏、平手 pot 平分、贏家 chips 累加後 persist 到 `Membership.chipsAtTable`、環狀桌面顯示 chips/bet/dealer(D)/位置代號/active player 高亮/showdown 揭手牌 + 中文牌型(自己的手牌只在環下方 "你的手牌" 區顯示,不重複貼在座位卡)、手牌結束 8 秒倒數**純自動**開下一手(client-side,owner 端 emit,無提前按鈕;倒數 key 綁 `handNumber` 所以中途秀牌 re-emit 不會 reset)、**action timeout 設定改為 room-level**(建房 form 選一次,整局固定,`game:start` 不再帶 param → 避免每手都問玩家)、pokersolver hand `name` 送到 client 翻譯 10 種牌型為中文(皇家同花順 / 同花順 / 四條 / 葫蘆 / 同花 / 順子 / 三條 / 兩對 / 一對 / 高牌)、**即時牌型**(自己的當前最佳牌型顯示在手牌旁,每翻一張公共牌 server 重推 `game:hole`;preflop 用簡單 2-card check「一對」或「高牌」)、**動作紀錄** 側邊面板 tab(聊天 / 本手紀錄 切換);client 累積每手成 `HandRecord[]`(hand number、history、endResult),**跨手保留**在 client memory,可用「上一手 / 下一手 / 回到最新」導覽;每手手牌進行中內文隱藏、結束才展開動作 + 各街公共牌 + 攤牌/秀牌;fold-out 贏家可按「秀牌」emit `game:show-cards` 讓 server 補進 `endResult.revealedHoles` → 再廣播 `game:ended` 讓大家看到。**尚未 persist**(重整 tab 就沒了、server 也不存),未來規劃寫進雲端資料夾。**簡化**:min raise = big blind、沒有 side pot(all-in 多層時大 pot 全給高手優先,不完全準確 → 2.2c 才補)。
   - [ ] Milestone 2.2c — Side pot(all-in 多層正確分派)
   - [x] **Milestone 2.4** — 行動超時 auto-action:server 每次輪到新玩家算 `deadline = now + Room.actionTimeoutSeconds*1000`,寫進 `HandState.deadline` 廣播;server 用 `setTimeout` 綁 deadline,到期沒動作就自動 check(可過的話)或 fold;client 依 deadline tick 顯示座位卡 + ActionBar 剩餘秒數(<=5s 變紅);cancel 時機:每次 action / 街轉換 / hand 結束 / 房間關 / 系統關房 |
-  - [ ] Milestone 2.5 — 斷線重連寬限期 + Room.status waiting↔playing 互鎖(跟 seatUser / standup / ownerCloseRoom)
+  - [x] **Milestone 2.5** — Session 內座位/籌碼持久化 + Room.status 互鎖:
+    - **`room:leave` 不 unseat**、**`disconnect` 不 unseat**(手牌中 auto-fold 靠 deadline 機制,手牌後 chipsAtTable 保留)。玩家關 tab / 換分頁 / 掉線後,座位跟 chipsAtTable 都留著,回同房會拿回原座位跟籌碼
+    - 唯二會退籌的路徑:`room:standup`(手牌後,自願站起)/ session-end settlement(auto-close 或 owner-close)
+    - `Room.status` 在 `game:start` 成功後 flip 成 `playing`,`broadcastAfterAction ended` / `game:end` debug 後 flip 回 `waiting`。`ownerCloseRoom` 在 `playing` 時拒絕(必須等手牌結束)
+    - `standup` 不再依賴 socket-local `seatedRoomId`,以 DB Membership 為準,支援 fresh socket 重連後站起
+    - **未做**:「XX 斷線中」座位 UI 提示、mid-hand `standup` 允許(仍拒絕,要等手牌結束)
   - [x] **Milestone 2.6** — 手牌 persist 到 DB(`HandLog` model,一手一 row jsonb `HandLogData`);server 在 `broadcastAfterAction` 手牌結束後寫入,`handNumber` 由 server `countHandLogs + 1` 決定並塞進 `HandStatePublic` 避免 client 端 race;`GET /api/rooms/:id/hands` REST 供 client mount 時 fetch merge(**只保留當前房間 session 期間**);voluntary `game:show-cards` 也會 patch `handLog.data.endResult`;隱私:muck 手牌不寫進 log(照使用者選 (b) 攤牌 + 自願秀才可見);**房間關閉時**(owner close / session expired / 房間空掉自動關)`deleteHandLogsForRoom(roomId)` 整批清掉該房 log,不跨 session 累積;**雲端資料夾** (Google Drive / S3 / 檔案系統匯出)未做
 - [ ] **Phase 3** — 房間聊天升級(目前部分有;lobby chat model 要重整)
 - [ ] **Phase 4** — SNG 錦標賽(盲注升級、淘汰、獎金分配)
 - [ ] **Phase 5** — UI 打磨 + Oracle VPS 部署(Docker Compose + Caddy)
+  - [x] 部署 artefacts:`Dockerfile.web` / `Dockerfile.server` / `docker-compose.prod.yml` / `Caddyfile` / `.env.prod.example` / `DEPLOY.md`
+    - Web:multi-stage,build 時 bake `NEXT_PUBLIC_SOCKET_URL`
+    - Server:直接跑 `tsx src/index.ts`(避開 workspace TS 解析),進 container 前先 `prisma db push --accept-data-loss`
+    - Caddy:反向代理 `alan-holdem.duckdns.org` → `web:3000`(Next.js)+ `/socket.io/*` → `server:3001`;auto SSL(Let's Encrypt)
+    - Postgres:同 network,`postgres:5432`
+    - DuckDNS 更新器 sidecar 每 5 min ping token 保持 DNS
+  - [ ] **實際部署到 VM**(需 SSH 執行 `DEPLOY.md` 步驟)
 
 ---
 
@@ -451,11 +463,16 @@ DB 持久化延到 Milestone 2.5(斷線寬限)才做。
 
 `game:hole` **只能**推給特定 socket,絕不廣播到 room channel。實作用 `io.in(channel).fetchSockets()` + 每個 socket 個別 `rs.emit('game:hole', priv)`。如果之後 refactor 改用 `.to()` 或 namespace 廣播,務必確認手牌不會外洩。
 
-### 11.17 手牌中禁止站起(2.2 → 2.5 才放行)
+### 11.17 手牌中禁止站起 + Exit-不-unseat(Milestone 2.5 收斂)
 
-`room:standup` handler 若 `hasActiveHand(roomId)` 為真,直接回 `room:error`「牌局進行中無法站起,請先蓋牌等這手結束」。理由:mid-hand 把 player 從 `hand.players` 拔掉會弄亂 `toAct` / `currentPlayerIdx` / 對手期待,實作成本高。Milestone 2.5 補 auto-fold + hand state fixup 後再放行。
+`room:standup` handler 若 `hasActiveHand(roomId)` 為真,回 `room:error`「牌局進行中無法站起」。理由:mid-hand 把 player 從 `hand.players` 拔掉會弄亂 `toAct` / `currentPlayerIdx` / 對手期待,實作成本高。之後若真的要放行,設計是 auto-fold + 保留 stack 給 session end 結算。
 
-**Disconnect 例外**:socket 直接斷線走 `handleLeave` → `unseatUser` 不會擋(該路徑目前沒 active-hand 檢查)。等於斷線時強制拔人,可能弄壞當前 hand 狀態。Milestone 2.5 要一起補這個路徑。
+**Disconnect / room:leave 現況(2.5)**:兩個路徑都**不 unseat**。玩家關 tab / 斷線 / 按離開房間都只是離開 socket channel,座位跟 chipsAtTable 留在 DB。手牌中的 turn 靠 `runAutoAction` deadline 自動 check/fold。這樣做的效果:
+- 「贏 20 → 斷線」→ chipsAtTable 保留 1020,session-end settlement 退回
+- 「贏 20 → 站起」(手牌後)→ `unseatUser` 立即退 1020 到 chipsBalance
+- 「贏 20 → 離開房間」→ 座位留著,session-end settlement 退
+
+真的要「不玩了」只能 `站起`(等手牌結束)。空房自動關的觸發變成:「所有人都主動站起 / owner-close / session-expire」。單純大家斷線的房會活到 session 到期為止。
 
 ---
 

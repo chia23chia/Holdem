@@ -178,6 +178,18 @@ export async function closeRoom(roomId: string): Promise<void> {
   });
 }
 
+// Set Room.status. Used by hand-start / hand-end transitions to toggle
+// waiting↔playing. Idempotent — writes even if same value (cost negligible).
+export async function setRoomStatus(
+  roomId: string,
+  status: 'waiting' | 'playing' | 'closed',
+): Promise<void> {
+  await prisma.room.update({
+    where: { id: roomId },
+    data: { status },
+  });
+}
+
 export type CloseOutcome =
   | { ok: true; kickedUserIds: string[] }
   | { ok: false; error: string };

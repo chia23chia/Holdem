@@ -1,0 +1,22 @@
+# Caddy config — automatic HTTPS via Let's Encrypt.
+# Requires DNS `alan-holdem.duckdns.org` → this server's public IP AND
+# ports 80/443 reachable from the internet (OCI Security List + host firewall).
+# Caddy 2 handles websocket upgrades on reverse_proxy transparently.
+
+alan-holdem.duckdns.org {
+  encode zstd gzip
+
+  # Socket.IO endpoint (path preserved).
+  reverse_proxy /socket.io/* server:3001
+
+  # Optional server health probe.
+  reverse_proxy /health server:3001
+
+  # Everything else → Next.js.
+  reverse_proxy web:3000
+
+  log {
+    output stdout
+    format console
+  }
+}
