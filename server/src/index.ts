@@ -36,7 +36,6 @@ import {
   getHand,
   getPrivateFor,
   hasActiveHand,
-  hasHand,
   startHand,
   toPublicState,
   type AppliedActionLog,
@@ -314,7 +313,6 @@ io.on('connection', (socket) => {
 
   // Track which room this socket is subscribed to for cleanup on disconnect.
   let subscribedRoomId: string | null = null;
-  let seatedRoomId: string | null = null;
 
   // ---- Lobby ----
   socket.on('lobby:subscribe', async () => {
@@ -333,7 +331,6 @@ io.on('connection', (socket) => {
       cb({ ok: false, error: outcome.error });
       return;
     }
-    seatedRoomId = roomId;
     cb({ ok: true });
     await broadcastLobbyList();
     await broadcastRoomDetail(roomId);
@@ -377,8 +374,9 @@ io.on('connection', (socket) => {
   });
 
   // Standup: unseat + refund, keep subscription so user remains a spectator.
-  // Does NOT depend on socket-local `seatedRoomId` — a fresh socket after
-  // reconnect might not have that cached, but their Membership persists in DB.
+  // Does NOT depend on any socket-local seated-room cache — a fresh socket
+  // after reconnect might not have that cached, but their Membership
+  // persists in DB.
   socket.on('room:standup', async ({ roomId }) => {
     if (hasActiveHand(roomId)) {
       socket.emit('room:error', {
@@ -387,7 +385,6 @@ io.on('connection', (socket) => {
       return;
     }
     const { empty } = await unseatUser(user.userId, roomId);
-    seatedRoomId = null;
     await finalizeRoomState(roomId, empty);
   });
 

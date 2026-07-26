@@ -86,8 +86,11 @@ export function hasActiveHand(roomId: string): boolean {
   return !!h && h.phase !== 'ended';
 }
 
-export function hasHand(roomId: string): boolean {
-  return hands.has(roomId);
+// Isolated in its own function so TS re-checks the full `phase` union instead
+// of the narrowed-to-exclude-'ended' type callers get after their own earlier
+// `phase !== 'ended'` guard — advanceAfterAction can still set it to 'ended'.
+function isEnded(hand: HandState): boolean {
+  return hand.phase === 'ended';
 }
 
 export function endHand(roomId: string): void {
@@ -341,7 +344,7 @@ export function applyAction(
 
   advanceAfterAction(hand);
   refreshDeadline(hand);
-  return { ok: true, ended: hand.phase === 'ended', log };
+  return { ok: true, ended: isEnded(hand), log };
 }
 
 // After a full raise, every OTHER active player must decide again.
