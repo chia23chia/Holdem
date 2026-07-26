@@ -2,7 +2,7 @@
 
 Holdem 專案的深度參考文件。README 負責入門(如何啟動),本檔負責描述程式碼結構、契約與設計決策。有架構性變動(新事件、新 model、新 endpoint、新踩坑)才更新。
 
-最後更新:2026-07-25(Phase 2 全部子 milestone 完成、Phase 5 已上線、play-money + rebuy 剛實作)
+最後更新:2026-07-26(side pot、rebuy 選擇制、broadcastAfterAction 容錯、Google Sheets 自動同步)
 
 ---
 
