@@ -37,6 +37,8 @@ services:
       DATABASE_URL: postgresql://holdem:${POSTGRES_PASSWORD}@postgres:5432/holdem
       CORS_ORIGIN: https://alan-holdem.duckdns.org
       NEXTAUTH_SECRET: ${NEXTAUTH_SECRET}
+      GOOGLE_SHEETS_SA_KEY: ${GOOGLE_SHEETS_SA_KEY}
+      GOOGLE_SHEETS_SPREADSHEET_ID: ${GOOGLE_SHEETS_SPREADSHEET_ID}
     depends_on:
       postgres:
         condition: service_healthy

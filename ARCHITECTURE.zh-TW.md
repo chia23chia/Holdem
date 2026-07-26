@@ -37,8 +37,8 @@ docker compose -f docker-compose.prod.yml --env-file .env.prod logs -f --tail=50
 
 - ✅ Phase 1-2 全部完成(OAuth、lobby、rooms、game engine 含下注/showdown/side-pot/timeout/reconnect/hand-log/rebuy)
 - ✅ Phase 5 已實際部署,`https` 拿到 Let's Encrypt,Google OAuth prod client 已加 `alan-holdem.duckdns.org` callback
-- ✅ play-money 模式 + rebuy + 結算輸贏欄已部署上 prod(VM 已 pull `8708e6a` 並 rebuild)
-- ⏳ **剛實作但未部署**:正確 side pot、rebuy 規則(歸零才能補 + chip-leader 上限,捨到 500)、broadcastAfterAction 容錯(避免 lag 導致 auto-action 計時器掛掉卡死整桌)、歷史紀錄補籌碼快照
+- ✅ play-money 模式 + rebuy + 結算輸贏欄已部署上 prod
+- ✅ 正確 side pot、rebuy 規則(歸零才能補 + chip-leader 上限,捨到 500,玩家自選金額)、broadcastAfterAction 容錯(避免 lag 導致 auto-action 計時器掛掉卡死整桌)、歷史紀錄補籌碼快照 —— 皆已部署上 prod(VM 已 pull `54fb117` 並 rebuild)
 - ❌ 未做:Phase 3 chat 系統訊息、Phase 4 SNG、雲端手牌 log 匯出、跨房 chipsBalance 追蹤
 
 ### 已知踩過的坑(避免重蹈)
@@ -541,6 +541,19 @@ DB 持久化延到 Milestone 2.5(斷線寬限)才做。
 
 長期追蹤功能之後補時,再把 chipsBalance 拉回計算流程(可能 rebuy 從 chipsBalance 扣、settlement 寫回 chipsBalance)。
 
+### 11.19 Google Sheets 自動同步(2026-07-26 起,選填)
+
+每次房間結算(`room:close` 房主關房 / session 到期自動關房)成功後,`server/src/sheetsSync.ts` 的 `syncSettlementToSheet` 會把該局每位玩家的結果 append 進一份外部 Google Sheet,方便長期戰績追蹤跟復盤。**完全選填** —— 沒設定對應環境變數就整個 no-op,不影響正常關房流程。
+
+- **驗證方式**:Service Account(不是使用者 OAuth),JSON 金鑰 base64 編碼後放進 `GOOGLE_SHEETS_SA_KEY`;目標試算表要另外用「共用」把該 service account 的 `client_email` 加為編輯者。
+- **寫入方式**:直接呼叫 Sheets API v4 REST(`google-auth-library` 只拿來換 access token,沒有用整包 `googleapis`,減少依賴體積)。
+- **目標試算表結構**(`sheetsSync.ts` 第一次寫入時自動建立,不需要使用者手動建表頭):
+  - 分頁「對局紀錄」:純 append-only log,一場結算 = N 列(N=玩家數)。欄位:日期時間、房間、玩家、買入、結算籌碼、淨輸贏
+  - 分頁「總排行」:只在 bootstrap 時寫入一次動態陣列公式(`UNIQUE`+`SUMIF`+`COUNTIF`),之後會自己跟著「對局紀錄」即時更新,app 不用重寫
+- **玩家名稱**:直接用 app 的 `SettlementSummary.players[].name`(= `nickname ?? name`),沒有額外對應表 —— 這是刻意設計成「新表格從下一次有玩的人開始長」,不去對應任何舊有的名字/代號系統。
+- **失敗處理**:`syncSettlementSafely`(index.ts)把整個呼叫包在 fire-and-forget + try/catch,Sheets API 掛掉或沒設定都不會擋到、也不會讓房間結算失敗。
+- **每個 process 只 bootstrap 一次**:`sheetsSync.ts` 內部用 `Set<spreadsheetId>` 記住已確認過分頁結構的試算表,同一個 process 生命週期內不會重複檢查/建立分頁。
+
 ---
 
 ## 12. 環境變數
@@ -564,6 +577,8 @@ DB 持久化延到 Milestone 2.5(斷線寬限)才做。
 | `DATABASE_URL` | 跟 web 同一個 DB |
 | `CORS_ORIGIN` | 允許的 browser origin(預設 `http://localhost:3000`) |
 | `NEXTAUTH_SECRET` | 要跟 web 一致 — server 用它驗握手 JWT |
+| `GOOGLE_SHEETS_SA_KEY` | 選填,見 §11.19。Service account JSON 金鑰整份 base64 編碼成一行 |
+| `GOOGLE_SHEETS_SPREADSHEET_ID` | 選填,見 §11.19。留空則整個 Sheets 同步功能自動關閉 |
 
 ### 12.3 `db/.env`
 

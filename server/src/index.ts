@@ -3,6 +3,7 @@ import { Server } from 'socket.io';
 import type {
   ClientToServerEvents,
   ServerToClientEvents,
+  SettlementSummary,
 } from '@holdem/shared';
 import { authMiddleware, getUser } from './auth.js';
 import {
@@ -25,6 +26,7 @@ import {
   unseatUser,
   updateHandLogEndResult,
 } from './rooms.js';
+import { syncSettlementToSheet } from './sheetsSync.js';
 import {
   applyAction,
   applyReveal,
@@ -139,6 +141,14 @@ async function drainPendingRebuys(roomId: string): Promise<void> {
   }
 }
 
+
+// Fire-and-forget: a Google Sheets hiccup (or it simply not being
+// configured) must never fail or delay a room close.
+function syncSettlementSafely(summary: SettlementSummary): void {
+  void syncSettlementToSheet(summary).catch((err) => {
+    console.error('[server] syncSettlementToSheet error', err);
+  });
+}
 
 function cancelAutoAction(roomId: string): void {
   const t = autoActionTimers.get(roomId);
@@ -432,6 +442,7 @@ io.on('connection', (socket) => {
     pendingRebuysByRoom.delete(roomId);
     await deleteHandLogsForRoom(roomId);
     const settlement = await buildOwnerCloseSettlement(roomId, players);
+    if (settlement) syncSettlementSafely(settlement);
     cb({ ok: true });
     io.to(roomChannel(roomId)).emit('room:closed', {
       roomId,
@@ -565,6 +576,7 @@ async function scanExpiredSessions() {
         'session-expired',
       );
       if (!settlement) continue;
+      syncSettlementSafely(settlement);
       cancelAutoAction(roomId);
       clearRoomState(roomId);
       lastHandLogIdByRoom.delete(roomId);

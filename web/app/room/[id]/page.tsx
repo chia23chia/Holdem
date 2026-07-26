@@ -1696,6 +1696,11 @@ function SettlementModal({
     summary.reason === 'session-expired'
       ? '遊戲時間到'
       : '房主關閉房間';
+  // Ranked by net win/loss, biggest winner first.
+  const rankedPlayers = [...summary.players].sort(
+    (a, b) =>
+      b.chipsAtTable - b.totalBuyIn - (a.chipsAtTable - a.totalBuyIn),
+  );
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
       <div className="w-full max-w-md rounded-lg border border-slate-700 bg-slate-900 p-6">
@@ -1707,6 +1712,7 @@ function SettlementModal({
           <table className="mb-4 w-full text-sm">
             <thead>
               <tr className="border-b border-slate-700 text-left text-xs text-slate-400">
+                <th className="py-1">名次</th>
                 <th className="py-1">玩家</th>
                 <th className="py-1 text-right">買入</th>
                 <th className="py-1 text-right">剩下</th>
@@ -1714,7 +1720,7 @@ function SettlementModal({
               </tr>
             </thead>
             <tbody>
-              {summary.players.map((p) => {
+              {rankedPlayers.map((p, i) => {
                 const net = p.chipsAtTable - p.totalBuyIn;
                 const netStr =
                   net > 0 ? `+${net}` : net < 0 ? `${net}` : '±0';
@@ -1726,6 +1732,7 @@ function SettlementModal({
                       : 'text-slate-500';
                 return (
                   <tr key={p.userId} className="border-b border-slate-800">
+                    <td className="py-1 text-slate-400">{i + 1}</td>
                     <td className="py-1">{p.name}</td>
                     <td className="py-1 text-right font-mono text-slate-400">
                       {p.totalBuyIn}
