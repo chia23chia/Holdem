@@ -109,18 +109,20 @@ const autoActionTimers = new Map<string, NodeJS.Timeout>();
 const lastHandLogIdByRoom = new Map<string, string>();
 
 // Rebuy queue: mid-hand rebuy requests wait here. Applied to Membership
-// after the hand ends, before the next one starts. Value = number of pending
-// rebuy attempts (each resolved against the zero-chips + chip-leader-cap
-// rule in `rebuyChips` at apply time, so a stale request just no-ops).
+// after the hand ends, before the next one starts. Value = the requested
+// amount (re-validated against the zero-chips + chip-leader-cap rule in
+// `rebuyChips` at apply time, so a stale/no-longer-valid request is rejected
+// rather than silently over-granting). A later request from the same player
+// overwrites an earlier one — only their latest choice matters.
 const pendingRebuysByRoom = new Map<string, Map<string, number>>();
 
-function queuePendingRebuy(roomId: string, userId: string): void {
+function queuePendingRebuy(roomId: string, userId: string, amount: number): void {
   let byUser = pendingRebuysByRoom.get(roomId);
   if (!byUser) {
     byUser = new Map();
     pendingRebuysByRoom.set(roomId, byUser);
   }
-  byUser.set(userId, (byUser.get(userId) ?? 0) + 1);
+  byUser.set(userId, amount);
 }
 
 async function drainPendingRebuys(roomId: string): Promise<void> {
@@ -128,13 +130,11 @@ async function drainPendingRebuys(roomId: string): Promise<void> {
   if (!byUser || byUser.size === 0) return;
   const entries = [...byUser.entries()];
   byUser.clear();
-  for (const [userId, count] of entries) {
-    for (let i = 0; i < count; i++) {
-      try {
-        await rebuyChips(userId, roomId);
-      } catch (err) {
-        console.error('[server] drain rebuy error', err);
-      }
+  for (const [userId, amount] of entries) {
+    try {
+      await rebuyChips(userId, roomId, amount);
+    } catch (err) {
+      console.error('[server] drain rebuy error', err);
     }
   }
 }
@@ -199,19 +199,35 @@ async function broadcastAfterAction(
   });
   io.to(roomChannel(roomId)).emit('game:state', toPublicState(hand));
 
+  // Below this point, every step is wrapped individually: a transient
+  // failure (DB hiccup, slow socket under lag, etc.) in any one of them must
+  // NOT stop the others from running — and must never skip the final
+  // `rescheduleAutoAction` at the bottom. Losing that reschedule kills the
+  // room's auto-fold/auto-check safety net permanently: the client's
+  // countdown is computed locally from the last `deadline` it received, so
+  // it keeps visually ticking while the server has actually given up and
+  // nothing will ever deal the next card.
   if (phaseBefore && hand.phase !== phaseBefore) {
-    const roomSockets = await io.in(roomChannel(roomId)).fetchSockets();
-    for (const rs of roomSockets) {
-      const rsUser = rs.data.user as { userId: string } | undefined;
-      if (!rsUser) continue;
-      const priv = getPrivateFor(hand, rsUser.userId);
-      if (priv) rs.emit('game:hole', priv);
+    try {
+      const roomSockets = await io.in(roomChannel(roomId)).fetchSockets();
+      for (const rs of roomSockets) {
+        const rsUser = rs.data.user as { userId: string } | undefined;
+        if (!rsUser) continue;
+        const priv = getPrivateFor(hand, rsUser.userId);
+        if (priv) rs.emit('game:hole', priv);
+      }
+    } catch (err) {
+      console.error('[server] game:hole broadcast error', err);
     }
   }
 
   if (ended) {
-    const snap = chipsSnapshot(hand);
-    await persistHandResult(roomId, snap);
+    try {
+      const snap = chipsSnapshot(hand);
+      await persistHandResult(roomId, snap);
+    } catch (err) {
+      console.error('[server] persistHandResult error', err);
+    }
     const result = getEndResult(hand);
     // Persist the completed hand to HandLog for later review / cross-session.
     try {
@@ -226,15 +242,29 @@ async function broadcastAfterAction(
       console.error('[server] persistHandLog error', err);
     }
     // Flip room back to 'waiting' — owner can now close between hands.
-    await setRoomStatus(roomId, 'waiting');
+    try {
+      await setRoomStatus(roomId, 'waiting');
+    } catch (err) {
+      console.error('[server] setRoomStatus error', err);
+    }
     // Apply any queued rebuys BEFORE broadcasting so clients see the updated
     // chipsAtTable in the same room:detail push.
-    await drainPendingRebuys(roomId);
+    try {
+      await drainPendingRebuys(roomId);
+    } catch (err) {
+      console.error('[server] drainPendingRebuys error', err);
+    }
+    // Always tell clients the hand ended, even if persistence above failed —
+    // otherwise their UI stays frozen on the last in-progress state forever.
     io.to(roomChannel(roomId)).emit('game:ended', {
       roomId,
       result: result ?? undefined,
     });
-    await broadcastRoomDetail(roomId);
+    try {
+      await broadcastRoomDetail(roomId);
+    } catch (err) {
+      console.error('[server] broadcastRoomDetail error', err);
+    }
   }
 
   rescheduleAutoAction(roomId);
@@ -410,16 +440,17 @@ io.on('connection', (socket) => {
     io.to(LOBBY_ROOM).emit('lobby:room-removed', { roomId });
   });
 
-  // Rebuy: only allowed once chipsAtTable hits 0; amount is capped at the
-  // chip leader's stack (see rebuyChips for the exact rule). Mid-hand →
-  // queued for hand end. Between-hand → applied immediately.
-  socket.on('room:rebuy', async ({ roomId }, cb) => {
+  // Rebuy: only allowed once chipsAtTable hits 0; caller picks the amount,
+  // capped at the chip leader's stack rounded to 500 (see rebuyChips for the
+  // exact rule). Mid-hand → queued for hand end. Between-hand → applied
+  // immediately.
+  socket.on('room:rebuy', async ({ roomId, amount }, cb) => {
     if (hasActiveHand(roomId)) {
-      queuePendingRebuy(roomId, user.userId);
+      queuePendingRebuy(roomId, user.userId, amount);
       cb({ ok: true });
       return;
     }
-    const outcome = await rebuyChips(user.userId, roomId);
+    const outcome = await rebuyChips(user.userId, roomId, amount);
     if (!outcome.ok) return cb({ ok: false, error: outcome.error });
     cb({ ok: true });
     await broadcastRoomDetail(roomId);

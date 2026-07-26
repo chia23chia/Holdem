@@ -45,13 +45,24 @@ export interface HandStatePublic {
   players: HandPlayerPublic[];      // Ordered by seat ascending
 }
 
+// Per-player chip snapshot for one hand — everyone's stack at that point, for
+// history/review. Shared shape between the live game:ended broadcast and the
+// persisted HandLogData so both surface the same data without re-deriving it.
+export interface HandPlayerChipSnapshot {
+  seat: number;
+  userId: string;
+  name: string;
+  startingChips: number; // Stack at the start of this hand
+  finalChips: number;    // Stack after this hand's result was applied
+}
+
 // Broadcast in `game:ended.result` when a hand concludes.
 export interface HandEndResult {
   reason: 'fold-out' | 'showdown';
   winners: Array<{
     userId: string;
     name: string;
-    amount: number;    // Chips won from pot
+    amount: number;    // Chips won from pot (summed across all side pots)
     handRank?: string; // pokersolver short name (e.g. "Two Pair") — showdown only
   }>;
   // Hole cards to reveal to all subscribers at showdown.
@@ -61,6 +72,7 @@ export interface HandEndResult {
     holeCards: [Card, Card];
     handRank: string; // pokersolver short name (translated client-side to Chinese)
   }>;
+  players: HandPlayerChipSnapshot[]; // Everyone's stack once this hand settled
 }
 
 // Client → server player action.
@@ -122,13 +134,7 @@ export interface HandLogData {
   smallBlind: number;
   bigBlind: number;
   actionTimeoutSeconds: number;
-  players: Array<{
-    seat: number;
-    userId: string;
-    name: string;
-    startingChips: number;
-    finalChips: number;
-  }>;
+  players: HandPlayerChipSnapshot[];
   history: HandHistoryEntry[];
   endResult: HandEndResult;
 }
@@ -213,8 +219,9 @@ export interface ClientToServerEvents {
   'room:subscribe': (data: { roomId: string }) => void;
   'room:standup': (data: { roomId: string }) => void;
   'room:close': (data: { roomId: string }, cb: (res: CloseRoomResult) => void) => void;
-  // Rebuy — always +room.buyIn. Mid-hand → queued, applied when hand ends.
-  'room:rebuy': (data: { roomId: string }, cb: (res: GameActionResult) => void) => void;
+  // Rebuy — caller picks amount (must be a multiple of 500, capped by the
+  // chip leader; see rebuyChips). Mid-hand → queued, applied when hand ends.
+  'room:rebuy': (data: { roomId: string; amount: number }, cb: (res: GameActionResult) => void) => void;
 
   'chat:send': (data: { roomId: string | null; text: string }) => void;
 

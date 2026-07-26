@@ -7,6 +7,7 @@ import type {
   HandEndResult,
   HandHistoryEntry,
   HandLogData,
+  HandPlayerChipSnapshot,
   HandPlayerPublic,
   HandStatePrivate,
   HandStatePublic,
@@ -523,10 +524,45 @@ function endWithFoldout(hand: HandState, winner: Player): void {
       { userId: winner.userId, name: winner.name, amount: hand.pot },
     ],
     revealedHoles: [],
+    players: buildChipSnapshot(hand),
   };
   hand.pot = 0;
   hand.currentPlayerIdx = null;
   hand.phase = 'ended';
+}
+
+// One slice of the pot at a given contribution level. `amount` is what
+// everyone at/above `level` chipped in for this slice; `eligible` is who's
+// still in the hand (not folded) and therefore allowed to win it.
+interface PotLayer {
+  amount: number;
+  eligible: Player[];
+}
+
+// Splits the hand's total contributions into side-pot layers so nobody can
+// win more than they (and everyone who matched them) actually put in.
+// Folded players' chips still count toward layer sizes — they just can't be
+// eligible winners — and a layer with only one eligible player is exactly
+// how an uncalled/conceded bet gets returned to whoever put it in.
+function buildSidePots(players: Player[]): PotLayer[] {
+  const contributors = players.filter((p) => p.totalBet > 0);
+  const levels = [...new Set(contributors.map((p) => p.totalBet))].sort(
+    (a, b) => a - b,
+  );
+  const layers: PotLayer[] = [];
+  let prevLevel = 0;
+  for (const level of levels) {
+    const atOrAbove = contributors.filter((p) => p.totalBet >= level);
+    const amount = (level - prevLevel) * atOrAbove.length;
+    if (amount > 0) {
+      layers.push({
+        amount,
+        eligible: atOrAbove.filter((p) => p.status !== 'folded'),
+      });
+    }
+    prevLevel = level;
+  }
+  return layers;
 }
 
 function endWithShowdown(hand: HandState): void {
@@ -537,42 +573,54 @@ function endWithShowdown(hand: HandState): void {
     const cards = [...p.holeCards.map(cardToStr), ...boardStrs];
     return { player: p, hand: PokerHand.solve(cards) };
   });
-  const winners = PokerHand.winners(solved.map((s) => s.hand));
-  const winnerPlayers = solved
-    .filter((s) => winners.includes(s.hand))
-    .map((s) => s.player);
+  const solvedFor = (p: Player) => solved.find((s) => s.player === p)!;
 
-  // Simplified pot split: divide pot equally among winners. Side pots (2.2c)
-  // will make this correct for all-in scenarios.
-  const share = Math.floor(hand.pot / winnerPlayers.length);
-  const remainder = hand.pot - share * winnerPlayers.length;
-
-  const winnerResults: HandEndResult['winners'] = winnerPlayers.map(
-    (p, i) => {
+  // Award each side-pot layer independently — a short-stacked all-in can
+  // only win what they (and their callers) put in; any excess above that
+  // stays in a higher layer that only the deeper stacks are eligible for.
+  const wonByUserId = new Map<string, number>();
+  for (const layer of buildSidePots(hand.players)) {
+    const eligibleSolved = layer.eligible.map(solvedFor);
+    if (eligibleSolved.length === 0) continue; // defensive; shouldn't happen
+    const layerWinningHands = PokerHand.winners(
+      eligibleSolved.map((s) => s.hand),
+    );
+    const layerWinners = eligibleSolved.filter((s) =>
+      layerWinningHands.includes(s.hand),
+    );
+    const share = Math.floor(layer.amount / layerWinners.length);
+    const remainder = layer.amount - share * layerWinners.length;
+    layerWinners.forEach((s, i) => {
       const amount = share + (i === 0 ? remainder : 0);
-      p.chips += amount;
-      const solvedForP = solved.find((s) => s.player === p)!;
-      return {
-        userId: p.userId,
-        name: p.name,
-        amount,
-        // Short name (e.g. "Two Pair") — client translates to Chinese.
-        handRank: solvedForP.hand.name,
-      };
-    },
-  );
+      s.player.chips += amount;
+      wonByUserId.set(
+        s.player.userId,
+        (wonByUserId.get(s.player.userId) ?? 0) + amount,
+      );
+    });
+  }
+
+  // One aggregated entry per winner (they may have won across several
+  // layers), ordered by seat for stable, predictable display.
+  const winnerResults: HandEndResult['winners'] = contenders
+    .filter((p) => wonByUserId.has(p.userId))
+    .map((p) => ({
+      userId: p.userId,
+      name: p.name,
+      amount: wonByUserId.get(p.userId)!,
+      // Short name (e.g. "Two Pair") — client translates to Chinese.
+      handRank: solvedFor(p).hand.name,
+    }));
 
   hand.endResult = {
     reason: 'showdown',
     winners: winnerResults,
-    revealedHoles: contenders.map((p) => {
-      const solvedForP = solved.find((s) => s.player === p)!;
-      return {
-        userId: p.userId,
-        holeCards: p.holeCards,
-        handRank: solvedForP.hand.name,
-      };
-    }),
+    revealedHoles: contenders.map((p) => ({
+      userId: p.userId,
+      holeCards: p.holeCards,
+      handRank: solvedFor(p).hand.name,
+    })),
+    players: buildChipSnapshot(hand),
   };
   hand.pot = 0;
   hand.currentPlayerIdx = null;
@@ -661,6 +709,18 @@ export function getEndResult(hand: HandState): HandEndResult | null {
   return hand.endResult;
 }
 
+// Everyone's stack at this exact moment — called once final chip mutations
+// (showdown/foldout payouts) are already applied, so `finalChips` is settled.
+function buildChipSnapshot(hand: HandState): HandPlayerChipSnapshot[] {
+  return hand.players.map((p) => ({
+    seat: p.seat,
+    userId: p.userId,
+    name: p.name,
+    startingChips: p.startingChips,
+    finalChips: p.chips,
+  }));
+}
+
 // Serialise an ended hand into the JSON blob persisted in HandLog.data.
 // Must be called after phase === 'ended' — throws otherwise.
 export function buildHandLogData(hand: HandState): HandLogData {
@@ -674,13 +734,7 @@ export function buildHandLogData(hand: HandState): HandLogData {
     smallBlind: hand.smallBlind,
     bigBlind: hand.bigBlind,
     actionTimeoutSeconds: hand.actionTimeoutSeconds,
-    players: hand.players.map((p) => ({
-      seat: p.seat,
-      userId: p.userId,
-      name: p.name,
-      startingChips: p.startingChips,
-      finalChips: p.chips,
-    })),
+    players: hand.endResult.players,
     history: hand.history,
     endResult: hand.endResult,
   };

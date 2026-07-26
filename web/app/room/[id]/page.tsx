@@ -20,13 +20,12 @@ import { connectSocket, type TypedSocket } from '@/lib/socket';
 
 // Display-only estimate of the server's rebuy cap (see rebuyChips in
 // server/src/rooms.ts for the authoritative rule): rounds down to the
-// leading digit once the chip leader's stack exceeds the room's buyIn.
-// 1999 -> 1000, 601 -> 600. Mid-hand this can be stale (seats reflect
-// pre-hand chip counts), so it's shown as an estimate, not a promise.
-function roundToLeadingDigit(n: number): number {
-  if (n <= 0) return 0;
-  const magnitude = 10 ** Math.floor(Math.log10(n));
-  return Math.floor(n / magnitude) * magnitude;
+// nearest 500 once the chip leader's stack exceeds the room's buyIn.
+// 1999 -> 1500, 601 -> 500. Mid-hand this can be stale (seats reflect
+// pre-hand chip counts), so it's shown as an estimate — the server
+// re-validates the actual chosen amount at rebuy time.
+function roundDownTo500(n: number): number {
+  return Math.max(0, Math.floor(n / 500) * 500);
 }
 
 export default function RoomPage() {
@@ -351,13 +350,13 @@ export default function RoomPage() {
   // priority since DB chipsAtTable doesn't sync until the hand ends.
   const myChipsNow = myHandPlayer ? myHandPlayer.chips : (myOccupant?.chipsAtTable ?? 0);
   const canRebuy = iAmSeated && myChipsNow === 0;
-  const rebuyEstimate = room
+  const rebuyCapEstimate = room
     ? (() => {
         const leader = room.seats.reduce(
           (m, s) => Math.max(m, s.chipsAtTable),
           0,
         );
-        return leader > room.buyIn ? roundToLeadingDigit(leader) : room.buyIn;
+        return roundDownTo500(leader > room.buyIn ? leader : room.buyIn);
       })()
     : 0;
   const itsMyTurn =
@@ -405,11 +404,11 @@ export default function RoomPage() {
     setShowRebuyConfirm(true);
   }
 
-  function handleRebuyConfirm() {
+  function handleRebuyConfirm(amount: number) {
     if (!socketRef.current || !roomId) return;
     setError(null);
     setShowRebuyConfirm(false);
-    socketRef.current.emit('room:rebuy', { roomId }, (res) => {
+    socketRef.current.emit('room:rebuy', { roomId, amount }, (res) => {
       if (!res.ok) setError(res.error);
     });
   }
@@ -504,7 +503,7 @@ export default function RoomPage() {
                   : '立即加碼到桌上'
               }
             >
-              加碼(≈{rebuyEstimate})
+              加碼(上限≈{rebuyCapEstimate})
             </button>
           )}
           {canStartGame && (
@@ -573,7 +572,7 @@ export default function RoomPage() {
                 )}
                 {canRebuy && room && (
                   <MenuItem onClick={handleRebuy}>
-                    加碼(≈{rebuyEstimate})
+                    加碼(上限≈{rebuyCapEstimate})
                   </MenuItem>
                 )}
                 {canStartGame && (
@@ -987,35 +986,12 @@ export default function RoomPage() {
       )}
 
       {showRebuyConfirm && room && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
-          <div className="w-full max-w-sm rounded-lg border border-slate-700 bg-slate-900 p-6">
-            <h2 className="mb-3 text-lg font-bold">加碼(預估 {rebuyEstimate})?</h2>
-            <p className="mb-4 text-sm text-slate-300">
-              桌上籌碼會增加到約 {rebuyEstimate}(依目前檯面籌碼王計算,實際金額以系統回應為準)。
-              {gameState && (
-                <span className="mt-2 block text-xs text-amber-300">
-                  牌局進行中,將在**下一手開始前**才加到桌上。
-                </span>
-              )}
-            </p>
-            <div className="flex justify-end gap-2 text-sm">
-              <button
-                type="button"
-                onClick={() => setShowRebuyConfirm(false)}
-                className="rounded border border-slate-700 px-4 py-2 hover:bg-slate-800"
-              >
-                取消
-              </button>
-              <button
-                type="button"
-                onClick={handleRebuyConfirm}
-                className="rounded bg-emerald-600 px-4 py-2 font-semibold hover:bg-emerald-500"
-              >
-                確定加碼
-              </button>
-            </div>
-          </div>
-        </div>
+        <RebuyModal
+          capEstimate={rebuyCapEstimate}
+          midHand={!!gameState}
+          onCancel={() => setShowRebuyConfirm(false)}
+          onConfirm={handleRebuyConfirm}
+        />
       )}
 
       {showCloseConfirm && room && (
@@ -1208,6 +1184,37 @@ function HistoryList({
                   )}
                 </div>
               ))}
+              {hand.endResult.players.length > 0 && (
+                <div className="mt-2 border-t border-slate-800 pt-2 text-xs">
+                  <div className="mb-1 text-slate-500">本手結束籌碼</div>
+                  {hand.endResult.players.map((p) => {
+                    const delta = p.finalChips - p.startingChips;
+                    return (
+                      <div
+                        key={p.userId}
+                        className="flex items-center justify-between text-slate-300"
+                      >
+                        <span>{p.name}</span>
+                        <span>
+                          {p.startingChips} → {p.finalChips}
+                          <span
+                            className={
+                              delta > 0
+                                ? 'ml-1 text-emerald-400'
+                                : delta < 0
+                                  ? 'ml-1 text-red-400'
+                                  : 'ml-1 text-slate-500'
+                            }
+                          >
+                            ({delta > 0 ? '+' : ''}
+                            {delta})
+                          </span>
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </div>
           )}
         </>
@@ -1564,6 +1571,91 @@ function RaiseModal({
             className="rounded bg-amber-600 px-4 py-2 font-semibold text-slate-950 hover:bg-amber-500"
           >
             送出
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Lets the player pick how much to rebuy (must be a multiple of 500, capped
+// by the chip leader — see rebuyChips in server/src/rooms.ts). `capEstimate`
+// is a client-side guess (server re-validates the real cap on submit).
+function RebuyModal({
+  capEstimate,
+  midHand,
+  onCancel,
+  onConfirm,
+}: {
+  capEstimate: number;
+  midHand: boolean;
+  onCancel: () => void;
+  onConfirm: (amount: number) => void;
+}) {
+  const cap = Math.max(500, capEstimate);
+  const [amount, setAmount] = useState(cap);
+
+  function submit() {
+    if (!Number.isFinite(amount) || amount <= 0 || amount % 500 !== 0) return;
+    onConfirm(amount);
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
+      <div className="w-full max-w-sm rounded-lg border border-slate-700 bg-slate-900 p-6">
+        <h2 className="mb-3 text-lg font-bold">加碼金額</h2>
+        <div className="mb-3 flex flex-wrap gap-2">
+          <button
+            onClick={() => setAmount(500)}
+            className="rounded border border-slate-600 px-3 py-1.5 text-xs hover:bg-slate-800"
+          >
+            500
+          </button>
+          <button
+            onClick={() => setAmount(Math.max(500, roundDownTo500(cap / 2)))}
+            className="rounded border border-slate-600 px-3 py-1.5 text-xs hover:bg-slate-800"
+          >
+            半({Math.max(500, roundDownTo500(cap / 2))})
+          </button>
+          <button
+            onClick={() => setAmount(cap)}
+            className="rounded border border-emerald-700 px-3 py-1.5 text-xs text-emerald-300 hover:bg-emerald-950"
+          >
+            上限({cap})
+          </button>
+        </div>
+        <input
+          type="number"
+          autoFocus
+          step={500}
+          min={500}
+          max={cap}
+          className="mb-1 w-full rounded border border-slate-700 bg-slate-950 px-3 py-2 text-lg"
+          value={amount}
+          onChange={(e) => setAmount(Number(e.target.value))}
+        />
+        <div className="mb-4 text-[10px] text-slate-500">
+          必須是 500 的倍數,不超過目前檯面籌碼上限(≈{cap},實際以系統回應為準)
+          {midHand && (
+            <span className="mt-1 block text-amber-300">
+              牌局進行中,將在下一手開始前才加到桌上。
+            </span>
+          )}
+        </div>
+        <div className="flex justify-end gap-2 text-sm">
+          <button
+            type="button"
+            onClick={onCancel}
+            className="rounded border border-slate-700 px-4 py-2 hover:bg-slate-800"
+          >
+            取消
+          </button>
+          <button
+            type="button"
+            onClick={submit}
+            className="rounded bg-emerald-600 px-4 py-2 font-semibold hover:bg-emerald-500"
+          >
+            確定加碼
           </button>
         </div>
       </div>

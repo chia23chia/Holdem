@@ -35,10 +35,11 @@ docker compose -f docker-compose.prod.yml --env-file .env.prod logs -f --tail=50
 
 ### 現況(2026-07-25)
 
-- ✅ Phase 1-2 全部完成(OAuth、lobby、rooms、game engine 含下注/showdown/side-pot-simplified/timeout/reconnect/hand-log/rebuy)
+- ✅ Phase 1-2 全部完成(OAuth、lobby、rooms、game engine 含下注/showdown/side-pot/timeout/reconnect/hand-log/rebuy)
 - ✅ Phase 5 已實際部署,`https` 拿到 Let's Encrypt,Google OAuth prod client 已加 `alan-holdem.duckdns.org` callback
-- ✅ play-money 模式 + rebuy + 結算輸贏欄已部署上 prod(VM 已 pull `b3649f5` 並 rebuild,`holdem-server`/`holdem-web` 已重啟,`/health` 正常)
-- ❌ 未做:Phase 3 chat 系統訊息、Phase 4 SNG、Milestone 2.2c side pot、雲端手牌 log 匯出、跨房 chipsBalance 追蹤
+- ✅ play-money 模式 + rebuy + 結算輸贏欄已部署上 prod(VM 已 pull `8708e6a` 並 rebuild)
+- ⏳ **剛實作但未部署**:正確 side pot、rebuy 規則(歸零才能補 + chip-leader 上限,捨到 500)、broadcastAfterAction 容錯(避免 lag 導致 auto-action 計時器掛掉卡死整桌)、歷史紀錄補籌碼快照
+- ❌ 未做:Phase 3 chat 系統訊息、Phase 4 SNG、雲端手牌 log 匯出、跨房 chipsBalance 追蹤
 
 ### 已知踩過的坑(避免重蹈)
 
@@ -191,11 +192,11 @@ Unique 約束:`(userId, roomId)`(同一玩家在同一房只能坐一個位)+ `(
 #### 5.3.1 Rebuy 規則(`rebuyChips`,唯一權威判定點)
 
 - **只有 `chipsAtTable === 0` 才能 rebuy** — 就算自己當初買入比別人少、桌上還剩一點籌碼,也不能加碼,只能等歸零。
-- **加碼金額(= rebuy 後的 `chipsAtTable`)不會超過目前的 chip leader**:
+- **玩家自己選加碼金額,但必須是 500 的倍數,且不能超過目前的上限**:
   - 令 `leader` = 房內所有座位 `chipsAtTable` 的最大值(`Membership.aggregate` 即時算,不含 in-hand 尚未 persist 的籌碼)。
-  - 若 `leader > room.buyIn`:加碼上限 = `leader` 無條件捨去到最高位數(`roundToLeadingDigit`)。例:1999 → 1000、601 → 600、42 → 40。
-  - 否則(`leader <= room.buyIn`,通常代表原本的 chip leader 已經站起離桌把籌碼帶走):加碼上限 = `room.buyIn`,此人加碼後金額 > 現有 leader,直接變成新的 chip leader。
-- 判定完全在 `rebuyChips` 內,`room:rebuy` handler 兩條路徑(手牌中 queue / 手牌外立即)最終都會走到這裡 — 手牌中排隊的請求,到手牌結束才重新驗證資格,若那時已不符合(例如其實沒歸零)就靜默 no-op,不會報錯洗版。
+  - 上限 `cap` = `roundDownTo500(leader > room.buyIn ? leader : room.buyIn)`。例:leader=1999(> buyIn)→ cap=1500,可選 500/1000/1500;leader ≤ buyIn(通常代表原本的 chip leader 已經站起離桌把籌碼帶走)→ cap = buyIn 捨到 500,選最高檔會讓此人變成新的 chip leader。
+  - `room:rebuy` payload 帶 `amount`,`rebuyChips` 驗證 `amount % 500 === 0 && amount > 0 && amount <= cap`,不符合直接回錯誤。
+- 判定完全在 `rebuyChips` 內,`room:rebuy` handler 兩條路徑(手牌中 queue / 手牌外立即)最終都會走到這裡。手牌中排隊時連同玩家當下選的金額一起存(`pendingRebuysByRoom: Map<userId, amount>`,同一人重複請求以最後一次為準),到手牌結束才用當時最新的 cap 重新驗證,若那時金額已不合法(例如其實沒歸零,或 cap 縮水了)就回錯誤、不會偷偷改金額或洗版報錯。
 
 ### 5.4 HandLog(Milestone 2.6)
 
@@ -304,7 +305,7 @@ Server(server/src/auth.ts authMiddleware):
 | `room:leave` | `{roomId}` | — | **僅離開 socket channel**;座位/Membership/chipsAtTable **不動**(session 內可回來繼續)。真的要退出座位要 `room:standup` |
 | `room:subscribe` | `{roomId}` | — | 加入 `room:<id>` 當觀戰(不需要 membership)、emit `room:detail` |
 | `room:standup` | `{roomId}` | — | Unseat(刪 Membership,play money 模式**不退回**任何餘額),保留訂閱變觀戰;手牌進行中拒絕;若空房自動關閉。不依賴 socket-local 狀態,DB Membership 為準 |
-| `room:rebuy` | `{roomId}` | `GameActionResult` | 僅 `chipsAtTable === 0` 時允許;金額 = 加碼上限(見 §5.3.1),寫入 `chipsAtTable` + `totalBuyIn`。手牌**中** queue 到 `pendingRebuysByRoom` map,`broadcastAfterAction ended` 時 drain 進 DB(逐一重新驗證資格,已不合資格則 no-op);手牌**外**立即寫入 DB + 廣播,並嘗試自動接續開下一手(見 `startHandForRoom`) |
+| `room:rebuy` | `{roomId, amount}` | `GameActionResult` | 僅 `chipsAtTable === 0` 時允許;`amount` 由玩家選(500 的倍數,見 §5.3.1 上限公式),寫入 `chipsAtTable` + `totalBuyIn`。手牌**中** queue 到 `pendingRebuysByRoom` map(存玩家選的金額);`broadcastAfterAction ended` 時 drain 進 DB(逐一重新驗證資格 + 金額,不合法則回錯誤、不套用);手牌**外**立即寫入 DB + 廣播,並嘗試自動接續開下一手(見 `startHandForRoom`) |
 | `room:close` | `{roomId}` | `CloseRoomResult` | `ownerCloseRoom`(驗權 + 全部退籌 + status=closed)、廣播 `room:closed` |
 | `game:start` | `{roomId}` | `GameActionResult` | 只有房主;server 從 Room 讀 `actionTimeoutSeconds`;只發手牌給**有籌碼**(`chipsAtTable > 0`)的就座玩家(≥2 人,否則回錯誤並廣播全房);0 籌碼玩家該手坐山觀虎鬥、廣播 `game:started` + 私人 `game:hole` |
 | `game:end` | `{roomId}` | `GameActionResult` | 房主 debug;強制清掉 hand state、廣播 `game:ended`(不帶 result) |
@@ -502,11 +503,14 @@ DB 持久化延到 Milestone 2.5(斷線寬限)才做。
 
 `server/src/pokersolver.d.ts` 手寫 ambient 宣告,只 export `Hand.solve` / `Hand.winners` + `SolvedHand` interface(name/descr/rank)。若之後 pokersolver 升版 API 有動,調這個檔案。
 
-### 11.14 沒有 side pot(2.2 已知簡化)
+### 11.14 Side pot(2026-07-26 補完,原 Milestone 2.2c 簡化已解)
 
-當多人 all-in 且金額不同,標準德撲要建 side pots(小 stack all-in 者只贏他能贏的部分)。目前 `endWithShowdown` 直接把整個 pot 平分給所有 pokersolver winners,short-stack all-in 贏家可能拿到超額(不公平但不會爆錯)。Milestone 2.2c 補。
+`endWithShowdown` 改用標準 side-pot 分層演算法(`buildSidePots`):把 `hand.players` 依 `totalBet` 排序取不重複金額級距,每一級距切一層 pot(該層金額 = 級距差 × 該級距以上的貢獻人數),每層獨立找出**尚未棄牌**的合格贏家算 pokersolver 比大小、獨立分那一層。棄牌者的錢仍計入級距(墊高該層金額)但沒資格贏任何一層。
 
-朋友圈實際玩多人一起 all-in 的機率不高,先跳過可接受。
+好處:
+- 短籌碼 all-in 只贏他能 cover 的那幾層,贏不到自己蓋不到的上層
+- 「多下注但沒人跟」的多餘籌碼,天然變成一個「只有下注者自己合格」的獨立層,原封不動退還 —— 不用另外寫「退錢」邏輯,是分層演算法的自然結果
+- 一個玩家可能贏好幾層,`winnerResults` 會把同一人的多層獎金加總成一筆
 
 ### 11.15 手牌 'ended' 狀態保留
 

@@ -138,30 +138,31 @@ export async function seatUser(
   });
 }
 
-// Rounds down to the leading digit: 1999 -> 1000, 601 -> 600, 42 -> 40.
+// Rounds down to the nearest 500: 1999 -> 1500, 601 -> 500, 2500 -> 2500.
 // Used to cap rebuys below the table's chip leader (see rebuyChips).
-function roundToLeadingDigit(n: number): number {
-  if (n <= 0) return 0;
-  const magnitude = 10 ** Math.floor(Math.log10(n));
-  return Math.floor(n / magnitude) * magnitude;
+function roundDownTo500(n: number): number {
+  return Math.max(0, Math.floor(n / 500) * 500);
 }
 
 // Rebuy rules (play-money, no chipsBalance deduction):
 //  - Only allowed once a seat's chips hit exactly 0 — no topping up a
 //    non-zero stack, however small.
-//  - Amount is capped so a rebuy can never hand out more than the table's
-//    current chip leader: if the leader's stack exceeds the room's buyIn,
-//    the cap rounds DOWN to the leader's leading digit (1999 -> 1000); if
-//    the leader is at or below buyIn (e.g. the original leader stood up and
-//    left with their stack), the cap is just buyIn — which makes this
-//    rebuying player the new leader.
+//  - Caller picks the amount, but it must be a multiple of 500 and can't
+//    exceed the table's current chip leader: if the leader's stack exceeds
+//    the room's buyIn, the cap rounds DOWN to the nearest 500 (leader 1999
+//    -> pick 500/1000/1500); if the leader is at or below buyIn (e.g. the
+//    original leader stood up and left with their stack), the cap is buyIn
+//    rounded down to 500 — picking the top tier makes this player the new
+//    leader.
 // Caller decides whether to apply immediately (between hands) or defer via
 // in-memory queue (mid-hand); either way this is the single authoritative
-// check, so a queued rebuy that's no longer eligible by the time the hand
-// ends (e.g. the player didn't actually bust) safely no-ops here.
+// check, so a queued rebuy that's no longer eligible/valid by the time the
+// hand ends (e.g. the player didn't actually bust, or the cap shrank) safely
+// gets rejected here instead of silently over-granting.
 export async function rebuyChips(
   userId: string,
   roomId: string,
+  amount: number,
 ): Promise<
   { ok: true; amount: number; chipsAtTable: number } | { ok: false; error: string }
 > {
@@ -178,14 +179,19 @@ export async function rebuyChips(
     if (membership.chipsAtTable > 0) {
       return { ok: false, error: '籌碼歸零才能加碼' };
     }
+    if (!Number.isInteger(amount) || amount <= 0 || amount % 500 !== 0) {
+      return { ok: false, error: '加碼金額必須是 500 的倍數' };
+    }
 
     const { _max } = await tx.membership.aggregate({
       where: { roomId },
       _max: { chipsAtTable: true },
     });
     const leader = _max.chipsAtTable ?? 0;
-    const amount =
-      leader > room.buyIn ? roundToLeadingDigit(leader) : room.buyIn;
+    const cap = roundDownTo500(leader > room.buyIn ? leader : room.buyIn);
+    if (amount > cap) {
+      return { ok: false, error: `加碼上限為 ${cap}` };
+    }
 
     const updated = await tx.membership.update({
       where: { id: membership.id },
