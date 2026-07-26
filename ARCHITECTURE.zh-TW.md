@@ -541,18 +541,31 @@ DB 持久化延到 Milestone 2.5(斷線寬限)才做。
 
 長期追蹤功能之後補時,再把 chipsBalance 拉回計算流程(可能 rebuy 從 chipsBalance 扣、settlement 寫回 chipsBalance)。
 
-### 11.19 Google Sheets 自動同步(2026-07-26 起,選填)
+### 11.19 Google Sheets 自動同步(2026-07-26 起,選填,v2 完整仿照舊表格式)
 
-每次房間結算(`room:close` 房主關房 / session 到期自動關房)成功後,`server/src/sheetsSync.ts` 的 `syncSettlementToSheet` 會把該局每位玩家的結果 append 進一份外部 Google Sheet,方便長期戰績追蹤跟復盤。**完全選填** —— 沒設定對應環境變數就整個 no-op,不影響正常關房流程。
+每次房間結算(`room:close` 房主關房 / session 到期自動關房)成功後,`server/src/sheetsSync.ts` 的 `syncSettlementToSheet` 會把該局每位玩家的結果寫進一份外部 Google Sheet,格式完整仿照原本朋友圈手工維護的那份月曆式戰績表(領先榜 + 每日總表 + 逐場 check 明細),但用 userId 當唯一鍵取代舊表脆弱的「代號手動對應」機制。**完全選填** —— 沒設定對應環境變數就整個 no-op,不影響正常關房流程。
 
 - **驗證方式**:Service Account(不是使用者 OAuth),JSON 金鑰 base64 編碼後放進 `GOOGLE_SHEETS_SA_KEY`;目標試算表要另外用「共用」把該 service account 的 `client_email` 加為編輯者。
-- **寫入方式**:直接呼叫 Sheets API v4 REST(`google-auth-library` 只拿來換 access token,沒有用整包 `googleapis`,減少依賴體積)。
-- **目標試算表結構**(`sheetsSync.ts` 第一次寫入時自動建立,不需要使用者手動建表頭):
-  - 分頁「對局紀錄」:純 append-only log,一場結算 = N 列(N=玩家數)。欄位:日期時間、房間、玩家、買入、結算籌碼、淨輸贏
-  - 分頁「總排行」:只在 bootstrap 時寫入一次動態陣列公式(`UNIQUE`+`SUMIF`+`COUNTIF`),之後會自己跟著「對局紀錄」即時更新,app 不用重寫
-- **玩家名稱**:直接用 app 的 `SettlementSummary.players[].name`(= `nickname ?? name`),沒有額外對應表 —— 這是刻意設計成「新表格從下一次有玩的人開始長」,不去對應任何舊有的名字/代號系統。
+- **寫入方式**:直接呼叫 Sheets API v4 REST(`values:batchGet`/`values:batchUpdate`),`google-auth-library` 只拿來換 access token,沒有用整包 `googleapis`。
+
+**分頁「人員」(全域,不分月)** —— 唯一的玩家身份來源:
+- 欄位:`userId | 顯示名稱 | 列位`。`列位` 是每個 userId 第一次出現時分配的固定序號,之後永不改變
+- 每次結算會檢查每位玩家的 `userId`:沒登記過就 append 新列(下一個列位);已登記但顯示名稱變了(玩家在 app 內改暱稱)就更新該列的顯示名稱、列位不動 —— 所以改名不會讓歷史資料對不上人
+- 月分頁的 B 欄(玩家名)都是 `='人員'!B<row>` 公式,不是寫死字串,所以人員表改名會自動反映到所有月份
+
+**每月一個分頁**(命名 `YYYY/MM`,如 `2026/08`),結構(N = 該分頁建立當下「人員」表的總人數,建立後固定不變):
+
+| 區塊 | 列範圍 | 內容 |
+|---|---|---|
+| 領先榜 | 1 ~ N+1 | 第1列標題;A2 是單一 `=SORT(A<每日總表起>:C<每日總表迄>,3,FALSE)` 依淨輸贏由高到低整塊 spill,B\~D 欄由公式自動填滿,不逐列手動寫 |
+| 檢查碼 | F2:G4 | 正/負/sum,`SUMIF`/`SUM` 加總每日總表的 C 欄,驗證零和 |
+| 每日總表 | N+3 (表頭) ~ 2N+3 | C 欄 `total` = `=SUM(D:AH)`(固定跨度,不用每次改公式);每個日期一欄,每格 `=C<對應 check 區塊列>` |
+| check 明細 | 2N+6 起,每區塊高 N+2 列 | 一個日期一區塊:表頭列(日期)+ N 位玩家列(C=`=SUM(E,F:AD)`)+ 空白列。同一天多場結算 = 同一區塊裡各玩家列往右多加一欄(E→F→G…),不是新開區塊 |
+
+- **日期儲存**:寫入時用 `USER_ENTERED` 送類似 `"7/26"` 的字串,Sheets 會自動解析成真正的日期型別(跟舊表一樣顯示 `7/26`,不是純文字)。**比對「今天這個區塊是否已存在」不能用字串比對**(日期已被 Sheets 轉型),要用 `sheetsDateSerial()` 换算 Excel/Sheets 序列值(1899-12-30 起算天數)去跟 `UNFORMATTED_VALUE` 讀回來的數字比 —— 這個坑在開發時真的踩過一次(每次結算都誤判成新的一天、開新區塊),測試時修掉了。
+- **固定寬度的取捨(邊界情況)**:每月分頁的玩家陣容在第一次建立時就固定死(= 當下人員表的全部人)。如果某個月分頁已經開始記錄之後,才出現一個「人員」表裡從沒登記過的全新 userId —— 這個月的區塊高度沒辦法安全地動態插入新列(會牽動後面所有 check 區塊 + 每日總表的公式列號)。遇到這種情況,`syncSettlementToSheet` 會把新玩家正常註冊進「人員」表,但**跳過**把這筆結算寫進當月分頁,並 `console.warn` 記錄;下個月的分頁會自動包含這個人。這是目前設計唯一沒辦法全自動的縫隙。
 - **失敗處理**:`syncSettlementSafely`(index.ts)把整個呼叫包在 fire-and-forget + try/catch,Sheets API 掛掉或沒設定都不會擋到、也不會讓房間結算失敗。
-- **每個 process 只 bootstrap 一次**:`sheetsSync.ts` 內部用 `Set<spreadsheetId>` 記住已確認過分頁結構的試算表,同一個 process 生命週期內不會重複檢查/建立分頁。
+- **沒有跨 process 快取**:每次結算都直接讀取試算表當下的真實狀態(有哪些分頁、人員表內容、每日總表已有幾個日期欄)來決定怎麼寫,不依賴記憶體裡的假設 —— 犧牲一點 API 呼叫數換取「server 重啟也不會弄錯位置」的穩定性,對一晚頂多結算幾次房間的量來說完全夠用。
 
 ---
 
