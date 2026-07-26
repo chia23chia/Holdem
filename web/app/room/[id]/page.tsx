@@ -16,6 +16,7 @@ import type {
   RoomDetail,
   SettlementSummary,
 } from '@holdem/shared';
+import { effectiveBlinds, nextBlindLevelAt } from '@holdem/shared';
 import { connectSocket, type TypedSocket } from '@/lib/socket';
 
 // Display-only estimate of the server's rebuy cap (see rebuyChips in
@@ -79,6 +80,10 @@ export default function RoomPage() {
   // Read latest chatOpen inside socket listener without re-registering it.
   const chatOpenRef = useRef(chatOpen);
   chatOpenRef.current = chatOpen;
+  // Read latest settlement inside the auto-next-hand timer without
+  // re-registering it — see the tournament-finish race note below.
+  const settlementRef = useRef(settlement);
+  settlementRef.current = settlement;
 
   useEffect(() => {
     if (status !== 'authenticated' || !roomId) return;
@@ -260,12 +265,19 @@ export default function RoomPage() {
   // seconds change smoothly; otherwise 1s for session-only.
   useEffect(() => {
     const hasSession = !!room?.sessionEndsAt;
+    const hasTournamentClock =
+      room?.roomType === 'tournament' && !!room.tournamentClockStartedAt;
     const hasDeadline = !!gameState?.deadline;
-    if (!hasSession && !hasDeadline) return;
+    if (!hasSession && !hasTournamentClock && !hasDeadline) return;
     const period = hasDeadline ? 500 : 1000;
     const id = setInterval(() => setNow(Date.now()), period);
     return () => clearInterval(id);
-  }, [room?.sessionEndsAt, gameState?.deadline]);
+  }, [
+    room?.sessionEndsAt,
+    room?.roomType,
+    room?.tournamentClockStartedAt,
+    gameState?.deadline,
+  ]);
 
   // Append a street entry to the current (last) hand when new community cards reveal.
   useEffect(() => {
@@ -313,7 +325,11 @@ export default function RoomPage() {
       setAutoNextIn(Math.ceil(remMs / 1000));
       if (remMs <= 0) {
         clearInterval(tick);
-        if (iAmOwner) {
+        // If a tournament just finished on this exact hand, the room is
+        // already closed and `settlement` is already showing — don't also
+        // fire game:start into the void (it would just broadcast a
+        // confusing "房間已關閉" error right as everyone sees the champion).
+        if (iAmOwner && !settlementRef.current) {
           socketRef.current?.emit('game:start', { roomId }, (res) => {
             if (!res.ok) setError(res.error);
           });
@@ -349,7 +365,8 @@ export default function RoomPage() {
   // Rebuy only unlocks once chips actually hit 0 — live in-hand chips take
   // priority since DB chipsAtTable doesn't sync until the hand ends.
   const myChipsNow = myHandPlayer ? myHandPlayer.chips : (myOccupant?.chipsAtTable ?? 0);
-  const canRebuy = iAmSeated && myChipsNow === 0;
+  const canRebuy = iAmSeated && myChipsNow === 0 && room?.roomType !== 'tournament';
+  const liveBlinds = room ? effectiveBlinds(room) : null;
   const rebuyCapEstimate = room
     ? (() => {
         const leader = room.seats.reduce(
@@ -446,9 +463,12 @@ export default function RoomPage() {
             {room?.name ?? '房間'}
           </h1>
           <p className="mt-0.5 text-xs text-slate-400 sm:text-sm">
-            {room && (
+            {room && liveBlinds && (
               <>
-                盲注 {room.smallBlind}/{room.bigBlind} · 買入 {room.buyIn} ·{' '}
+                盲注 {liveBlinds.smallBlind}/{liveBlinds.bigBlind}
+                {room.roomType === 'tournament' && ` (第${liveBlinds.level}級)`}
+                {' · '}
+                {room.roomType === 'tournament' ? '起始籌碼' : '買入'} {room.buyIn} ·{' '}
                 {room.currentPlayers}/{room.maxPlayers} 人
               </>
             )}
@@ -459,7 +479,9 @@ export default function RoomPage() {
             >
               {connected ? '已連線' : '連線中…'}
             </span>
-            {room?.sessionEndsAt ? (
+            {room?.roomType === 'tournament' ? (
+              <BlindLevelInfo room={room} now={now} />
+            ) : room?.sessionEndsAt ? (
               <SessionCountdown endsAt={room.sessionEndsAt} now={now} />
             ) : (
               room?.sessionMinutes && (
@@ -665,7 +687,8 @@ export default function RoomPage() {
                   <div className="text-center text-[10px] text-slate-400 sm:text-xs">
                     尚未開牌
                     <br />
-                    盲注 {room.smallBlind}/{room.bigBlind}
+                    盲注 {liveBlinds?.smallBlind ?? room.smallBlind}/
+                    {liveBlinds?.bigBlind ?? room.bigBlind}
                   </div>
                 )}
               </div>
@@ -717,6 +740,7 @@ export default function RoomPage() {
                         chips={handPlayer?.chips ?? occupant.chipsAtTable}
                         bet={handPlayer?.bet}
                         status={handPlayer?.status}
+                        eliminated={occupant.finishRank != null}
                         positionLabel={positionLabel}
                         isMe={occupant.userId === myUserId}
                         isActive={isActive}
@@ -1298,6 +1322,7 @@ function SeatCard({
   chips,
   bet,
   status,
+  eliminated,
   positionLabel,
   isMe,
   isActive,
@@ -1311,6 +1336,7 @@ function SeatCard({
   chips: number;
   bet?: number;
   status?: 'active' | 'folded' | 'all-in';
+  eliminated?: boolean;
   positionLabel: string | null;
   isMe: boolean;
   isActive: boolean;
@@ -1326,11 +1352,13 @@ function SeatCard({
     : isMe
       ? 'border-emerald-500'
       : 'border-slate-700';
-  const bg = isFolded
-    ? 'bg-slate-950 opacity-50'
-    : isMe
-      ? 'bg-emerald-950'
-      : 'bg-slate-900';
+  const bg = eliminated
+    ? 'bg-slate-950 opacity-40'
+    : isFolded
+      ? 'bg-slate-950 opacity-50'
+      : isMe
+        ? 'bg-emerald-950'
+        : 'bg-slate-900';
   return (
     <div
       className={`relative w-16 rounded border p-1 shadow sm:w-24 sm:p-2 ${border} ${bg}`}
@@ -1353,6 +1381,11 @@ function SeatCard({
       {typeof bet === 'number' && bet > 0 && (
         <div className="text-[9px] font-bold text-emerald-300 sm:text-[10px]">
           bet {bet}
+        </div>
+      )}
+      {eliminated && (
+        <div className="text-[9px] font-bold text-slate-500 sm:text-[10px]">
+          已淘汰
         </div>
       )}
       {isFolded && (
@@ -1685,6 +1718,37 @@ function SessionCountdown({ endsAt, now }: { endsAt: string; now: number }) {
   );
 }
 
+// Blind-level display for tournament rooms — parallel to SessionCountdown,
+// ticks locally off `now` (no extra socket event needed for the ticking).
+function BlindLevelInfo({ room, now }: { room: RoomDetail; now: number }) {
+  const levelMinutes = room.blindLevelMinutes ?? 15;
+  const { smallBlind, bigBlind, level } = effectiveBlinds(room);
+  if (!room.tournamentClockStartedAt) {
+    return (
+      <span
+        className="ml-2 inline-block rounded bg-slate-700 px-1.5 py-0.5 text-[10px] font-mono text-slate-400 sm:text-xs"
+        title="按下開始牌局才會開始漲盲"
+      >
+        第 1 級 {smallBlind}/{bigBlind} · 未開始
+      </span>
+    );
+  }
+  const nextAt = nextBlindLevelAt(room.tournamentClockStartedAt, levelMinutes) ?? now;
+  const remaining = Math.max(0, nextAt - now);
+  const totalSec = Math.floor(remaining / 1000);
+  const mm = Math.floor(totalSec / 60);
+  const ss = totalSec % 60;
+  return (
+    <span
+      className="ml-2 inline-block rounded bg-amber-800 px-1.5 py-0.5 text-[10px] font-mono sm:text-xs"
+      title="距離下一級盲注"
+    >
+      第{level}級 {smallBlind}/{bigBlind} · 下級{' '}
+      {String(mm).padStart(2, '0')}:{String(ss).padStart(2, '0')}
+    </span>
+  );
+}
+
 function SettlementModal({
   summary,
   onDismiss,
@@ -1692,6 +1756,54 @@ function SettlementModal({
   summary: SettlementSummary;
   onDismiss: () => void;
 }) {
+  if (summary.reason === 'tournament-finished') {
+    const ranked = [...summary.players].sort(
+      (a, b) => (a.finishRank ?? 999) - (b.finishRank ?? 999),
+    );
+    return (
+      <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
+        <div className="w-full max-w-md rounded-lg border border-slate-700 bg-slate-900 p-6">
+          <h2 className="mb-4 text-lg font-bold">
+            錦標賽結束 · {summary.roomName}
+          </h2>
+          <ul className="mb-4 flex flex-col gap-1 text-sm">
+            {ranked.map((p) => (
+              <li
+                key={p.userId}
+                className={`flex items-center justify-between rounded px-2 py-1.5 ${
+                  p.finishRank === 1
+                    ? 'bg-amber-950/60 font-bold text-amber-300'
+                    : 'text-slate-300'
+                }`}
+              >
+                <span>
+                  {p.finishRank === 1 ? '🏆 冠軍' : `第 ${p.finishRank} 名`}{' '}
+                  {p.name}
+                </span>
+                <span
+                  className={
+                    p.finishRank === 1 ? 'text-emerald-400' : 'text-red-400'
+                  }
+                >
+                  {p.finishRank === 1 ? '贏得全部籌碼' : '輸掉買入'}
+                </span>
+              </li>
+            ))}
+          </ul>
+          <div className="flex justify-end">
+            <button
+              type="button"
+              onClick={onDismiss}
+              className="rounded bg-emerald-600 px-4 py-2 text-sm font-semibold hover:bg-emerald-500"
+            >
+              回大廳
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   const reasonLabel =
     summary.reason === 'session-expired'
       ? '遊戲時間到'

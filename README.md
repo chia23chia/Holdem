@@ -79,7 +79,7 @@ pnpm dev
 - [x] **Phase 1** — Google OAuth、大廳、房間建立/加入
 - [x] **Phase 2** — 單桌現金局引擎(下注 / side pot / 超時 / 斷線重連 / hand log / rebuy)
 - [ ] **Phase 3** — 房間聊天系統訊息(目前只有玩家聊天,無系統事件訊息)
-- [ ] **Phase 4** — 錦標賽(SNG,盲注升級,淘汰制)
+- [x] **Phase 4** — 錦標賽(SNG,盲注升級,淘汰制)v1 雛形(單桌、無獎金拆分、無延遲報名,細節見 ARCHITECTURE.zh-TW.md §11.20)
 - [x] **Phase 5** — UI 打磨 + Oracle VPS 部署(已上線)
 
 ## 部署

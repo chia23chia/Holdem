@@ -5,6 +5,7 @@ import type {
   ServerToClientEvents,
   SettlementSummary,
 } from '@holdem/shared';
+import { effectiveBlinds } from '@holdem/shared';
 import { authMiddleware, getUser } from './auth.js';
 import {
   buildOwnerCloseSettlement,
@@ -13,6 +14,7 @@ import {
   deleteHandLogsForRoom,
   findExpiredRooms,
   getRoomDetail,
+  getRoomType,
   listRoomSummaries,
   ownerCloseRoom,
   persistHandLog,
@@ -27,6 +29,11 @@ import {
   updateHandLogEndResult,
 } from './rooms.js';
 import { syncSettlementToSheet } from './sheetsSync.js';
+import {
+  eliminateStandingPlayer,
+  processTournamentHandEnd,
+  startTournamentClockIfNeeded,
+} from './tournament.js';
 import {
   applyAction,
   applyReveal,
@@ -238,7 +245,49 @@ async function broadcastAfterAction(
     } catch (err) {
       console.error('[server] persistHandResult error', err);
     }
+
+    // Tournament elimination + possible finish. No-op (returns finished:
+    // false immediately) for cash rooms, so this can't affect the cash path.
+    let tournamentOutcome: { finished: boolean; settlement?: SettlementSummary } = {
+      finished: false,
+    };
+    try {
+      tournamentOutcome = await processTournamentHandEnd(roomId);
+    } catch (err) {
+      console.error('[server] processTournamentHandEnd error', err);
+    }
+
     const result = getEndResult(hand);
+
+    if (tournamentOutcome.finished && tournamentOutcome.settlement) {
+      // Tournament room is already closed + memberships deleted (done inside
+      // processTournamentHandEnd's transaction). Tear down like the existing
+      // room:close / session-expiry paths instead of the normal "flip to
+      // waiting, wait for next hand" flow below — cancelAutoAction already
+      // handles timer cleanup, so skipping the final rescheduleAutoAction
+      // call at the bottom of this function (via `return`) is safe.
+      cancelAutoAction(roomId);
+      clearRoomState(roomId);
+      lastHandLogIdByRoom.delete(roomId);
+      pendingRebuysByRoom.delete(roomId);
+      try {
+        await deleteHandLogsForRoom(roomId);
+      } catch (err) {
+        console.error('[server] deleteHandLogsForRoom error', err);
+      }
+      io.to(roomChannel(roomId)).emit('game:ended', {
+        roomId,
+        result: result ?? undefined,
+      });
+      syncSettlementSafely(tournamentOutcome.settlement);
+      io.to(roomChannel(roomId)).emit('room:closed', {
+        roomId,
+        settlement: tournamentOutcome.settlement,
+      });
+      io.to(LOBBY_ROOM).emit('lobby:room-removed', { roomId });
+      return;
+    }
+
     // Persist the completed hand to HandLog for later review / cross-session.
     try {
       const logData = buildHandLogData(hand);
@@ -292,15 +341,18 @@ async function startHandForRoom(roomId: string): Promise<StartHandOutcome> {
   const detail = await getRoomDetail(roomId);
   if (!detail) return { ok: false, error: '房間不存在' };
   if (hasActiveHand(roomId)) return { ok: false, error: '已在牌局中' };
-  // Players with 0 chips sit out (need a rebuy) — they aren't dealt in,
-  // otherwise they'd be stuck unable to check or call every hand.
+  // Players with 0 chips sit out — they aren't dealt in. Cash game: they
+  // need a rebuy (otherwise they'd be stuck unable to check or call).
+  // Tournament: 0 chips means eliminated, there's no rebuy to suggest.
   const playersWithChips = detail.seats.filter((s) => s.chipsAtTable > 0);
   if (playersWithChips.length < 2) {
-    return {
-      ok: false,
-      error: '需要至少 2 位有籌碼的玩家(0 籌碼玩家請先加值)',
-      needsRebuy: true,
-    };
+    return detail.roomType === 'tournament'
+      ? { ok: false, error: '需要至少 2 位玩家才能開始錦標賽' }
+      : {
+          ok: false,
+          error: '需要至少 2 位有籌碼的玩家(0 籌碼玩家請先加值)',
+          needsRebuy: true,
+        };
   }
 
   // Wipe any prior ended-hand state before starting fresh.
@@ -308,6 +360,9 @@ async function startHandForRoom(roomId: string): Promise<StartHandOutcome> {
   // Determine the next hand number now (server authoritative) so the
   // HandStatePublic broadcast and the eventual HandLog write agree.
   const priorCount = await countHandLogs(roomId);
+  // Cash rooms: fixed blinds. Tournament rooms: computed from the blind
+  // clock (still level 1 / base blinds before the clock has started).
+  const { smallBlind, bigBlind } = effectiveBlinds(detail);
   const hand = startHand(
     roomId,
     playersWithChips.map((s) => ({
@@ -316,17 +371,19 @@ async function startHandForRoom(roomId: string): Promise<StartHandOutcome> {
       name: s.name,
       chipsAtTable: s.chipsAtTable,
     })),
-    detail.smallBlind,
-    detail.bigBlind,
+    smallBlind,
+    bigBlind,
     detail.actionTimeoutSeconds,
     priorCount + 1,
   );
 
   // Flip room to 'playing' — blocks ownerCloseRoom until the hand ends.
   await setRoomStatus(roomId, 'playing');
-  // First hand ever also sets sessionEndsAt.
+  // First hand ever also sets sessionEndsAt (cash) / starts the blind clock
+  // (tournament) — each no-ops on the other room type, no branch needed here.
   await startSessionIfNeeded(roomId);
-  // Broadcast for both status flip AND (possibly) session start.
+  await startTournamentClockIfNeeded(roomId);
+  // Broadcast for both status flip AND (possibly) session/clock start.
   await broadcastRoomDetail(roomId);
 
   // Public state → all subscribers (players + spectators).
@@ -424,6 +481,33 @@ io.on('connection', (socket) => {
       });
       return;
     }
+    const roomType = await getRoomType(roomId);
+    if (roomType === 'tournament') {
+      // Voluntary standup in a tournament = elimination at the current
+      // position, not a free unseat — no rebuy exists to come back from.
+      const outcome = await eliminateStandingPlayer(user.userId, roomId);
+      if (!outcome.removed) return;
+      if (outcome.finished) {
+        cancelAutoAction(roomId);
+        clearRoomState(roomId);
+        lastHandLogIdByRoom.delete(roomId);
+        pendingRebuysByRoom.delete(roomId);
+        await deleteHandLogsForRoom(roomId);
+        syncSettlementSafely(outcome.settlement);
+        io.to(roomChannel(roomId)).emit('room:closed', {
+          roomId,
+          settlement: outcome.settlement,
+        });
+        io.to(LOBBY_ROOM).emit('lobby:room-removed', { roomId });
+        return;
+      }
+      // Not finished — the eliminated player's seat stays in Membership
+      // (chipsAtTable=0, finishRank set) so remaining players see them
+      // tagged eliminated rather than the seat vanishing.
+      await broadcastRoomDetail(roomId);
+      await broadcastLobbyList();
+      return;
+    }
     const { empty } = await unseatUser(user.userId, roomId);
     await finalizeRoomState(roomId, empty);
   });
@@ -456,6 +540,10 @@ io.on('connection', (socket) => {
   // exact rule). Mid-hand → queued for hand end. Between-hand → applied
   // immediately.
   socket.on('room:rebuy', async ({ roomId, amount }, cb) => {
+    const roomType = await getRoomType(roomId);
+    if (roomType === 'tournament') {
+      return cb({ ok: false, error: '錦標賽模式沒有加碼,籌碼歸零即淘汰' });
+    }
     if (hasActiveHand(roomId)) {
       queuePendingRebuy(roomId, user.userId, amount);
       cb({ ok: true });
@@ -479,6 +567,7 @@ io.on('connection', (socket) => {
   socket.on('game:start', async ({ roomId }, cb) => {
     const detail = await getRoomDetail(roomId);
     if (!detail) return cb({ ok: false, error: '房間不存在' });
+    if (detail.status === 'closed') return cb({ ok: false, error: '房間已關閉' });
     if (detail.ownerId !== user.userId) {
       return cb({ ok: false, error: '只有房主可以開牌局' });
     }

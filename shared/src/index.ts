@@ -89,12 +89,15 @@ export type PlayerAction =
 export interface SettlementSummary {
   roomId: string;
   roomName: string;
-  reason: 'session-expired' | 'owner-closed';
+  reason: 'session-expired' | 'owner-closed' | 'tournament-finished';
   players: Array<{
     userId: string;
     name: string;
     chipsAtTable: number; // Final stack when session ended
     totalBuyIn: number;   // Initial buyIn + all rebuys — for net win/loss display
+    // Present only when reason === 'tournament-finished'. 1 = champion,
+    // higher = eliminated earlier; ties (simultaneous bust-out) share a rank.
+    finishRank?: number;
   }>;
 }
 
@@ -148,20 +151,25 @@ export type GameActionResult =
 // Mirrors DB shape but plain-JSON for wire transmission.
 // ============================================================
 export type RoomStatus = 'waiting' | 'playing' | 'closed';
+export type RoomType = 'cash' | 'tournament';
 
 export interface RoomSummary {
   id: string;
   name: string;
   ownerName: string;
+  roomType: RoomType;
   maxPlayers: number;
   currentPlayers: number;
   smallBlind: number;
   bigBlind: number;
   buyIn: number;
   status: RoomStatus;
-  sessionMinutes: number | null; // null = unlimited
-  sessionEndsAt: string | null;  // ISO date; null = unlimited
+  sessionMinutes: number | null; // null = unlimited (cash only)
+  sessionEndsAt: string | null;  // ISO date; null = unlimited (cash only)
   actionTimeoutSeconds: number;  // Per-hand player action time, fixed at create
+  // Tournament (SNG) fields — null for cash rooms.
+  blindLevelMinutes: number | null;
+  tournamentClockStartedAt: string | null; // ISO date; set once, first hand dealt
 }
 
 export interface RoomSeat {
@@ -170,11 +178,87 @@ export interface RoomSeat {
   name: string;
   image: string | null;
   chipsAtTable: number;
+  finishRank: number | null; // tournament only: 1 = champion, higher = out earlier
 }
 
 export interface RoomDetail extends RoomSummary {
   ownerId: string;
   seats: RoomSeat[];
+}
+
+// ============================================================
+// Tournament (SNG) blind schedule — PURE functions, no I/O. Server calls
+// these fresh every hand (never caches a "current level"); client ticks
+// them locally off its own `now` state, exactly like the cash-game session
+// countdown, so no extra socket event is needed just for the ticking.
+// ============================================================
+
+// Rounds to the nearest 5, floor of 5 (blinds should never round to 0).
+function roundToNearest5(n: number): number {
+  return Math.max(5, Math.round(n / 5) * 5);
+}
+
+// Level 1 = the room's configured base blinds, verbatim. Each later level's
+// big blind is 1.5x the previous, rounded to the nearest 5, with a floor of
+// +5 over the previous level so escalation never stalls at low stakes.
+export function blindsForLevel(
+  baseSmallBlind: number,
+  baseBigBlind: number,
+  level: number,
+): { smallBlind: number; bigBlind: number } {
+  if (level <= 1) return { smallBlind: baseSmallBlind, bigBlind: baseBigBlind };
+  let bb = baseBigBlind;
+  for (let l = 2; l <= level; l += 1) {
+    bb = Math.max(bb + 5, roundToNearest5(bb * 1.5));
+  }
+  const sb = Math.min(roundToNearest5(bb / 2), bb - 5);
+  return { smallBlind: Math.max(5, sb), bigBlind: bb };
+}
+
+// Current level number from wall-clock elapsed time since the tournament
+// clock started. Returns 1 if the clock hasn't started yet.
+export function currentBlindLevel(
+  tournamentClockStartedAt: string | null,
+  blindLevelMinutes: number,
+): number {
+  if (!tournamentClockStartedAt) return 1;
+  const elapsedMs = Date.now() - new Date(tournamentClockStartedAt).getTime();
+  if (elapsedMs <= 0) return 1;
+  return Math.floor(elapsedMs / (blindLevelMinutes * 60_000)) + 1;
+}
+
+// Epoch ms when the current level ends (i.e. the next level begins). Null
+// if the clock hasn't started yet.
+export function nextBlindLevelAt(
+  tournamentClockStartedAt: string | null,
+  blindLevelMinutes: number,
+): number | null {
+  if (!tournamentClockStartedAt) return null;
+  const level = currentBlindLevel(tournamentClockStartedAt, blindLevelMinutes);
+  return (
+    new Date(tournamentClockStartedAt).getTime() + level * blindLevelMinutes * 60_000
+  );
+}
+
+// Live SB/BB for a room right now — cash rooms just echo their fixed
+// blinds; tournament rooms compute from the blind clock. Single entry
+// point shared by the server (authoritative, used when dealing a hand) and
+// the client (display-only).
+export function effectiveBlinds(room: {
+  roomType: RoomType;
+  smallBlind: number;
+  bigBlind: number;
+  blindLevelMinutes: number | null;
+  tournamentClockStartedAt: string | null;
+}): { smallBlind: number; bigBlind: number; level: number } {
+  if (room.roomType !== 'tournament') {
+    return { smallBlind: room.smallBlind, bigBlind: room.bigBlind, level: 1 };
+  }
+  const level = currentBlindLevel(
+    room.tournamentClockStartedAt,
+    room.blindLevelMinutes ?? 15,
+  );
+  return { ...blindsForLevel(room.smallBlind, room.bigBlind, level), level };
 }
 
 export interface ChatMessage {

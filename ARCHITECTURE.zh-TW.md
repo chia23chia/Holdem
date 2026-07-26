@@ -2,7 +2,7 @@
 
 Holdem 專案的深度參考文件。README 負責入門(如何啟動),本檔負責描述程式碼結構、契約與設計決策。有架構性變動(新事件、新 model、新 endpoint、新踩坑)才更新。
 
-最後更新:2026-07-26(side pot、rebuy 選擇制、broadcastAfterAction 容錯、Google Sheets 自動同步)
+最後更新:2026-07-26(side pot、rebuy 選擇制、broadcastAfterAction 容錯、Google Sheets 自動同步、SNG 錦標賽模式 v1)
 
 ---
 
@@ -566,6 +566,18 @@ DB 持久化延到 Milestone 2.5(斷線寬限)才做。
 - **固定寬度的取捨(邊界情況)**:每月分頁的玩家陣容在第一次建立時就固定死(= 當下人員表的全部人)。如果某個月分頁已經開始記錄之後,才出現一個「人員」表裡從沒登記過的全新 userId —— 這個月的區塊高度沒辦法安全地動態插入新列(會牽動後面所有 check 區塊 + 每日總表的公式列號)。遇到這種情況,`syncSettlementToSheet` 會把新玩家正常註冊進「人員」表,但**跳過**把這筆結算寫進當月分頁,並 `console.warn` 記錄;下個月的分頁會自動包含這個人。這是目前設計唯一沒辦法全自動的縫隙。
 - **失敗處理**:`syncSettlementSafely`(index.ts)把整個呼叫包在 fire-and-forget + try/catch,Sheets API 掛掉或沒設定都不會擋到、也不會讓房間結算失敗。
 - **沒有跨 process 快取**:每次結算都直接讀取試算表當下的真實狀態(有哪些分頁、人員表內容、每日總表已有幾個日期欄)來決定怎麼寫,不依賴記憶體裡的假設 —— 犧牲一點 API 呼叫數換取「server 重啟也不會弄錯位置」的穩定性,對一晚頂多結算幾次房間的量來說完全夠用。
+
+### 11.20 SNG 錦標賽模式(2026-07-26 起,v1 雛形)
+
+`Room.roomType`(`cash`/`tournament`)區分兩種房型,現金局既有邏輯(side pot、rebuy、broadcastAfterAction 容錯)完全不受影響 —— 所有錦標賽專屬邏輯都是「先查房型,對現金局立刻 no-op」的加分支寫法,不改動既有函式的行為路徑。單桌制,app 本來就沒有多桌基礎設施。
+
+- **不可 rebuy(freezeout)**:`rebuyChips`、`room:rebuy` handler 兩處都擋,籌碼歸零直接淘汰,沒有補碼。
+- **盲注調漲**:`shared/src/index.ts` 的 `blindsForLevel`/`currentBlindLevel`/`nextBlindLevelAt`/`effectiveBlinds` 是純函式,server(`startHandForRoom`,權威)、client(標頭顯示,純顯示用)共用同一套公式算,不用額外 socket 事件同步。第 1 級 = 建房時設定的原始盲注;之後每級大盲 = 前一級 × 1.5,捨去到最近的 5,並保底 +5(避免小盲注卡住不漲)。時鐘起點 `Room.tournamentClockStartedAt` 在第一手發牌時寫入一次(`startTournamentClockIfNeeded`,道理跟現金局的 `startSessionIfNeeded` 一樣,對彼此房型自然 no-op)。
+- **淘汰與名次**:`server/src/tournament.ts` 的 `processTournamentHandEnd` 在每手結束、`persistHandResult` 之後、`persistHandLog` 之前呼叫(掛在 `broadcastAfterAction` 裡)。把這手新輸光(`chipsAtTable<=0` 且還沒名次)的人指定名次 = 這手開始前還在場上(未淘汰)的人數 —— 例如 6 人局打到剩 4 人未淘汰時有人輸光,他是第 4 名。同一手多人同時輸光 → 並列同名次(v1 簡化,不用起始籌碼細分排序)。剩 1 人未淘汰且有籌碼 = 冠軍(第 1 名),整場結束:刪光 membership、房間標 closed、回傳 `SettlementSummary`(`reason:'tournament-finished'`),跟 `room:close`/session-expiry 用同一套善後(`cancelAutoAction`/`clearRoomState`/清 map/刪 HandLog/廣播 `room:closed`)。
+- **主動站起 = 淘汰**:`eliminateStandingPlayer` 取代現金局的 `unseatUser`,記名次、籌碼歸零,但**保留** Membership 列(不刪除),讓最終結算還讀得到 `finishRank`,座位也會顯示「已淘汰」而不是直接空出來被別人坐(反正沒有 rebuy,空位也沒意義)。
+- **晚期報名擋**:`seatUser` 如果房型是 tournament 且 `tournamentClockStartedAt` 已設定(代表已開打),直接拒絕加入。
+- **結算型別**:`SettlementSummary.reason` 多一個 `'tournament-finished'`,`players[]` 多一個選填的 `finishRank`(用加欄位而非 discriminated union,`sheetsSync.ts` 跟現有兩個現金局結算組裝函式完全不用改,反正它們就是不會填這個欄位)。前端「贏家全拿」框架顯示(冠軍「贏得全部籌碼」,其他人「輸掉買入」)只是顯示概念,沒有真的獎池轉帳。
+- **已知 v1 簡化**:房主中途手動 `room:close` 一個進行中的錦標賽,走現金局結算畫面(不顯示名次/冠軍),當作安全中止備案;主動站起淘汰籌碼直接消失,不會分配給還在場的其他人;沒有可配置的獎金拆分(1st/2nd/3rd 各拿多少 %),也沒有延遲報名 —— 都是「雛形」範圍外的加強項目。
 
 ---
 

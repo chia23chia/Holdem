@@ -5,10 +5,11 @@ import type {
   RoomDetail,
   RoomStatus,
   RoomSummary,
+  RoomType,
   SettlementSummary,
 } from '@holdem/shared';
 
-const displayName = (u: { nickname: string | null; name: string | null }) =>
+export const displayName = (u: { nickname: string | null; name: string | null }) =>
   u.nickname ?? u.name ?? 'unknown';
 
 export async function listRoomSummaries(): Promise<RoomSummary[]> {
@@ -24,6 +25,7 @@ export async function listRoomSummaries(): Promise<RoomSummary[]> {
     id: r.id,
     name: r.name,
     ownerName: displayName(r.owner),
+    roomType: r.roomType as RoomType,
     maxPlayers: r.maxPlayers,
     currentPlayers: r._count.memberships,
     smallBlind: r.smallBlind,
@@ -33,6 +35,8 @@ export async function listRoomSummaries(): Promise<RoomSummary[]> {
     sessionMinutes: r.sessionMinutes,
     sessionEndsAt: r.sessionEndsAt?.toISOString() ?? null,
     actionTimeoutSeconds: r.actionTimeoutSeconds,
+    blindLevelMinutes: r.blindLevelMinutes,
+    tournamentClockStartedAt: r.tournamentClockStartedAt?.toISOString() ?? null,
   }));
 }
 
@@ -55,6 +59,7 @@ export async function getRoomDetail(roomId: string): Promise<RoomDetail | null> 
     name: room.name,
     ownerId: room.ownerId,
     ownerName: displayName(room.owner),
+    roomType: room.roomType as RoomType,
     maxPlayers: room.maxPlayers,
     currentPlayers: room.memberships.length,
     smallBlind: room.smallBlind,
@@ -64,12 +69,15 @@ export async function getRoomDetail(roomId: string): Promise<RoomDetail | null> 
     sessionMinutes: room.sessionMinutes,
     sessionEndsAt: room.sessionEndsAt?.toISOString() ?? null,
     actionTimeoutSeconds: room.actionTimeoutSeconds,
+    blindLevelMinutes: room.blindLevelMinutes,
+    tournamentClockStartedAt: room.tournamentClockStartedAt?.toISOString() ?? null,
     seats: room.memberships.map((m) => ({
       seat: m.seat,
       userId: m.userId,
       name: displayName(m.user),
       image: m.user.image,
       chipsAtTable: m.chipsAtTable,
+      finishRank: m.finishRank,
     })),
   };
 }
@@ -105,6 +113,10 @@ export async function seatUser(
 
     const existing = room.memberships.find((m) => m.userId === userId);
     if (existing) return { ok: true, seat: existing.seat };
+
+    if (room.roomType === 'tournament' && room.tournamentClockStartedAt) {
+      return { ok: false, error: '錦標賽已開始,無法加入' };
+    }
 
     if (room.memberships.length >= room.maxPlayers) {
       return { ok: false, error: '房間已滿' };
@@ -169,9 +181,12 @@ export async function rebuyChips(
   return prisma.$transaction(async (tx) => {
     const room = await tx.room.findUnique({
       where: { id: roomId },
-      select: { buyIn: true },
+      select: { buyIn: true, roomType: true },
     });
     if (!room) return { ok: false, error: '房間不存在' };
+    if (room.roomType === 'tournament') {
+      return { ok: false, error: '錦標賽模式不可加碼' };
+    }
     const membership = await tx.membership.findUnique({
       where: { userId_roomId: { userId, roomId } },
     });
@@ -228,6 +243,16 @@ export async function closeRoom(roomId: string): Promise<void> {
     where: { id: roomId },
     data: { status: 'closed' },
   });
+}
+
+// Cheap lookup used to gate rebuy/standup/rooms behavior by room type
+// without fetching the full room detail.
+export async function getRoomType(roomId: string): Promise<RoomType | null> {
+  const room = await prisma.room.findUnique({
+    where: { id: roomId },
+    select: { roomType: true },
+  });
+  return (room?.roomType as RoomType) ?? null;
 }
 
 // Set Room.status. Used by hand-start / hand-end transitions to toggle

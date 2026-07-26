@@ -137,11 +137,20 @@ export default function LobbyPage() {
                 className="flex items-center justify-between p-4 hover:bg-slate-900"
               >
                 <div>
-                  <div className="font-semibold">{r.name}</div>
+                  <div className="flex items-center gap-2 font-semibold">
+                    {r.name}
+                    {r.roomType === 'tournament' && (
+                      <span className="rounded bg-amber-700 px-1.5 py-0.5 text-[10px] font-bold text-amber-100">
+                        錦標賽
+                      </span>
+                    )}
+                  </div>
                   <div className="text-xs text-slate-500">
-                    房主 {r.ownerName} · 盲注 {r.smallBlind}/{r.bigBlind} · 買入{' '}
-                    {r.buyIn}
-                    {r.sessionMinutes && ` · 時長 ${r.sessionMinutes} 分`}
+                    房主 {r.ownerName} · 盲注 {r.smallBlind}/{r.bigBlind} ·{' '}
+                    {r.roomType === 'tournament' ? '起始籌碼' : '買入'} {r.buyIn}
+                    {r.roomType === 'tournament'
+                      ? r.blindLevelMinutes && ` · 每級 ${r.blindLevelMinutes} 分`
+                      : r.sessionMinutes && ` · 時長 ${r.sessionMinutes} 分`}
                   </div>
                 </div>
                 <div className="flex items-center gap-4">
@@ -265,11 +274,13 @@ function NicknameModal({
 
 type CreateRoomPayload = {
   name: string;
+  roomType: 'cash' | 'tournament';
   maxPlayers: number;
   smallBlind: number;
   bigBlind: number;
   buyIn: number;
-  sessionMinutes: number;
+  sessionMinutes?: number;      // cash only
+  blindLevelMinutes?: number;   // tournament only
   actionTimeoutSeconds: number;
 };
 
@@ -283,12 +294,15 @@ function CreateRoomModal({
   onSubmit: (p: CreateRoomPayload) => void;
 }) {
   const [name, setName] = useState('');
+  const [roomType, setRoomType] = useState<'cash' | 'tournament'>('cash');
   const [maxPlayers, setMaxPlayers] = useState(9);
   const [smallBlind, setSmallBlind] = useState(5);
   const [bigBlind, setBigBlind] = useState(10);
   const [buyIn, setBuyIn] = useState(1000);
   const [sessionMinutes, setSessionMinutes] = useState(30);
+  const [blindLevelMinutes, setBlindLevelMinutes] = useState(15);
   const [actionTimeoutSeconds, setActionTimeoutSeconds] = useState(30);
+  const isTournament = roomType === 'tournament';
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
@@ -300,16 +314,41 @@ function CreateRoomModal({
             if (!name.trim()) return;
             onSubmit({
               name: name.trim(),
+              roomType,
               maxPlayers,
               smallBlind,
               bigBlind,
               buyIn,
-              sessionMinutes,
               actionTimeoutSeconds,
+              ...(isTournament ? { blindLevelMinutes } : { sessionMinutes }),
             });
           }}
           className="flex flex-col gap-3 text-sm"
         >
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={() => setRoomType('cash')}
+              className={`flex-1 rounded border px-3 py-2 font-semibold ${
+                !isTournament
+                  ? 'border-emerald-600 bg-emerald-950 text-emerald-200'
+                  : 'border-slate-700 text-slate-400 hover:bg-slate-800'
+              }`}
+            >
+              現金局
+            </button>
+            <button
+              type="button"
+              onClick={() => setRoomType('tournament')}
+              className={`flex-1 rounded border px-3 py-2 font-semibold ${
+                isTournament
+                  ? 'border-amber-600 bg-amber-950 text-amber-200'
+                  : 'border-slate-700 text-slate-400 hover:bg-slate-800'
+              }`}
+            >
+              錦標賽
+            </button>
+          </div>
           <label className="flex flex-col gap-1">
             <span className="text-slate-300">房間名稱</span>
             <input
@@ -329,37 +368,55 @@ function CreateRoomModal({
               max={10}
             />
             <Field
-              label="買入 (>= 20 × 大盲)"
+              label={isTournament ? '起始籌碼' : '買入 (>= 20 × 大盲)'}
               value={buyIn}
               onChange={setBuyIn}
               min={20}
             />
             <Field
-              label="小盲"
+              label={isTournament ? '小盲 (第一級)' : '小盲'}
               value={smallBlind}
               onChange={setSmallBlind}
               min={1}
             />
             <Field
-              label="大盲 (>= 2 × 小盲)"
+              label={isTournament ? '大盲 (第一級,>= 2 × 小盲)' : '大盲 (>= 2 × 小盲)'}
               value={bigBlind}
               onChange={setBigBlind}
               min={2}
             />
           </div>
-          <label className="flex flex-col gap-1">
-            <span className="text-slate-300">遊戲時長(按開始牌局才開始倒數)</span>
-            <select
-              className="rounded border border-slate-700 bg-slate-950 px-3 py-2"
-              value={sessionMinutes}
-              onChange={(e) => setSessionMinutes(Number(e.target.value))}
-            >
-              <option value={30}>30 分鐘</option>
-              <option value={60}>60 分鐘</option>
-              <option value={90}>90 分鐘</option>
-              <option value={120}>120 分鐘</option>
-            </select>
-          </label>
+          {isTournament ? (
+            <label className="flex flex-col gap-1">
+              <span className="text-slate-300">
+                每級盲注維持幾分鐘(按開始牌局才開始漲盲)
+              </span>
+              <select
+                className="rounded border border-slate-700 bg-slate-950 px-3 py-2"
+                value={blindLevelMinutes}
+                onChange={(e) => setBlindLevelMinutes(Number(e.target.value))}
+              >
+                <option value={5}>5 分鐘</option>
+                <option value={10}>10 分鐘</option>
+                <option value={15}>15 分鐘</option>
+                <option value={20}>20 分鐘</option>
+              </select>
+            </label>
+          ) : (
+            <label className="flex flex-col gap-1">
+              <span className="text-slate-300">遊戲時長(按開始牌局才開始倒數)</span>
+              <select
+                className="rounded border border-slate-700 bg-slate-950 px-3 py-2"
+                value={sessionMinutes}
+                onChange={(e) => setSessionMinutes(Number(e.target.value))}
+              >
+                <option value={30}>30 分鐘</option>
+                <option value={60}>60 分鐘</option>
+                <option value={90}>90 分鐘</option>
+                <option value={120}>120 分鐘</option>
+              </select>
+            </label>
+          )}
           <label className="flex flex-col gap-1">
             <span className="text-slate-300">每人每手行動秒數(整局固定)</span>
             <select

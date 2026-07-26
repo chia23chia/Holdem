@@ -77,21 +77,35 @@ enum RoomStatus {
   closed
 }
 
+enum RoomType {
+  cash
+  tournament
+}
+
 model Room {
   id             String     @id @default(cuid())
   name           String
   ownerId        String
+  roomType       RoomType   @default(cash)
   maxPlayers     Int        @default(9)
   smallBlind     Int        @default(5)
   bigBlind       Int        @default(10)
   buyIn          Int        @default(1000)
   status         RoomStatus @default(waiting)
-  // Session (Phase 2). NULL = unlimited (no auto-close by time).
+  // Session (Phase 2, cash games only). NULL = unlimited (no auto-close by time).
   sessionMinutes Int?
   sessionEndsAt  DateTime?
   // Per-player action time budget applied to every hand in this room.
   // Chosen at room create, then locked for the whole session.
   actionTimeoutSeconds Int   @default(30)
+  // Tournament (SNG) fields — unused/null for cash rooms.
+  // Minutes each blind level lasts; blindsForLevel() in @holdem/shared derives
+  // the actual SB/BB for "now" from tournamentClockStartedAt + this duration.
+  blindLevelMinutes        Int?
+  // Wall-clock zero point for blind escalation, set once when the first hand
+  // is dealt. Deliberately separate from sessionEndsAt/sessionMinutes, which
+  // are a cash-only "session length" concept tournaments don't use.
+  tournamentClockStartedAt DateTime?
   createdAt      DateTime   @default(now())
 
   owner       User         @relation("RoomOwner", fields: [ownerId], references: [id])
@@ -111,6 +125,9 @@ model Membership {
   // Used to compute win/loss = chipsAtTable - totalBuyIn on session settlement.
   totalBuyIn   Int      @default(0)
   joinedAt     DateTime @default(now())
+  // Tournament finish placement: 1 = champion, higher = eliminated earlier.
+  // Null while still active, and unused entirely for cash-game rooms.
+  finishRank   Int?
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
   room Room @relation(fields: [roomId], references: [id], onDelete: Cascade)
