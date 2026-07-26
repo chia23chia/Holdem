@@ -119,7 +119,12 @@ model Membership {
   id           String   @id @default(cuid())
   userId       String
   roomId       String
-  seat         Int
+  // Null = temporarily standing (cash game only) — the Membership row and
+  // its chipsAtTable/totalBuyIn survive so sitting back down resumes the
+  // same stack instead of a fresh buy-in. Postgres allows multiple NULLs
+  // under the (roomId, seat) unique constraint below (same trick already
+  // used by User.nickname), so several standing players don't collide.
+  seat         Int?
   chipsAtTable Int
   // Cumulative chips brought to this room across seat + rebuys.
   // Used to compute win/loss = chipsAtTable - totalBuyIn on session settlement.

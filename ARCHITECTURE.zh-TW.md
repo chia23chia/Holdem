@@ -182,7 +182,7 @@ Browser ─┬─ HTTP  ────────────► web (Next.js) :3
 | `id` | String (cuid) PK | |
 | `userId` | String | FK → User(CASCADE) |
 | `roomId` | String | FK → Room(CASCADE) |
-| `seat` | Int | 1..maxPlayers |
+| `seat` | Int? | 1..maxPlayers;null = 暫離中(站起但保留籌碼,見 §11.17) |
 | `chipsAtTable` | Int | 桌上籌碼(play money;seat 時 = buyIn,牌局結束由 persistHandResult 更新;rebuy 規則見下) |
 | `totalBuyIn` | Int DEFAULT 0 | 累計買入(初始 buyIn + 所有 rebuys),用來算 settlement 輸贏 = chipsAtTable - totalBuyIn |
 | `joinedAt` | DateTime | |
@@ -524,19 +524,23 @@ DB 持久化延到 Milestone 2.5(斷線寬限)才做。
 
 `game:hole` **只能**推給特定 socket,絕不廣播到 room channel。實作用 `io.in(channel).fetchSockets()` + 每個 socket 個別 `rs.emit('game:hole', priv)`。如果之後 refactor 改用 `.to()` 或 namespace 廣播,務必確認手牌不會外洩。
 
-### 11.17 手牌中禁止站起 + Exit-不-unseat(Milestone 2.5 收斂)
+### 11.17 手牌中禁止站起 + 站起是「暫離」不是退出(2026-07-27 修正)
 
 `room:standup` handler 若 `hasActiveHand(roomId)` 為真,回 `room:error`「牌局進行中無法站起」。理由:mid-hand 把 player 從 `hand.players` 拔掉會弄亂 `toAct` / `currentPlayerIdx` / 對手期待,實作成本高。
 
-**Disconnect / room:leave 現況(2.5)**:兩個路徑都**不 unseat**。玩家關 tab / 斷線 / 按離開房間都只是離開 socket channel,座位跟 chipsAtTable 留在 DB。手牌中的 turn 靠 `runAutoAction` deadline 自動 check/fold。真的要「不玩了」只能 `站起`(等手牌結束)。空房自動關的觸發:「所有人都主動站起 / owner-close / session-expire」。
+**站起 = 暫離,不是退出**(現金局;錦標賽走 `eliminateStandingPlayer`,見 §11.20,不受這節影響)。`Membership.seat` 是 `Int?`,站起時 `unseatUser` 只把 `seat` 設回 `null`,**不刪 Membership、不動 chipsAtTable/totalBuyIn**;之後同一人用 `seatUser` 坐回來(同座位或其他空位皆可),會直接接續原本的籌碼,不是重新用 `room.buyIn` 買入。Postgres 的 `@@unique([roomId, seat])` 允許多個 NULL 並存(跟 `User.nickname` 同一招),所以好幾個人同時暫離不會互相卡到。`seat === null` 的成員不會出現在 `RoomDetail.seats`(座位表看不到、大廳人數也不計入),但設定/結算查詢仍會抓到他們的籌碼記錄。
+
+早期(Milestone 2.5)設計是「站起 = 永久退出、籌碼歸零」,但實測發現使用者會把「站起」當成暫時離桌,再坐下卻發現籌碼被清空、變成重新買入 —— 上面這版修正解決了這個問題。
+
+**Disconnect / room:leave 現況**:兩個路徑都**不 unseat**(座位維持 seated 狀態)。玩家關 tab / 斷線 / 按離開房間都只是離開 socket channel,座位跟 chipsAtTable 留在 DB。手牌中的 turn 靠 `runAutoAction` deadline 自動 check/fold。空房自動關的觸發:「所有人都站起(不再是任何人有 seat) / owner-close / session-expire」—— `closeRoom`(空房自動關專用)現在會連同任何遺留的站起中 Membership 一起刪掉,因為房間關閉後 `seatUser` 一律拒絕加入,沒有留著的必要。
 
 ### 11.18 Play-money 模式(2026-07-25 起)
 
 `User.chipsBalance` 這個欄位**保留但不動**(留給以後長期追蹤功能用)。當前為每局獨立 play-money:
 
-- **坐下**:`seatUser` 直接把 `chipsAtTable = room.buyIn` + `totalBuyIn = room.buyIn` 寫進 Membership,**不從 chipsBalance 扣**
+- **坐下**:`seatUser` 首次入座才把 `chipsAtTable = room.buyIn` + `totalBuyIn = room.buyIn` 寫進 Membership;暫離後坐回來則保留原本數字,**不從 chipsBalance 扣**
 - **Rebuy**:`rebuyChips` 依 §5.3.1 的歸零 + chip-leader 上限規則加碼到 chipsAtTable + totalBuyIn,**不從 chipsBalance 扣**
-- **站起 / 空房自動關 / owner close / session expire**:刪 Membership,**不 refund 到 chipsBalance**
+- **空房自動關 / owner close / session expire**:刪 Membership,**不 refund 到 chipsBalance**(站起本身不再刪 Membership,見 §11.17)
 - **Settlement modal**:顯示每人「買入 / 剩下 / 輸贏」,輸贏 = chipsAtTable - totalBuyIn(正綠負紅),純資訊,不動 chipsBalance
 
 長期追蹤功能之後補時,再把 chipsBalance 拉回計算流程(可能 rebuy 從 chipsBalance 扣、settlement 寫回 chipsBalance)。

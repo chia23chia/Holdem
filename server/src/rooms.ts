@@ -18,7 +18,7 @@ export async function listRoomSummaries(): Promise<RoomSummary[]> {
     orderBy: { createdAt: 'desc' },
     include: {
       owner: { select: { name: true, nickname: true } },
-      _count: { select: { memberships: true } },
+      _count: { select: { memberships: { where: { seat: { not: null } } } } },
     },
   });
   return rooms.map((r) => ({
@@ -61,7 +61,7 @@ export async function getRoomDetail(roomId: string): Promise<RoomDetail | null> 
     ownerName: displayName(room.owner),
     roomType: room.roomType as RoomType,
     maxPlayers: room.maxPlayers,
-    currentPlayers: room.memberships.length,
+    currentPlayers: room.memberships.filter((m) => m.seat !== null).length,
     smallBlind: room.smallBlind,
     bigBlind: room.bigBlind,
     buyIn: room.buyIn,
@@ -71,14 +71,19 @@ export async function getRoomDetail(roomId: string): Promise<RoomDetail | null> 
     actionTimeoutSeconds: room.actionTimeoutSeconds,
     blindLevelMinutes: room.blindLevelMinutes,
     tournamentClockStartedAt: room.tournamentClockStartedAt?.toISOString() ?? null,
-    seats: room.memberships.map((m) => ({
-      seat: m.seat,
-      userId: m.userId,
-      name: displayName(m.user),
-      image: m.user.image,
-      chipsAtTable: m.chipsAtTable,
-      finishRank: m.finishRank,
-    })),
+    // Temporarily-standing players (seat === null) aren't shown as
+    // occupying a seat — their Membership row just holds their chips
+    // until they sit back down.
+    seats: room.memberships
+      .filter((m): m is typeof m & { seat: number } => m.seat !== null)
+      .map((m) => ({
+        seat: m.seat,
+        userId: m.userId,
+        name: displayName(m.user),
+        image: m.user.image,
+        chipsAtTable: m.chipsAtTable,
+        finishRank: m.finishRank,
+      })),
   };
 }
 
@@ -97,7 +102,10 @@ export type SeatOutcome =
 // Atomically seats user at a free seat. Play-money model — chips are given
 // out of thin air (no chipsBalance deduction). totalBuyIn tracks cumulative
 // chips brought in for settlement's win/loss display.
-// If user already seated in the room, returns success with their existing seat.
+// If already seated, returns success with their existing seat. If they have
+// a Membership row but are temporarily standing (seat === null, see
+// unseatUser), re-seats them WITHOUT touching chipsAtTable/totalBuyIn — they
+// resume their prior stack instead of a fresh buy-in.
 export async function seatUser(
   userId: string,
   roomId: string,
@@ -106,23 +114,26 @@ export async function seatUser(
   return prisma.$transaction(async (tx) => {
     const room = await tx.room.findUnique({
       where: { id: roomId },
-      include: { memberships: { select: { seat: true, userId: true } } },
+      include: { memberships: { select: { id: true, seat: true, userId: true } } },
     });
     if (!room) return { ok: false, error: '房間不存在' };
     if (room.status === 'closed') return { ok: false, error: '房間已關閉' };
 
     const existing = room.memberships.find((m) => m.userId === userId);
-    if (existing) return { ok: true, seat: existing.seat };
+    if (existing && existing.seat !== null) {
+      return { ok: true, seat: existing.seat };
+    }
 
     if (room.roomType === 'tournament' && room.tournamentClockStartedAt) {
       return { ok: false, error: '錦標賽已開始,無法加入' };
     }
 
-    if (room.memberships.length >= room.maxPlayers) {
+    const seatedMemberships = room.memberships.filter((m) => m.seat !== null);
+    if (seatedMemberships.length >= room.maxPlayers) {
       return { ok: false, error: '房間已滿' };
     }
 
-    const taken = new Set(room.memberships.map((m) => m.seat));
+    const taken = new Set(seatedMemberships.map((m) => m.seat as number));
     let seat: number | null;
     if (desiredSeat) {
       if (desiredSeat < 1 || desiredSeat > room.maxPlayers) {
@@ -137,15 +148,23 @@ export async function seatUser(
       if (seat === null) return { ok: false, error: '房間已滿' };
     }
 
-    await tx.membership.create({
-      data: {
-        userId,
-        roomId,
-        seat,
-        chipsAtTable: room.buyIn,
-        totalBuyIn: room.buyIn,
-      },
-    });
+    if (existing) {
+      // Re-seating after a temporary standup — keep their prior stack.
+      await tx.membership.update({
+        where: { id: existing.id },
+        data: { seat },
+      });
+    } else {
+      await tx.membership.create({
+        data: {
+          userId,
+          roomId,
+          seat,
+          chipsAtTable: room.buyIn,
+          totalBuyIn: room.buyIn,
+        },
+      });
+    }
     return { ok: true, seat };
   });
 }
@@ -219,30 +238,40 @@ export async function rebuyChips(
   });
 }
 
-// Removes user from room. Play-money model — chips vanish (no chipsBalance
-// refund; settlement was already shown for display purposes).
+// Temporarily stands the player up — frees their seat for someone else but
+// keeps the Membership row (chipsAtTable/totalBuyIn intact) so sitting back
+// down later in the same room session resumes their same stack instead of a
+// fresh buy-in. The row only actually disappears when the room itself
+// settles/closes (owner-close / session-expire), which still refunds
+// nothing per the play-money model — this just stops "stand up, sit back
+// down" from silently wiping out someone's stack.
 // Idempotent: safe to call twice concurrently.
 export async function unseatUser(
   userId: string,
   roomId: string,
 ): Promise<{ empty: boolean }> {
   return prisma.$transaction(async (tx) => {
-    const membership = await tx.membership.findUnique({
-      where: { userId_roomId: { userId, roomId } },
+    await tx.membership.updateMany({
+      where: { userId, roomId },
+      data: { seat: null },
     });
-    if (membership) {
-      await tx.membership.deleteMany({ where: { id: membership.id } });
-    }
-    const remaining = await tx.membership.count({ where: { roomId } });
+    const remaining = await tx.membership.count({
+      where: { roomId, seat: { not: null } },
+    });
     return { empty: remaining === 0 };
   });
 }
 
+// Used for the "everyone stood up / room went empty" auto-close path.
+// "Empty" means no one is currently SEATED, but standing players keep
+// their Membership row (see unseatUser) — clean those up too since a
+// closed room can never be rejoined (seatUser rejects closed rooms), so
+// there's no reason to keep their preserved chip counts around.
 export async function closeRoom(roomId: string): Promise<void> {
-  await prisma.room.update({
-    where: { id: roomId },
-    data: { status: 'closed' },
-  });
+  await prisma.$transaction([
+    prisma.membership.deleteMany({ where: { roomId } }),
+    prisma.room.update({ where: { id: roomId }, data: { status: 'closed' } }),
+  ]);
 }
 
 // Cheap lookup used to gate rebuy/standup/rooms behavior by room type
