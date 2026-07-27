@@ -2,6 +2,11 @@
 
 所有值得記錄的變動都記在這裡,新的在最上面。日期是 commit 當天(UTC+8),不是嚴格的版本號。
 
+## 2026-07-28
+
+- **Session 到期擋新手**:`startHandForRoom` 加 `sessionEndsAt <= now` 檢查,現金局到期後不能再開新手(先前靠 `scanExpiredSessions` 30s tick,client 自動開下一手能塞進空檔多打 1-2 手)。錦標賽不受影響(不用 sessionEndsAt)。
+- **蓋牌者允許 mid-hand 站起**:`room:standup` 對已 `status === 'folded'` 的玩家放行 —— 該玩家已無牌局動線影響,現金局走 seat=null 暫離、錦標賽走 `eliminateStandingPlayer`。原本一律拒絕。
+
 ## 2026-07-27
 
 - **修正站起會清空籌碼的問題**(`00e64ba`):`room:standup` 原本會整筆刪除 Membership,導致再坐下時被當成新玩家、重新用 `room.buyIn` 買入,原本的籌碼(不管輸贏)都不見了。改成「暫離」:`Membership.seat` 改成可為 null,站起只把 `seat` 設回 null(籌碼不動),坐回來時接續原本的 `chipsAtTable`/`totalBuyIn`,不是重新買入。錦標賽的淘汰邏輯是完全獨立的路徑,不受影響。

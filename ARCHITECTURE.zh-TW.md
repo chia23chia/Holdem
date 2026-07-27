@@ -526,7 +526,9 @@ DB 持久化延到 Milestone 2.5(斷線寬限)才做。
 
 ### 11.17 手牌中禁止站起 + 站起是「暫離」不是退出(2026-07-27 修正)
 
-`room:standup` handler 若 `hasActiveHand(roomId)` 為真,回 `room:error`「牌局進行中無法站起」。理由:mid-hand 把 player 從 `hand.players` 拔掉會弄亂 `toAct` / `currentPlayerIdx` / 對手期待,實作成本高。
+`room:standup` handler 若 `hasActiveHand(roomId)` 為真,原則上回 `room:error`「牌局進行中無法站起」。理由:mid-hand 把 player 從 `hand.players` 拔掉會弄亂 `toAct` / `currentPlayerIdx` / 對手期待,實作成本高。
+
+**例外(2026-07-28 起)**:當前玩家在該手已 `status === 'folded'` 時允許站起 —— 蓋牌者不再影響牌局動線,把座位設 null(現金局暫離,籌碼保留)或走 `eliminateStandingPlayer`(錦標賽)都安全。`hand.players` 陣列不動、他的 fold 狀態繼續帶到手牌結束。
 
 **站起 = 暫離,不是退出**(現金局;錦標賽走 `eliminateStandingPlayer`,見 §11.20,不受這節影響)。`Membership.seat` 是 `Int?`,站起時 `unseatUser` 只把 `seat` 設回 `null`,**不刪 Membership、不動 chipsAtTable/totalBuyIn**;之後同一人用 `seatUser` 坐回來(同座位或其他空位皆可),會直接接續原本的籌碼,不是重新用 `room.buyIn` 買入。Postgres 的 `@@unique([roomId, seat])` 允許多個 NULL 並存(跟 `User.nickname` 同一招),所以好幾個人同時暫離不會互相卡到。`seat === null` 的成員不會出現在 `RoomDetail.seats`(座位表看不到、大廳人數也不計入),但設定/結算查詢仍會抓到他們的籌碼記錄。
 

@@ -341,6 +341,15 @@ async function startHandForRoom(roomId: string): Promise<StartHandOutcome> {
   const detail = await getRoomDetail(roomId);
   if (!detail) return { ok: false, error: '房間不存在' };
   if (hasActiveHand(roomId)) return { ok: false, error: '已在牌局中' };
+  // Block new hands after session expiry — scanExpiredSessions can lag up to
+  // 30s so without this a client-side auto-next-hand emit could sneak past.
+  // Tournaments don't set sessionEndsAt, so this only applies to cash rooms.
+  if (detail.sessionEndsAt) {
+    const endsAt = new Date(detail.sessionEndsAt).getTime();
+    if (endsAt <= Date.now()) {
+      return { ok: false, error: '房間時間已到,無法開新手' };
+    }
+  }
   // Players with 0 chips sit out — they aren't dealt in. Cash game: they
   // need a rebuy (otherwise they'd be stuck unable to check or call).
   // Tournament: 0 chips means eliminated, there's no rebuy to suggest.
@@ -476,10 +485,17 @@ io.on('connection', (socket) => {
   // persists in DB.
   socket.on('room:standup', async ({ roomId }) => {
     if (hasActiveHand(roomId)) {
-      socket.emit('room:error', {
-        message: '牌局進行中無法站起,請等這手結束',
-      });
-      return;
+      // Exception: a player who's already folded this hand isn't affecting
+      // action anymore, so they can safely leave the seat (cash: seat→null +
+      // chips preserved per §11.17; tournament: eliminated per the block below).
+      const hand = getHand(roomId);
+      const player = hand?.players.find((p) => p.userId === user.userId);
+      if (!player || player.status !== 'folded') {
+        socket.emit('room:error', {
+          message: '牌局進行中無法站起,請先蓋牌或等這手結束',
+        });
+        return;
+      }
     }
     const roomType = await getRoomType(roomId);
     if (roomType === 'tournament') {
