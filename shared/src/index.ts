@@ -283,6 +283,30 @@ export interface ChatMessage {
   ts: number;
 }
 
+// Emoji reactions ("stickers") a player can fling across the room. Whitelist
+// is shared so the picker options and the server-side validator stay in
+// lockstep — sending anything not in this list is dropped.
+export const STICKER_EMOJIS = [
+  '👍',
+  '😂',
+  '🎉',
+  '🙈',
+  '💩',
+  '🔥',
+  '❤️',
+  '😱',
+] as const;
+export type StickerEmoji = (typeof STICKER_EMOJIS)[number];
+
+// Broadcast to every room subscriber when a player sends a reaction.
+export interface StickerEvent {
+  id: string;      // server-generated, unique per event — used as React key
+  userId: string;  // sender's userId
+  name: string;    // sender's display name (for accessibility labels)
+  emoji: StickerEmoji;
+  ts: number;      // server epoch ms
+}
+
 // ============================================================
 // Socket.IO event contracts
 // ============================================================
@@ -300,6 +324,7 @@ export interface ServerToClientEvents {
   'room:error': (data: { message: string }) => void;
   'room:closed': (data: { roomId: string; settlement?: SettlementSummary }) => void;
   'chat:message': (msg: ChatMessage) => void;
+  'sticker:show': (evt: StickerEvent) => void;
 
   // Game (Phase 2)
   'game:started': (state: HandStatePublic) => void;
@@ -323,6 +348,8 @@ export interface ClientToServerEvents {
   'room:rebuy': (data: { roomId: string; amount: number }, cb: (res: GameActionResult) => void) => void;
 
   'chat:send': (data: { roomId: string | null; text: string }) => void;
+  // Emoji reaction — server rate-limits (see STICKER_EMOJIS whitelist).
+  'sticker:send': (data: { roomId: string; emoji: StickerEmoji }) => void;
 
   // Game (Phase 2 — owner-only)
   // actionTimeoutSeconds now lives on Room, no per-call param.

@@ -4,8 +4,10 @@ import type {
   ClientToServerEvents,
   ServerToClientEvents,
   SettlementSummary,
+  StickerEmoji,
+  StickerEvent,
 } from '@holdem/shared';
-import { effectiveBlinds } from '@holdem/shared';
+import { effectiveBlinds, STICKER_EMOJIS } from '@holdem/shared';
 import { authMiddleware, getUser } from './auth.js';
 import {
   buildOwnerCloseSettlement,
@@ -116,6 +118,13 @@ const autoActionTimers = new Map<string, NodeJS.Timeout>();
 // Latest persisted HandLog row id per room; used to patch endResult when a
 // voluntary reveal fires after the hand was already persisted.
 const lastHandLogIdByRoom = new Map<string, string>();
+
+// Sticker cooldown: per-user timestamp of last accepted sticker. Prevents a
+// single user from spamming reactions and drowning out the felt. Silently
+// drop instead of erroring — a dropped click is cheaper to explain than a
+// popup for a fun feature.
+const STICKER_COOLDOWN_MS = 3_000;
+const stickerLastSentByUser = new Map<string, number>();
 
 // Rebuy queue: mid-hand rebuy requests wait here. Applied to Membership
 // after the hand ends, before the next one starts. Value = the requested
@@ -639,6 +648,23 @@ io.on('connection', (socket) => {
         console.error('[server] updateHandLogEndResult error', err);
       }
     }
+  });
+
+  // ---- Stickers ----
+  socket.on('sticker:send', ({ roomId, emoji }) => {
+    if (!STICKER_EMOJIS.includes(emoji as StickerEmoji)) return;
+    const now = Date.now();
+    const last = stickerLastSentByUser.get(user.userId) ?? 0;
+    if (now - last < STICKER_COOLDOWN_MS) return;
+    stickerLastSentByUser.set(user.userId, now);
+    const evt: StickerEvent = {
+      id: `${user.userId}-${now}`,
+      userId: user.userId,
+      name: user.name,
+      emoji: emoji as StickerEmoji,
+      ts: now,
+    };
+    io.to(roomChannel(roomId)).emit('sticker:show', evt);
   });
 
   // ---- Chat ----

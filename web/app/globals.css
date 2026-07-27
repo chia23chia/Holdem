@@ -11,3 +11,35 @@ body {
   font-family: system-ui, -apple-system, 'PingFang TC', 'Microsoft JhengHei',
     'Noto Sans TC', sans-serif;
 }
+
+/* Sticker: fly right→left across the viewport, growing and rotating slightly,
+   then fade out at the end. Vertical position is set per-instance via inline
+   style. */
+@keyframes sticker-fly {
+  0% {
+    transform: translateX(110vw) scale(0.6) rotate(-10deg);
+    opacity: 0;
+  }
+  10% {
+    opacity: 1;
+  }
+  85% {
+    opacity: 1;
+  }
+  100% {
+    transform: translateX(-30vw) scale(1.4) rotate(15deg);
+    opacity: 0;
+  }
+}
+
+/* Marquee: single chat line scrolls right→left across its container. Duration
+   is set per-instance via inline style so long messages get proportionally
+   longer scroll time. */
+@keyframes marquee-scroll {
+  0% {
+    transform: translateX(100%);
+  }
+  100% {
+    transform: translateX(-100%);
+  }
+}

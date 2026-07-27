@@ -294,6 +294,7 @@ Server(server/src/auth.ts authMiddleware):
 | `game:hole` | `HandStatePrivate` | 單一 socket | 該座位玩家的私人手牌 + 當前最佳牌型;每次翻公共牌後 server 會**重推**讓 handRank 更新 |
 | `game:action-log` | `ActionLogEntry` | `room:<id>` channel | 每次玩家 action 後推一筆(seat、name、phase、actionType、amount);client 累積成本手動作紀錄,`game:started` 時清空 |
 | `game:ended` | `{roomId, result?}` | `room:<id>` channel | 手牌自然結束時帶 `result`(winners + hole reveal + handRank);manual `game:end` 不帶 result 直接清狀態 |
+| `sticker:show` | `StickerEvent` | `room:<id>` channel | 有人送 emoji reaction;client 疊到全螢幕飛過的貼圖層(見 §11.22) |
 
 ### 7.2 Client → Server
 
@@ -312,6 +313,7 @@ Server(server/src/auth.ts authMiddleware):
 | `game:action` | `{roomId, action}` | `GameActionResult` | 當前輪到的玩家送 fold / check / call / raise{amount} / all-in;server 更新 HandState、廣播 `game:state`;若手牌結束則存 chips 到 Membership + 廣播 `game:ended` {result} + 新的 `room:detail` |
 | `game:show-cards` | `{roomId}` | — | 手牌結束後任何曾在該手的玩家(含 fold 者)自願秀牌;server 更新 `endResult.revealedHoles` 加該人的手牌 + handRank(重複呼叫或已被揭露 no-op),再次廣播 `game:ended` {result 更新} |
 | `chat:send` | `{roomId\|null, text}` | — | Sanitize、emit `chat:message` 到房間或大廳 |
+| `sticker:send` | `{roomId, emoji}` | — | 送 emoji reaction(白名單見 `STICKER_EMOJIS`);per-user 3s cooldown,超頻直接丟掉不回錯,見 §11.22 |
 
 ### 7.3 Disconnect 清理
 
@@ -592,6 +594,40 @@ DB 持久化延到 Milestone 2.5(斷線寬限)才做。
 - **資料來源**:`getRoomDetail` 直接讀 `room.memberships`(不篩 seat),映射成 `{userId, name, seat, chipsAtTable, totalBuyIn, finishRank}`,依 `chipsAtTable - totalBuyIn` 由高到低排序,server 端統一排好、client 直接 render 不用再排。
 - **傳輸路徑**:走既有的 `room:detail` 事件,不新增 socket 事件。凡是會觸發 `room:detail` 廣播的時機(座位變動、rebuy、hand end 後的 `broadcastAfterAction`、`persistHandResult` 之後)都會順帶把 standings 一起送出,不用額外 tick。
 - **UI**:`web/app/room/[id]/page.tsx` 的 `PanelTabs` 從 2 tab(聊天 / 本手紀錄)擴成 3 tab,`StandingsList` 用 `<table>` 顯示 玩家 / 買入 / 剩下 / 輸贏 四欄;輸贏用 `text-emerald-400`(正)/ `text-red-400`(負)/ `text-slate-500`(±0)著色;`seat === null && finishRank === null` 加「(暫離)」小字,`finishRank !== null` 加名次徽章並淡化名字色。desktop 右側 panel 與 mobile 抽屜共用同一個 component。
+
+### 11.22 貼圖 reaction(2026-07-28 起)
+
+房間右下角的 `😀` FAB 打開 8 個 emoji picker(`STICKER_EMOJIS`:👍😂🎉🙈💩🔥❤️😱),點一下 emit `sticker:send`,server 白名單驗證 + per-user 3s cooldown 通過就 broadcast `sticker:show` 給整房。Client 接到後推進 `stickers` state,3 秒後自動移除(對應 CSS `sticker-fly` 動畫 3s 完成)。
+
+- **Whitelist 共享**:`STICKER_EMOJIS` 在 `shared/src/index.ts`,server 用同一份 array 驗證 emoji 合法性,前端 picker 也用它 render 按鈕,兩邊自動 lockstep。
+- **Rate limit**:`stickerLastSentByUser: Map<userId, number>` 記每位 user 上次送成功的 timestamp,3 秒內再送直接**丟掉不回錯**(fun feature 不值得 popup)。Map 只有 O(user 數)個 entry,永不清理也沒事。
+- **動畫**:`sticker-fly` keyframe(`globals.css`)從 `translateX(110vw)` 滑到 `translateX(-30vw)`,ease-out 3 秒,同時 scale 0.6→1.4 + 微旋轉、頭尾 opacity fade。
+- **不亂跳的垂直位置**:StickerLayer 用 `hashStr(sticker.id) % 60 + 15` 算 top%(15–75),同一個 sticker.id 永遠算出同一 top,即使 React 因為 state 變動重 render 也不會 jitter。
+- **全螢幕 overlay**:`fixed inset-0 z-40 pointer-events-none`,永遠不擋到底下按鈕點擊。
+
+### 11.23 聊天跑馬燈(2026-07-28 起)
+
+Header 底下一條 fixed-height(`h-6`)的跑馬燈,即時顯示 chat 訊息一則一則橫向捲過,**手機用戶不用主動點開聊天抽屜也能看到誰說了什麼**。走既有的 `chat:message` 事件,client 端多開一個 queue,不新增 socket。
+
+- **實作**:`ChatMarquee` 元件接收當前顯示中的 message + 空 queue callback。每則捲完(`onAnimationEnd`)呼叫 `onDone` 清空 current,`useEffect` 看到 current 空 + queue 有東西就 pop head 成新的 current,自然接續下一則。
+- **捲動時長**:`Math.max(6, Math.min(20, text.length * 0.25 + 6))` 秒,長訊息不會一閃而過。
+- **CSS 動畫**:`marquee-scroll` keyframe(`globals.css`)`translateX(100% → -100%)` linear,靠 `animationFillMode: 'forwards'` 保持在最終位置直到 React unmount。
+- **Queue 上限**:queue 最多留最近 20 則(`prev.slice(-19)`),爆量時掉最舊的,避免久掛的 tab 累積無限多待播訊息。
+- **空 queue 空狀態**:元件永遠 render `h-6` 空 div(不管有沒有訊息),避免出現時 layout 跳動。
+
+### 11.24 音效 cue(2026-07-28 起)
+
+`web/lib/sound.ts` — 極簡的 audio cue player,依 event 觸發播 `deal / fold / check / call / raise / allin / street / win / myturn` 短音效。全域 localStorage 記錄 mute 狀態(header 的 `🔊/🔇` 按鈕切換),沒設定預設有聲音。
+
+- **音檔位置**:`web/public/sounds/{key}.mp3`。**檔案不存在就靜音,不會壞掉任何流程** —— `Audio.play().catch(() => {})` 吞掉 404 / autoplay policy / codec 錯誤,不做 fallback。使用者自行把免費 CC0 音效 drop 進去,沒放也沒關係。
+- **Autoplay policy**:iOS Safari / Chrome 都要求首次播放要在 user gesture 內。因為玩家一定會先點過「就座」或「開始牌局」等按鈕才會聽到第一個 cue,所以實際上不會被擋。真被擋的話 `.catch` 也吞掉了,不用手動 unlock。
+- **Cue 對應**:
+  - `game:started` → `deal`
+  - `game:action-log` → 依 `actionType` 對應到 `fold/check/call/raise/allin`
+  - `phase` 從 preflop 進 flop/turn/river → `street`(只在真的 append 新 street entry 時響,不會因為 `game:state` 重播同一階段就重響)
+  - `game:ended` 帶 `result` → `win`
+  - 自己成為當前輪次的玩家(false→true transition,靠 `prevMyTurnRef` 去抖動)→ `myturn`
+- **Audio pool**:每個 cue key 第一次播才 lazy new `Audio()` 存進 `audioPool: Map`,之後 rewind `currentTime = 0` 重播,不重複建立 Element。
 
 ---
 

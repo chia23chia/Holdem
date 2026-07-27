@@ -16,9 +16,16 @@ import type {
   RoomDetail,
   RoomStanding,
   SettlementSummary,
+  StickerEmoji,
+  StickerEvent,
 } from '@holdem/shared';
-import { effectiveBlinds, nextBlindLevelAt } from '@holdem/shared';
+import {
+  effectiveBlinds,
+  nextBlindLevelAt,
+  STICKER_EMOJIS,
+} from '@holdem/shared';
 import { connectSocket, type TypedSocket } from '@/lib/socket';
+import { isMuted, playCue, setMuted, type SoundCue } from '@/lib/sound';
 
 // Display-only estimate of the server's rebuy cap (see rebuyChips in
 // server/src/rooms.ts for the authoritative rule): rounds down to the
@@ -59,6 +66,26 @@ export default function RoomPage() {
   const [settlement, setSettlement] = useState<SettlementSummary | null>(null);
   const [now, setNow] = useState(() => Date.now());
   const [autoNextIn, setAutoNextIn] = useState<number | null>(null);
+  // Sticker overlay: server-broadcast reactions each auto-remove after ~3.5s
+  // (animation is 3s + a tiny buffer to let the fade-out finish).
+  const [stickers, setStickers] = useState<StickerEvent[]>([]);
+  const [showStickerPicker, setShowStickerPicker] = useState(false);
+  // Chat marquee: one message at a time scrolls across; queue drains FIFO.
+  const [marqueeQueue, setMarqueeQueue] = useState<ChatMessage[]>([]);
+  const [marqueeCurrent, setMarqueeCurrent] = useState<ChatMessage | null>(
+    null,
+  );
+  // Local mute toggle (persisted to localStorage inside lib/sound). Seed from
+  // storage on mount so refresh remembers the choice.
+  const [muted, setMutedState] = useState(false);
+  useEffect(() => {
+    setMutedState(isMuted());
+  }, []);
+  function toggleMuted() {
+    const next = !muted;
+    setMuted(next);
+    setMutedState(next);
+  }
 
   // Derived at every render — safe to reference inside useEffects since it's
   // computed above them.
@@ -87,6 +114,9 @@ export default function RoomPage() {
   // re-registering it — see the tournament-finish race note below.
   const settlementRef = useRef(settlement);
   settlementRef.current = settlement;
+  // Debounces the myturn sound to only fire on the false→true transition, so
+  // re-renders while it's still my turn don't spam-play the ding.
+  const prevMyTurnRef = useRef(false);
 
   useEffect(() => {
     if (status !== 'authenticated' || !roomId) return;
@@ -123,6 +153,15 @@ export default function RoomPage() {
           if (!chatOpenRef.current) {
             setUnreadCount((n) => n + 1);
           }
+          // Push to marquee queue so mobile users don't need to open chat.
+          setMarqueeQueue((q) => [...q.slice(-19), msg]);
+        });
+        s.on('sticker:show', (evt) => {
+          setStickers((prev) => [...prev, evt]);
+          // Auto-remove after animation completes (3s anim + small buffer).
+          window.setTimeout(() => {
+            setStickers((prev) => prev.filter((x) => x.id !== evt.id));
+          }, 3500);
         });
         s.on('game:started', (state) => {
           setError(null); // clear any stale "等待補值" banner now that a hand began
@@ -144,6 +183,7 @@ export default function RoomPage() {
               },
             ];
           });
+          playCue('deal');
         });
         s.on('game:state', (state) => setGameState(state));
         s.on('game:hole', ({ holeCards: cards, handRank: hr }) => {
@@ -161,6 +201,19 @@ export default function RoomPage() {
             };
             return copy;
           });
+          const cue: SoundCue | null =
+            entry.actionType === 'fold'
+              ? 'fold'
+              : entry.actionType === 'check'
+                ? 'check'
+                : entry.actionType === 'call'
+                  ? 'call'
+                  : entry.actionType === 'raise'
+                    ? 'raise'
+                    : entry.actionType === 'all-in'
+                      ? 'allin'
+                      : null;
+          if (cue) playCue(cue);
         });
         s.on('game:ended', ({ result }) => {
           if (result) {
@@ -174,6 +227,7 @@ export default function RoomPage() {
               };
               return copy;
             });
+            playCue('win');
           } else {
             // Manual owner debug end → clear active game display AND drop the
             // last hand record if it never finished (no natural endResult).
@@ -287,12 +341,14 @@ export default function RoomPage() {
     if (!gameState) return;
     const phase = gameState.phase;
     if (phase !== 'flop' && phase !== 'turn' && phase !== 'river') return;
+    let didAppend = false;
     setHands((prev) => {
       if (prev.length === 0) return prev;
       const last = prev[prev.length - 1];
       if (last.history.some((h) => h.kind === 'street' && h.phase === phase)) {
         return prev;
       }
+      didAppend = true;
       const copy = [...prev];
       copy[copy.length - 1] = {
         ...last,
@@ -303,7 +359,36 @@ export default function RoomPage() {
       };
       return copy;
     });
+    // Only ding on the actual reveal (not on redundant re-broadcasts of the
+    // same phase, which would replay the sound on every re-render).
+    if (didAppend) playCue('street');
   }, [gameState?.phase, gameState?.community]);
+
+  // Play a distinct "your turn" cue only when it transitions to my turn —
+  // watching the derived boolean via a ref avoids replaying the sound every
+  // render while it's still my turn (e.g. bet-slider re-renders).
+  useEffect(() => {
+    const uid = session?.user?.id;
+    const isMe =
+      !!gameState &&
+      !!uid &&
+      gameState.phase !== 'ended' &&
+      gameState.players.some(
+        (p) =>
+          p.userId === uid &&
+          p.seat === gameState.currentPlayerSeat &&
+          p.status === 'active',
+      );
+    if (isMe && !prevMyTurnRef.current) {
+      playCue('myturn');
+    }
+    prevMyTurnRef.current = isMe;
+  }, [
+    gameState?.currentPlayerSeat,
+    gameState?.phase,
+    gameState?.handNumber,
+    session?.user?.id,
+  ]);
 
   // After a hand ends, run an 8-second countdown visible to everyone. Only the
   // owner's client actually emits `game:start` on reaching 0; server pulls the
@@ -351,6 +436,23 @@ export default function RoomPage() {
     if (!trimmed || !socketRef.current) return;
     socketRef.current.emit('chat:send', { roomId, text: trimmed });
     setInput('');
+  }
+
+  // Marquee: whenever nothing is currently scrolling but the queue has items,
+  // pop the head and start showing it. onAnimationEnd on the marquee element
+  // clears `marqueeCurrent`, which retriggers this effect for the next one.
+  useEffect(() => {
+    if (marqueeCurrent) return;
+    if (marqueeQueue.length === 0) return;
+    const [head, ...rest] = marqueeQueue;
+    setMarqueeCurrent(head);
+    setMarqueeQueue(rest);
+  }, [marqueeCurrent, marqueeQueue]);
+
+  function sendSticker(emoji: StickerEmoji) {
+    setShowStickerPicker(false);
+    if (!socketRef.current || !roomId) return;
+    socketRef.current.emit('sticker:send', { roomId, emoji });
   }
 
   if (status !== 'authenticated') return null;
@@ -482,6 +584,15 @@ export default function RoomPage() {
             >
               {connected ? '已連線' : '連線中…'}
             </span>
+            <button
+              type="button"
+              onClick={toggleMuted}
+              className="ml-2 inline-block rounded border border-slate-700 px-1.5 py-0.5 text-[10px] hover:bg-slate-800 sm:text-xs"
+              title={muted ? '目前靜音,點擊開啟音效' : '目前有音效,點擊靜音'}
+              aria-label={muted ? '開啟音效' : '靜音'}
+            >
+              {muted ? '🔇' : '🔊'}
+            </button>
             {room?.roomType === 'tournament' ? (
               <BlindLevelInfo room={room} now={now} />
             ) : room?.sessionEndsAt ? (
@@ -634,6 +745,12 @@ export default function RoomPage() {
           )}
         </div>
       </header>
+
+      <ChatMarquee
+        current={marqueeCurrent}
+        myUserId={myUserId}
+        onDone={() => setMarqueeCurrent(null)}
+      />
 
       {error && (
         <div className="rounded border border-red-700 bg-red-950 p-3 text-sm text-red-200">
@@ -920,19 +1037,47 @@ export default function RoomPage() {
         </section>
       </div>
 
-      {/* Mobile chat FAB */}
-      <button
-        onClick={() => setChatOpen(true)}
-        className="fixed bottom-4 right-4 z-30 flex h-12 w-12 items-center justify-center rounded-full bg-emerald-600 text-xl shadow-lg hover:bg-emerald-500 sm:hidden"
-        aria-label="開啟聊天"
-      >
-        💬
-        {unreadCount > 0 && (
-          <span className="absolute -right-1 -top-1 flex h-5 min-w-5 items-center justify-center rounded-full bg-red-600 px-1 text-[10px] font-bold">
-            {unreadCount > 99 ? '99+' : unreadCount}
-          </span>
+      {/* Sticker FAB — always visible; on mobile sits next to the chat FAB */}
+      <div className="fixed bottom-4 right-4 z-30 flex flex-col items-end gap-2">
+        {showStickerPicker && (
+          <div className="grid grid-cols-4 gap-1 rounded-lg border border-slate-700 bg-slate-900 p-2 shadow-lg">
+            {STICKER_EMOJIS.map((e) => (
+              <button
+                key={e}
+                onClick={() => sendSticker(e)}
+                className="h-10 w-10 rounded text-2xl hover:bg-slate-800"
+                aria-label={`送出 ${e}`}
+              >
+                {e}
+              </button>
+            ))}
+          </div>
         )}
-      </button>
+        <div className="flex items-end gap-2">
+          {/* Mobile chat FAB — hidden on desktop where the panel is always open. */}
+          <button
+            onClick={() => setChatOpen(true)}
+            className="relative flex h-12 w-12 items-center justify-center rounded-full bg-emerald-600 text-xl shadow-lg hover:bg-emerald-500 sm:hidden"
+            aria-label="開啟聊天"
+          >
+            💬
+            {unreadCount > 0 && (
+              <span className="absolute -right-1 -top-1 flex h-5 min-w-5 items-center justify-center rounded-full bg-red-600 px-1 text-[10px] font-bold">
+                {unreadCount > 99 ? '99+' : unreadCount}
+              </span>
+            )}
+          </button>
+          <button
+            onClick={() => setShowStickerPicker((v) => !v)}
+            className="flex h-12 w-12 items-center justify-center rounded-full bg-amber-600 text-xl shadow-lg hover:bg-amber-500"
+            aria-label="送出表情"
+          >
+            😀
+          </button>
+        </div>
+      </div>
+
+      <StickerLayer stickers={stickers} />
 
       {/* Mobile chat drawer */}
       {chatOpen && (
@@ -1093,6 +1238,84 @@ function PanelTabs({
       {btn('standings', '戰績')}
     </div>
   );
+}
+
+function ChatMarquee({
+  current,
+  myUserId,
+  onDone,
+}: {
+  current: ChatMessage | null;
+  myUserId: string | undefined;
+  onDone: () => void;
+}) {
+  // Fixed-height bar so nothing jumps when the marquee is empty. Overflow
+  // hidden clips the scrolling text to the container width.
+  if (!current) {
+    return <div className="h-6" aria-hidden />;
+  }
+  // Longer messages get proportionally longer scroll duration (min 6s, ~0.25s
+  // per char) so a long message doesn't blur past too fast.
+  const durationSec = Math.max(6, Math.min(20, current.text.length * 0.25 + 6));
+  const isMe = current.userId === myUserId;
+  return (
+    <div className="h-6 overflow-hidden rounded bg-slate-900/70 text-sm">
+      <div
+        key={current.ts + current.userId}
+        onAnimationEnd={onDone}
+        className="whitespace-nowrap"
+        style={{
+          animation: `marquee-scroll ${durationSec}s linear`,
+          animationFillMode: 'forwards',
+        }}
+      >
+        <span className={isMe ? 'text-emerald-400' : 'text-sky-400'}>
+          {current.from}
+        </span>
+        <span className="text-slate-500">:</span>{' '}
+        <span className="text-slate-200">{current.text}</span>
+      </div>
+    </div>
+  );
+}
+
+function StickerLayer({ stickers }: { stickers: StickerEvent[] }) {
+  // Full-viewport overlay. `pointer-events-none` so it never blocks clicks on
+  // the felt or buttons underneath. Each sticker is absolutely-positioned by
+  // a random top percentage assigned once per event id (deterministic hash so
+  // re-renders don't teleport an in-flight sticker vertically).
+  return (
+    <div className="pointer-events-none fixed inset-0 z-40 overflow-hidden">
+      {stickers.map((s) => {
+        const topPct = 15 + (hashStr(s.id) % 60); // 15%..75%
+        return (
+          <div
+            key={s.id}
+            className="absolute text-5xl sm:text-6xl"
+            style={{
+              top: `${topPct}%`,
+              left: 0,
+              animation: 'sticker-fly 3s ease-out forwards',
+              filter: 'drop-shadow(0 2px 4px rgba(0,0,0,0.5))',
+            }}
+            aria-label={`${s.name} 送出 ${s.emoji}`}
+          >
+            {s.emoji}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// Tiny deterministic hash for sticker vertical placement — same id always
+// maps to the same top%, so re-renders don't jitter an in-flight sticker.
+function hashStr(s: string): number {
+  let h = 0;
+  for (let i = 0; i < s.length; i += 1) {
+    h = (h * 31 + s.charCodeAt(i)) | 0;
+  }
+  return Math.abs(h);
 }
 
 function StandingsList({

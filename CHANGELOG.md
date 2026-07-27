@@ -4,6 +4,9 @@
 
 ## 2026-07-28
 
+- **音效 cue + mute 開關**:發牌、fold / check / call / raise / all-in、翻公共牌、贏牌、輪到自己各有一個短音效,header 加 `🔊/🔇` 一鍵靜音(記在 localStorage,重整不掉)。音檔期望放在 `web/public/sounds/{deal,fold,check,call,raise,allin,street,win,myturn}.mp3`,**沒放就是靜音**,不會壞掉任何遊戲流程(`.catch(()=>{})` 吞掉 404/autoplay/codec 錯)。見 `ARCHITECTURE.zh-TW.md` §11.24。
+- **貼圖 reaction**:房間右下角加 `😀` FAB,打開 8 個 emoji picker(👍😂🎉🙈💩🔥❤️😱),送出後全房看到那個 emoji 飛過螢幕 3 秒消失。Server 白名單驗證 + per-user 3 秒 cooldown(超頻直接丟掉不回錯,fun feature 不值得 popup)。細節見 §11.22。
+- **聊天跑馬燈**:Header 下面一條跑馬燈,即時顯示 chat 訊息一則一則橫向捲過,手機用戶不用主動點開聊天抽屜也能看到誰說了什麼。走既有 `chat:message` 事件不新增 socket;queue 上限 20 則,爆量掉最舊的。長訊息會拉長捲動時間(6–20 秒),不會一閃而過。細節見 §11.23。
 - **即時戰績面板**:房間右側面板加第 3 個分頁「戰績」,顯示房內每位成員當下的 買入 / 剩下 / 輸贏,依淨輸贏由高到低排序。**含暫離成員**(結算 modal 看不到暫離者,這個 tab 看得到),名次算完的錦標賽淘汰者也帶名次徽章顯示。走既有 `room:detail` 事件,不新增 socket。細節見 `ARCHITECTURE.zh-TW.md` §11.21。
 - **Session 到期擋新手**:`startHandForRoom` 加 `sessionEndsAt <= now` 檢查,現金局到期後不能再開新手(先前靠 `scanExpiredSessions` 30s tick,client 自動開下一手能塞進空檔多打 1-2 手)。錦標賽不受影響(不用 sessionEndsAt)。
 - **蓋牌者允許 mid-hand 站起**:`room:standup` 對已 `status === 'folded'` 的玩家放行 —— 該玩家已無牌局動線影響,現金局走 seat=null 暫離、錦標賽走 `eliminateStandingPlayer`。原本一律拒絕。
