@@ -14,6 +14,7 @@ import type {
   HandStatePublic,
   PlayerAction,
   RoomDetail,
+  RoomStanding,
   SettlementSummary,
 } from '@holdem/shared';
 import { effectiveBlinds, nextBlindLevelAt } from '@holdem/shared';
@@ -49,7 +50,9 @@ export default function RoomPage() {
   const [hands, setHands] = useState<HandRecord[]>([]);
   // null = follow latest hand; number = viewing a specific past hand
   const [selectedIdx, setSelectedIdx] = useState<number | null>(null);
-  const [panelTab, setPanelTab] = useState<'chat' | 'history'>('chat');
+  const [panelTab, setPanelTab] = useState<'chat' | 'history' | 'standings'>(
+    'chat',
+  );
   const [chatOpen, setChatOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [unreadCount, setUnreadCount] = useState(0);
@@ -900,7 +903,7 @@ export default function RoomPage() {
                 </button>
               </form>
             </>
-          ) : (
+          ) : panelTab === 'history' ? (
             <div className="flex h-96 flex-col gap-1 overflow-y-auto rounded bg-slate-900 p-3 text-sm">
               <HistoryList
                 hands={hands}
@@ -908,6 +911,10 @@ export default function RoomPage() {
                 onSelectIdx={setSelectedIdx}
                 players={gameState?.players ?? []}
               />
+            </div>
+          ) : (
+            <div className="flex h-96 flex-col overflow-y-auto rounded bg-slate-900 p-3">
+              <StandingsList standings={room?.standings ?? []} />
             </div>
           )}
         </section>
@@ -985,7 +992,7 @@ export default function RoomPage() {
                   </button>
                 </form>
               </>
-            ) : (
+            ) : panelTab === 'history' ? (
               <div className="flex flex-1 flex-col gap-1 overflow-y-auto rounded bg-slate-950 p-2 text-sm">
                 <HistoryList
                   hands={hands}
@@ -993,6 +1000,10 @@ export default function RoomPage() {
                   onSelectIdx={setSelectedIdx}
                   players={gameState?.players ?? []}
                 />
+              </div>
+            ) : (
+              <div className="flex flex-1 flex-col overflow-y-auto rounded bg-slate-950 p-2">
+                <StandingsList standings={room?.standings ?? []} />
               </div>
             )}
           </div>
@@ -1054,14 +1065,16 @@ export default function RoomPage() {
 // Helper components
 // ============================================================
 
+type PanelTab = 'chat' | 'history' | 'standings';
+
 function PanelTabs({
   tab,
   onChange,
 }: {
-  tab: 'chat' | 'history';
-  onChange: (t: 'chat' | 'history') => void;
+  tab: PanelTab;
+  onChange: (t: PanelTab) => void;
 }) {
-  const btn = (which: 'chat' | 'history', label: string) => (
+  const btn = (which: PanelTab, label: string) => (
     <button
       onClick={() => onChange(which)}
       className={`rounded-t border-b-2 px-3 py-1 text-sm font-semibold ${
@@ -1077,7 +1090,72 @@ function PanelTabs({
     <div className="flex gap-1 border-b border-slate-800">
       {btn('chat', '聊天')}
       {btn('history', '本手紀錄')}
+      {btn('standings', '戰績')}
     </div>
+  );
+}
+
+function StandingsList({
+  standings,
+}: {
+  standings: RoomStanding[];
+}) {
+  if (standings.length === 0) {
+    return <p className="text-slate-500">尚無成員</p>;
+  }
+  return (
+    <table className="w-full text-sm">
+      <thead>
+        <tr className="border-b border-slate-700 text-left text-xs text-slate-400">
+          <th className="py-1">玩家</th>
+          <th className="py-1 text-right">買入</th>
+          <th className="py-1 text-right">剩下</th>
+          <th className="py-1 text-right">輸贏</th>
+        </tr>
+      </thead>
+      <tbody>
+        {standings.map((s) => {
+          const net = s.chipsAtTable - s.totalBuyIn;
+          const netStr = net > 0 ? `+${net}` : net < 0 ? `${net}` : '±0';
+          const netColor =
+            net > 0
+              ? 'text-emerald-400'
+              : net < 0
+                ? 'text-red-400'
+                : 'text-slate-500';
+          const isStanding = s.seat === null && s.finishRank === null;
+          const isEliminated = s.finishRank !== null;
+          return (
+            <tr key={s.userId} className="border-b border-slate-800">
+              <td className="py-1">
+                <span className={isEliminated ? 'text-slate-500' : ''}>
+                  {s.name}
+                </span>
+                {isStanding && (
+                  <span className="ml-1 text-[10px] text-slate-500">
+                    (暫離)
+                  </span>
+                )}
+                {isEliminated && (
+                  <span className="ml-1 text-[10px] text-amber-400">
+                    #{s.finishRank}
+                  </span>
+                )}
+              </td>
+              <td className="py-1 text-right font-mono text-slate-400">
+                {s.totalBuyIn}
+              </td>
+              <td className="py-1 text-right font-mono">{s.chipsAtTable}</td>
+              <td
+                className={`py-1 text-right font-mono font-bold ${netColor}`}
+              >
+                {netStr}
+              </td>
+            </tr>
+          );
+        })}
+      </tbody>
+    </table>
   );
 }
 

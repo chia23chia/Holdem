@@ -84,6 +84,21 @@ export async function getRoomDetail(roomId: string): Promise<RoomDetail | null> 
         chipsAtTable: m.chipsAtTable,
         finishRank: m.finishRank,
       })),
+    // Standings include everyone (seated + 暫離). Sorted by net DESC on
+    // server so all clients render the same order without extra work.
+    standings: room.memberships
+      .map((m) => ({
+        userId: m.userId,
+        name: displayName(m.user),
+        seat: m.seat,
+        chipsAtTable: m.chipsAtTable,
+        totalBuyIn: m.totalBuyIn,
+        finishRank: m.finishRank,
+      }))
+      .sort(
+        (a, b) =>
+          b.chipsAtTable - b.totalBuyIn - (a.chipsAtTable - a.totalBuyIn),
+      ),
   };
 }
 

@@ -4,6 +4,7 @@
 
 ## 2026-07-28
 
+- **即時戰績面板**:房間右側面板加第 3 個分頁「戰績」,顯示房內每位成員當下的 買入 / 剩下 / 輸贏,依淨輸贏由高到低排序。**含暫離成員**(結算 modal 看不到暫離者,這個 tab 看得到),名次算完的錦標賽淘汰者也帶名次徽章顯示。走既有 `room:detail` 事件,不新增 socket。細節見 `ARCHITECTURE.zh-TW.md` §11.21。
 - **Session 到期擋新手**:`startHandForRoom` 加 `sessionEndsAt <= now` 檢查,現金局到期後不能再開新手(先前靠 `scanExpiredSessions` 30s tick,client 自動開下一手能塞進空檔多打 1-2 手)。錦標賽不受影響(不用 sessionEndsAt)。
 - **蓋牌者允許 mid-hand 站起**:`room:standup` 對已 `status === 'folded'` 的玩家放行 —— 該玩家已無牌局動線影響,現金局走 seat=null 暫離、錦標賽走 `eliminateStandingPlayer`。原本一律拒絕。
 

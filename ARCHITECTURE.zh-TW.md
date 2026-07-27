@@ -285,7 +285,7 @@ Server(server/src/auth.ts authMiddleware):
 | `lobby:rooms` | `RoomSummary[]` | 訂閱者(加入 `lobby` channel) | 初始 + 完整刷新 |
 | `lobby:room-updated` | `RoomSummary` | `lobby` channel | 建房 / 座位變動 |
 | `lobby:room-removed` | `{roomId}` | `lobby` channel | 房間關閉 |
-| `room:detail` | `RoomDetail` | `room:<id>` channel | 完整房間細節含座位 |
+| `room:detail` | `RoomDetail` | `room:<id>` channel | 完整房間細節含座位;`standings` 欄位帶全部成員(含暫離)的即時輸贏,見 §11.21 |
 | `room:error` | `{message}` | 這個 socket | 例如「房間不存在」 |
 | `room:closed` | `{roomId, settlement?}` | `room:<id>` channel | 房間關閉(房主或 session 到期);若有 `settlement` client 顯示結算 modal 再導回 lobby |
 | `chat:message` | `ChatMessage` | `room:<id>` 或 `lobby` | 房內或大廳聊天 |
@@ -584,6 +584,14 @@ DB 持久化延到 Milestone 2.5(斷線寬限)才做。
 - **晚期報名擋**:`seatUser` 如果房型是 tournament 且 `tournamentClockStartedAt` 已設定(代表已開打),直接拒絕加入。
 - **結算型別**:`SettlementSummary.reason` 多一個 `'tournament-finished'`,`players[]` 多一個選填的 `finishRank`(用加欄位而非 discriminated union,`sheetsSync.ts` 跟現有兩個現金局結算組裝函式完全不用改,反正它們就是不會填這個欄位)。前端「贏家全拿」框架顯示(冠軍「贏得全部籌碼」,其他人「輸掉買入」)只是顯示概念,沒有真的獎池轉帳。
 - **已知 v1 簡化**:房主中途手動 `room:close` 一個進行中的錦標賽,走現金局結算畫面(不顯示名次/冠軍),當作安全中止備案;主動站起淘汰籌碼直接消失,不會分配給還在場的其他人;沒有可配置的獎金拆分(1st/2nd/3rd 各拿多少 %),也沒有延遲報名 —— 都是「雛形」範圍外的加強項目。
+
+### 11.21 即時戰績面板(2026-07-28 起)
+
+`RoomDetail.standings: RoomStanding[]` 帶著房內每位成員當下的輸贏,供房間右側面板的「戰績」分頁顯示。跟現金局結算 modal 的區別:結算是**局末**才看得到、且看不到暫離者;戰績面板任何時刻都能開,而且**含暫離**(`seat === null`)成員 —— 有人站起去洗手間,他的輸贏還在榜上,不會消失。
+
+- **資料來源**:`getRoomDetail` 直接讀 `room.memberships`(不篩 seat),映射成 `{userId, name, seat, chipsAtTable, totalBuyIn, finishRank}`,依 `chipsAtTable - totalBuyIn` 由高到低排序,server 端統一排好、client 直接 render 不用再排。
+- **傳輸路徑**:走既有的 `room:detail` 事件,不新增 socket 事件。凡是會觸發 `room:detail` 廣播的時機(座位變動、rebuy、hand end 後的 `broadcastAfterAction`、`persistHandResult` 之後)都會順帶把 standings 一起送出,不用額外 tick。
+- **UI**:`web/app/room/[id]/page.tsx` 的 `PanelTabs` 從 2 tab(聊天 / 本手紀錄)擴成 3 tab,`StandingsList` 用 `<table>` 顯示 玩家 / 買入 / 剩下 / 輸贏 四欄;輸贏用 `text-emerald-400`(正)/ `text-red-400`(負)/ `text-slate-500`(±0)著色;`seat === null && finishRank === null` 加「(暫離)」小字,`finishRank !== null` 加名次徽章並淡化名字色。desktop 右側 panel 與 mobile 抽屜共用同一個 component。
 
 ---
 

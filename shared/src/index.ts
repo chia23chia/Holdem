@@ -181,9 +181,24 @@ export interface RoomSeat {
   finishRank: number | null; // tournament only: 1 = champion, higher = out earlier
 }
 
+// Live win/loss row — used by the 戰績 panel to show every member's current
+// standing. Includes 暫離 members (seat === null) so their net doesn't vanish
+// from the leaderboard when they step away.
+export interface RoomStanding {
+  userId: string;
+  name: string;
+  seat: number | null;         // null = 暫離
+  chipsAtTable: number;
+  totalBuyIn: number;
+  finishRank: number | null;   // tournament: 1 = champion; higher = eliminated
+}
+
 export interface RoomDetail extends RoomSummary {
   ownerId: string;
   seats: RoomSeat[];
+  // All members (seated + 暫離), sorted by net win/loss DESC. Server-computed
+  // so every client shows the same order.
+  standings: RoomStanding[];
 }
 
 // ============================================================
