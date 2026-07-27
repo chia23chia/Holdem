@@ -274,30 +274,14 @@ interface MonthTab {
   rosterSlots: RosterEntry[]; // this month's fixed player set, in slot order
 }
 
-// Creates the month's tab (leaderboard + daily-table skeleton) the first
-// time it's needed, fixed to however many players are in the roster right
-// now. If the tab already exists, reads back N from how many player rows
-// the leaderboard actually has.
-async function ensureMonthTab(
+// Writes the leaderboard + daily-table skeleton into a fresh (or
+// freshly-cleared) tab. Shared by first-time creation and mid-month rebuild.
+async function writeMonthSkeleton(
   spreadsheetId: string,
   tabName: string,
-  existingTabs: SheetMeta[],
-  fullRoster: RosterEntry[],
-): Promise<MonthTab> {
-  const exists = existingTabs.some((t) => t.title === tabName);
-
-  if (exists) {
-    const [vr] = await batchGetValues(spreadsheetId, [`${tabName}!B2:B50`]);
-    const names = vr.values ?? [];
-    let N = 0;
-    while (N < names.length && names[N][0]) N += 1;
-    return { N, rosterSlots: fullRoster.slice(0, N) };
-  }
-
-  const N = fullRoster.length;
-  const rosterSlots = fullRoster.slice(0, N);
-  await addTab(spreadsheetId, tabName);
-
+  N: number,
+  rosterSlots: RosterEntry[],
+): Promise<void> {
   const dStart = dailyStartRow(N);
   const dEnd = dailyEndRow(N);
   const data: ValueRange[] = [
@@ -334,7 +318,200 @@ async function ensureMonthTab(
   }
 
   await batchUpdateValues(spreadsheetId, data);
+}
+
+// Creates the month's tab (leaderboard + daily-table skeleton) the first
+// time it's needed, fixed to however many players are in the roster right
+// now. If the tab already exists AND the roster has grown since it was
+// built, rebuilds in place to make room for the new players (their prior
+// dates come out empty = 0, per the user ask). Otherwise reads back N.
+async function ensureMonthTab(
+  spreadsheetId: string,
+  tabName: string,
+  existingTabs: SheetMeta[],
+  fullRoster: RosterEntry[],
+): Promise<MonthTab> {
+  const exists = existingTabs.some((t) => t.title === tabName);
+
+  if (exists) {
+    const [vr] = await batchGetValues(spreadsheetId, [`${tabName}!B2:B50`]);
+    const names = vr.values ?? [];
+    let N_old = 0;
+    while (N_old < names.length && names[N_old][0]) N_old += 1;
+
+    if (fullRoster.length > N_old) {
+      return rebuildMonthTab(spreadsheetId, tabName, N_old, fullRoster);
+    }
+    return { N: N_old, rosterSlots: fullRoster.slice(0, N_old) };
+  }
+
+  const N = fullRoster.length;
+  const rosterSlots = fullRoster.slice(0, N);
+  await addTab(spreadsheetId, tabName);
+  await writeMonthSkeleton(spreadsheetId, tabName, N, rosterSlots);
   return { N, rosterSlots };
+}
+
+// Wipes VALUES ONLY (formatting, column widths, sheet id preserved). Used
+// before rebuild so cell formatting the users care about survives.
+async function clearAllValues(spreadsheetId: string, tabName: string): Promise<void> {
+  await sheetsRequest(
+    `/${spreadsheetId}/values/${encodeURIComponent(tabName)}:clear`,
+    { method: 'POST' },
+  );
+}
+
+// Inverse of sheetsDateSerial — reconstruct a Date from the numeric serial
+// we read back out of the header row. Used during replay so
+// findOrCreateDateBlock's label + serial matching stays consistent.
+function dateFromSerial(serial: number): Date {
+  const epoch = Date.UTC(1899, 11, 30);
+  return new Date(epoch + serial * 86400000);
+}
+
+interface DateSnapshot {
+  serial: number;
+  // Per player: all their session entries for this date, in the order they
+  // were originally written (E, F, G, ...). Missing/blank cells are dropped.
+  entriesByUserId: Map<string, number[]>;
+}
+
+// Reads back everything we need from an existing month tab so we can
+// replay it into a fresh layout with a larger N. Assumes the roster's
+// first N_old entries match the tab's current player row order (which is
+// true because roster is append-only and month layout uses slot order).
+async function snapshotMonthTab(
+  spreadsheetId: string,
+  tabName: string,
+  N_old: number,
+  rosterAtBuildTime: RosterEntry[],
+): Promise<DateSnapshot[]> {
+  const headerRow = dailyHeaderRow(N_old);
+  const [headerVR] = await batchGetValues(spreadsheetId, [
+    `${tabName}!${colLetter(DAILY_DATE_FIRST_COL)}${headerRow}:${colLetter(DAILY_DATE_LAST_COL)}${headerRow}`,
+  ]);
+  const dateSerials: number[] = (headerVR.values?.[0] ?? []).filter(
+    (v): v is number => typeof v === 'number',
+  );
+  if (dateSerials.length === 0) return [];
+
+  // Batch-read every player row of every check block in a single call.
+  const ranges: string[] = [];
+  for (let i = 0; i < dateSerials.length; i += 1) {
+    const blockRow = checkBlockStartRow(N_old, i);
+    for (let p = 0; p < N_old; p += 1) {
+      const row = blockRow + 1 + p;
+      ranges.push(
+        `${tabName}!${colLetter(CHECK_ENTRY_FIRST_COL)}${row}:${colLetter(CHECK_ENTRY_LAST_COL)}${row}`,
+      );
+    }
+  }
+  const allVRs = await batchGetValues(spreadsheetId, ranges);
+
+  const dates: DateSnapshot[] = [];
+  let vrIdx = 0;
+  for (let i = 0; i < dateSerials.length; i += 1) {
+    const entriesByUserId = new Map<string, number[]>();
+    for (let p = 0; p < N_old; p += 1) {
+      const userId = rosterAtBuildTime[p].userId;
+      const cells = allVRs[vrIdx].values?.[0] ?? [];
+      vrIdx += 1;
+      const nums = cells.filter((v): v is number => typeof v === 'number');
+      if (nums.length > 0) entriesByUserId.set(userId, nums);
+    }
+    dates.push({ serial: dateSerials[i], entriesByUserId });
+  }
+  return dates;
+}
+
+// One-shot write of every player's entries for a single date's check block.
+// Used only during replay — the normal single-session path still goes
+// through appendSessionEntries.
+async function bulkWriteBlockEntries(
+  spreadsheetId: string,
+  tabName: string,
+  blockRow: number,
+  rosterSlots: RosterEntry[],
+  entriesByUserId: Map<string, number[]>,
+): Promise<void> {
+  const data: ValueRange[] = [];
+  for (let i = 0; i < rosterSlots.length; i += 1) {
+    const nums = entriesByUserId.get(rosterSlots[i].userId);
+    if (!nums || nums.length === 0) continue;
+    const row = blockRow + 1 + i;
+    const startCol = colLetter(CHECK_ENTRY_FIRST_COL);
+    const endCol = colLetter(CHECK_ENTRY_FIRST_COL + nums.length - 1);
+    data.push({
+      range: `${tabName}!${startCol}${row}:${endCol}${row}`,
+      values: [nums],
+    });
+  }
+  if (data.length > 0) await batchUpdateValues(spreadsheetId, data);
+}
+
+// Snapshot → clear values → rewrite skeleton with new N → replay every
+// prior date's entries into the new layout. New players (those in
+// fullRoster beyond N_old) end up with empty rows, so their prior-date
+// C column SUM naturally reads 0 — exactly what the friend group wants.
+//
+// Not atomic: if the process dies between clear and replay, the tab is
+// partially empty. Snapshot content is logged BEFORE clear so it's
+// recoverable from server logs. Google Sheets also keeps 30d version
+// history as a further safety net.
+async function rebuildMonthTab(
+  spreadsheetId: string,
+  tabName: string,
+  N_old: number,
+  fullRoster: RosterEntry[],
+): Promise<MonthTab> {
+  const N = fullRoster.length;
+  const rosterAtBuildTime = fullRoster.slice(0, N_old);
+  console.warn(
+    `[sheetsSync] ${tabName} rebuild: N ${N_old}→${N} (` +
+      `${fullRoster.slice(N_old).map((r) => r.name).join('、')})`,
+  );
+
+  const dates = await snapshotMonthTab(
+    spreadsheetId,
+    tabName,
+    N_old,
+    rosterAtBuildTime,
+  );
+  console.warn(
+    `[sheetsSync] ${tabName} pre-rebuild snapshot (` +
+      `${dates.length} dates): ` +
+      JSON.stringify(
+        dates.map((d) => ({
+          serial: d.serial,
+          entries: Object.fromEntries(d.entriesByUserId),
+        })),
+      ),
+  );
+
+  await clearAllValues(spreadsheetId, tabName);
+
+  const rosterSlots = fullRoster.slice();
+  const month: MonthTab = { N, rosterSlots };
+  await writeMonthSkeleton(spreadsheetId, tabName, N, rosterSlots);
+
+  // Replay dates in the same column order as before (snapshotMonthTab
+  // returned them left-to-right from D..AH, so calling
+  // findOrCreateDateBlock in order preserves the original date column
+  // ordering).
+  for (const d of dates) {
+    const date = dateFromSerial(d.serial);
+    const blockRow = await findOrCreateDateBlock(spreadsheetId, tabName, month, date);
+    await bulkWriteBlockEntries(
+      spreadsheetId,
+      tabName,
+      blockRow,
+      month.rosterSlots,
+      d.entriesByUserId,
+    );
+  }
+
+  console.warn(`[sheetsSync] ${tabName} rebuild done`);
+  return month;
 }
 
 // Finds today's check-block if it already exists (another settlement
@@ -449,21 +626,12 @@ export async function syncSettlementToSheet(
     : await listTabs(spreadsheetId);
   const month = await ensureMonthTab(spreadsheetId, tabName, tabsAfterRoster, fullRoster);
 
-  const monthUserIds = new Set(month.rosterSlots.map((r) => r.userId));
-  const outOfRoster = summary.players.filter((p) => !monthUserIds.has(p.userId));
-  if (outOfRoster.length > 0) {
-    console.warn(
-      `[sheetsSync] ${tabName} was already bootstrapped before these players' first game — ` +
-        `registered in ${ROSTER_SHEET} but NOT written into ${tabName} (fixed-width month block): ` +
-        outOfRoster.map((p) => p.name).join('、'),
-    );
-  }
-  const inRoster = summary.players.filter((p) => monthUserIds.has(p.userId));
-  if (inRoster.length === 0) return;
-
+  // ensureMonthTab guarantees month.rosterSlots contains every roster entry
+  // (auto-rebuilds if the roster grew since the tab was first written), so
+  // every summary.players entry has a home row here.
   const blockRow = await findOrCreateDateBlock(spreadsheetId, tabName, month, now);
   const entries = new Map(
-    inRoster.map((p) => [p.userId, p.chipsAtTable - p.totalBuyIn] as const),
+    summary.players.map((p) => [p.userId, p.chipsAtTable - p.totalBuyIn] as const),
   );
   await appendSessionEntries(spreadsheetId, tabName, blockRow, month.rosterSlots, entries);
 }

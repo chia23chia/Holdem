@@ -15,6 +15,7 @@
 
 ### 修正
 
+- **Google Sheet 月中新人自動加入**:先前月分頁的玩家陣容在建立時就固定死,月中才第一次參加的新玩家會被 `console.warn` 記一下但**跳過**當月寫入,要等下個月才有資料。改成 `ensureMonthTab` 偵測到 `fullRoster.length > N_old` 時整頁 rebuild:snapshot 既有日期資料 → `values:clear` 清內容(保留格式)→ 用新 N 重寫 skeleton → 逐日 replay 回去。新人所有舊日期自然空白 = 0。Rebuild 非原子,失敗前會把 snapshot 整包 JSON 印進 log,加上 Sheets 內建 30 天版本歷史雙保險。細節見 §11.19。
 - **Session 到期擋新手**(`20608ca`):`startHandForRoom` 加 `sessionEndsAt <= now` 檢查,現金局到期後不能再開新手(先前靠 `scanExpiredSessions` 30s tick,client 自動開下一手能塞進空檔多打 1-2 手)。錦標賽不受影響(不用 sessionEndsAt)。
 - **蓋牌者允許 mid-hand 站起**(`20608ca`):`room:standup` 對已 `status === 'folded'` 的玩家放行 —— 該玩家已無牌局動線影響,現金局走 seat=null 暫離、錦標賽走 `eliminateStandingPlayer`。原本一律拒絕。見 §11.17。
 
