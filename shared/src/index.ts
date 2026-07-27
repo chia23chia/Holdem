@@ -126,7 +126,15 @@ export interface ActionLogEntry {
 // player actions and community-card reveals per street.
 export type HandHistoryEntry =
   | { kind: 'action'; entry: ActionLogEntry }
-  | { kind: 'street'; phase: 'flop' | 'turn' | 'river'; cards: Card[] };
+  | {
+      kind: 'street';
+      phase: 'flop' | 'turn' | 'river';
+      cards: Card[];
+      // Set only during an all-in runout: the userId currently holding the
+      // worst hand against the revealed board, for the river-flip highlight.
+      // Undefined for normal (non-all-in) streets.
+      trailingUserId?: string;
+    };
 
 // Full snapshot of a completed hand — stored in HandLog.data (jsonb).
 // Used to reconstruct historic hands on client mount / refresh.
@@ -336,7 +344,20 @@ export interface ServerToClientEvents {
   // through flop+turn+river in a single server-side action still sends
   // each street as its own event instead of the client only ever seeing
   // the final "ended" phase and missing the intermediate boards.
-  'game:street-log': (entry: { phase: 'flop' | 'turn' | 'river'; cards: Card[] }) => void;
+  // trailingUserId is set only during an all-in runout (see below).
+  'game:street-log': (entry: {
+    phase: 'flop' | 'turn' | 'river';
+    cards: Card[];
+    trailingUserId?: string;
+  }) => void;
+  // Emitted once, the moment an all-in runout begins (>1 player still in the
+  // hand, <=1 of them able to act further). Everyone still in the hand gets
+  // their hole cards revealed early, poker-broadcast style — they have no
+  // more decisions left, so this doesn't leak information any action could
+  // have hidden. Folded players' cards are never included.
+  'game:allin-reveal': (data: {
+    players: Array<{ userId: string; name: string; holeCards: [Card, Card] }>;
+  }) => void;
   'game:ended': (data: { roomId: string; result?: HandEndResult }) => void;
 }
 

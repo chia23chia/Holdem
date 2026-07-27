@@ -100,6 +100,8 @@ async function finalizeRoomState(roomId: string, empty: boolean) {
     clearRoomState(roomId);
     lastHandLogIdByRoom.delete(roomId);
     pendingRebuysByRoom.delete(roomId);
+    idleStreakByRoom.delete(roomId);
+    pendingForcedStandupByRoom.delete(roomId);
     await deleteHandLogsForRoom(roomId);
     await closeRoom(roomId);
     io.to(roomChannel(roomId)).emit('room:closed', { roomId });
@@ -157,6 +159,96 @@ async function drainPendingRebuys(roomId: string): Promise<void> {
   }
 }
 
+// Idle-action streak: counts consecutive actions that were auto-resolved by
+// the timeout (not a real click) for a given player. Reset to 0 the moment
+// they act manually — this only tracks "haven't touched the client in a
+// row," not a lifetime tally. Persists across hands on purpose (an AFK
+// player is AFK regardless of hand boundaries); cleared alongside the room's
+// other per-room state whenever the room itself goes away.
+const AUTO_ACTION_STANDUP_THRESHOLD = 2;
+const idleStreakByRoom = new Map<string, Map<string, number>>();
+
+function bumpIdleStreak(roomId: string, userId: string): number {
+  let byUser = idleStreakByRoom.get(roomId);
+  if (!byUser) {
+    byUser = new Map();
+    idleStreakByRoom.set(roomId, byUser);
+  }
+  const next = (byUser.get(userId) ?? 0) + 1;
+  byUser.set(userId, next);
+  return next;
+}
+
+// Also cancels any already-queued forced standup (see below) — a real
+// action proves they're back, so a stale "was idle" ejection queued from an
+// earlier streak in this same hand shouldn't still fire once it ends.
+function resetIdleStreak(roomId: string, userId: string): void {
+  idleStreakByRoom.get(roomId)?.delete(userId);
+  pendingForcedStandupByRoom.get(roomId)?.delete(userId);
+}
+
+// Forced standups queued from an idle streak hitting the threshold while the
+// player is still 'active' (auto-checked, not auto-folded) — standing them
+// up immediately would pull a still-live player out of the hand, so this
+// waits for the hand to end instead (drained alongside pending rebuys).
+const pendingForcedStandupByRoom = new Map<string, Set<string>>();
+
+function queuePendingForcedStandup(roomId: string, userId: string): void {
+  let byUser = pendingForcedStandupByRoom.get(roomId);
+  if (!byUser) {
+    byUser = new Set();
+    pendingForcedStandupByRoom.set(roomId, byUser);
+  }
+  byUser.add(userId);
+}
+
+async function drainPendingForcedStandups(roomId: string): Promise<void> {
+  const byUser = pendingForcedStandupByRoom.get(roomId);
+  if (!byUser || byUser.size === 0) return;
+  const userIds = [...byUser];
+  byUser.clear();
+  for (const userId of userIds) {
+    try {
+      await forceStandUp(roomId, userId);
+    } catch (err) {
+      console.error('[server] drain forced standup error', err);
+    }
+  }
+}
+
+// Shared by the manual room:standup handler and the automatic idle-streak
+// trigger — same rules either way: cash keeps chips (seat -> null, can
+// rejoin later), tournament has no rebuy so it's elimination at the current
+// position.
+async function forceStandUp(roomId: string, userId: string): Promise<void> {
+  const roomType = await getRoomType(roomId);
+  if (roomType === 'tournament') {
+    const outcome = await eliminateStandingPlayer(userId, roomId);
+    if (!outcome.removed) return;
+    if (outcome.finished) {
+      cancelAutoAction(roomId);
+      clearRoomState(roomId);
+      lastHandLogIdByRoom.delete(roomId);
+      pendingRebuysByRoom.delete(roomId);
+      idleStreakByRoom.delete(roomId);
+      pendingForcedStandupByRoom.delete(roomId);
+      await deleteHandLogsForRoom(roomId);
+      syncSettlementSafely(outcome.settlement);
+      io.to(roomChannel(roomId)).emit('room:closed', {
+        roomId,
+        settlement: outcome.settlement,
+      });
+      io.to(LOBBY_ROOM).emit('lobby:room-removed', { roomId });
+      return;
+    }
+    await broadcastRoomDetail(roomId);
+    await broadcastLobbyList();
+    return;
+  }
+  const { empty } = await unseatUser(userId, roomId);
+  await finalizeRoomState(roomId, empty);
+}
+
 
 // Fire-and-forget: a Google Sheets hiccup (or it simply not being
 // configured) must never fail or delay a room close.
@@ -197,10 +289,35 @@ async function runAutoAction(roomId: string): Promise<void> {
   const canCheck = cur.bet === hand.currentBet;
   const action: PlayerAction = canCheck ? { type: 'check' } : { type: 'fold' };
   const historyLenBefore = hand.history.length;
-  const outcome = applyAction(roomId, cur.userId, action);
+  const hadAllInReveal = !!hand.allInRevealPayload;
+  const curUserId = cur.userId;
+  const outcome = applyAction(roomId, curUserId, action);
   if (!outcome.ok) return;
   const phaseBefore = hand.phase; // captured before applyAction re-entered
-  await broadcastAfterAction(roomId, outcome.log, phaseBefore, outcome.ended, historyLenBefore);
+  await broadcastAfterAction(
+    roomId,
+    outcome.log,
+    phaseBefore,
+    outcome.ended,
+    historyLenBefore,
+    hadAllInReveal,
+  );
+
+  // This action was auto-resolved by the timeout, not a real click — count
+  // it toward the idle-standup rule. Two in a row (no manual action from
+  // this player in between) forces them up: immediately if the timeout
+  // folded them (already allowed to leave mid-hand, same as a voluntary
+  // standup after folding), otherwise queued for right after the hand ends
+  // since they're still active in it (auto-check case).
+  const streak = bumpIdleStreak(roomId, curUserId);
+  if (streak >= AUTO_ACTION_STANDUP_THRESHOLD) {
+    resetIdleStreak(roomId, curUserId);
+    if (action.type === 'fold') {
+      await forceStandUp(roomId, curUserId);
+    } else {
+      queuePendingForcedStandup(roomId, curUserId);
+    }
+  }
 }
 
 // Shared post-action broadcast: action-log + street-log + state + optional
@@ -212,6 +329,7 @@ async function broadcastAfterAction(
   phaseBefore: string | undefined,
   ended: boolean,
   historyLenBefore: number,
+  hadAllInReveal: boolean,
 ): Promise<void> {
   const hand = getHand(roomId);
   if (!hand) return;
@@ -225,6 +343,15 @@ async function broadcastAfterAction(
     amount: log.amount,
     ts: Date.now(),
   });
+  // An all-in runout reveals everyone still in the hand's hole cards early —
+  // fires at most once per hand (hadAllInReveal, captured before applyAction,
+  // guards against re-emitting on every subsequent street/action of the same
+  // runout).
+  if (!hadAllInReveal && hand.allInRevealPayload) {
+    io.to(roomChannel(roomId)).emit('game:allin-reveal', {
+      players: hand.allInRevealPayload,
+    });
+  }
   // A single action can fast-forward through several streets at once (e.g.
   // everyone's all-in before the river) — emit every street that got
   // revealed since this action started, not just whatever the final phase
@@ -234,6 +361,7 @@ async function broadcastAfterAction(
       io.to(roomChannel(roomId)).emit('game:street-log', {
         phase: entry.phase,
         cards: entry.cards,
+        trailingUserId: entry.trailingUserId,
       });
     }
   }
@@ -293,6 +421,8 @@ async function broadcastAfterAction(
       clearRoomState(roomId);
       lastHandLogIdByRoom.delete(roomId);
       pendingRebuysByRoom.delete(roomId);
+      idleStreakByRoom.delete(roomId);
+      pendingForcedStandupByRoom.delete(roomId);
       try {
         await deleteHandLogsForRoom(roomId);
       } catch (err) {
@@ -335,6 +465,14 @@ async function broadcastAfterAction(
       await drainPendingRebuys(roomId);
     } catch (err) {
       console.error('[server] drainPendingRebuys error', err);
+    }
+    // Same for forced standups queued while the idle player was still
+    // active this hand (see AUTO_ACTION_STANDUP_THRESHOLD) — safe now that
+    // the hand is over.
+    try {
+      await drainPendingForcedStandups(roomId);
+    } catch (err) {
+      console.error('[server] drainPendingForcedStandups error', err);
     }
     // Always tell clients the hand ended, even if persistence above failed —
     // otherwise their UI stays frozen on the last in-progress state forever.
@@ -420,6 +558,16 @@ async function startHandForRoom(roomId: string): Promise<StartHandOutcome> {
 
   // Public state → all subscribers (players + spectators).
   io.to(roomChannel(roomId)).emit('game:started', toPublicState(hand));
+
+  // Edge case: extremely short-stacked blinds can put the hand all-in before
+  // anyone acts, so startHand's internal maybeAdvanceIfNoAction may already
+  // have set this. game:action's broadcastAfterAction handles the normal
+  // mid-hand case; this covers the same reveal firing at hand-start instead.
+  if (hand.allInRevealPayload) {
+    io.to(roomChannel(roomId)).emit('game:allin-reveal', {
+      players: hand.allInRevealPayload,
+    });
+  }
 
   // Private hole cards → each seated player's socket(s) only.
   const roomSockets = await io.in(roomChannel(roomId)).fetchSockets();
@@ -520,35 +668,8 @@ io.on('connection', (socket) => {
         return;
       }
     }
-    const roomType = await getRoomType(roomId);
-    if (roomType === 'tournament') {
-      // Voluntary standup in a tournament = elimination at the current
-      // position, not a free unseat — no rebuy exists to come back from.
-      const outcome = await eliminateStandingPlayer(user.userId, roomId);
-      if (!outcome.removed) return;
-      if (outcome.finished) {
-        cancelAutoAction(roomId);
-        clearRoomState(roomId);
-        lastHandLogIdByRoom.delete(roomId);
-        pendingRebuysByRoom.delete(roomId);
-        await deleteHandLogsForRoom(roomId);
-        syncSettlementSafely(outcome.settlement);
-        io.to(roomChannel(roomId)).emit('room:closed', {
-          roomId,
-          settlement: outcome.settlement,
-        });
-        io.to(LOBBY_ROOM).emit('lobby:room-removed', { roomId });
-        return;
-      }
-      // Not finished — the eliminated player's seat stays in Membership
-      // (chipsAtTable=0, finishRank set) so remaining players see them
-      // tagged eliminated rather than the seat vanishing.
-      await broadcastRoomDetail(roomId);
-      await broadcastLobbyList();
-      return;
-    }
-    const { empty } = await unseatUser(user.userId, roomId);
-    await finalizeRoomState(roomId, empty);
+    resetIdleStreak(roomId, user.userId);
+    await forceStandUp(roomId, user.userId);
   });
 
   socket.on('room:close', async ({ roomId }, cb) => {
@@ -563,6 +684,8 @@ io.on('connection', (socket) => {
     clearRoomState(roomId);
     lastHandLogIdByRoom.delete(roomId);
     pendingRebuysByRoom.delete(roomId);
+    idleStreakByRoom.delete(roomId);
+    pendingForcedStandupByRoom.delete(roomId);
     await deleteHandLogsForRoom(roomId);
     const settlement = await buildOwnerCloseSettlement(roomId, players);
     if (settlement) syncSettlementSafely(settlement);
@@ -637,10 +760,20 @@ io.on('connection', (socket) => {
     const handBefore = getHand(roomId);
     const phaseBefore = handBefore?.phase;
     const historyLenBefore = handBefore?.history.length ?? 0;
+    const hadAllInReveal = !!handBefore?.allInRevealPayload;
     const outcome = applyAction(roomId, user.userId, action);
     if (!outcome.ok) return cb({ ok: false, error: outcome.error });
     cb({ ok: true });
-    await broadcastAfterAction(roomId, outcome.log, phaseBefore, outcome.ended, historyLenBefore);
+    // A real click — whatever idle streak they had is no longer valid.
+    resetIdleStreak(roomId, user.userId);
+    await broadcastAfterAction(
+      roomId,
+      outcome.log,
+      phaseBefore,
+      outcome.ended,
+      historyLenBefore,
+      hadAllInReveal,
+    );
   });
 
   // Voluntary reveal — any player still recorded in this ended hand.

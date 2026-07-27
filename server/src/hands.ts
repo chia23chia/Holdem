@@ -52,6 +52,12 @@ interface HandState {
   endResult: HandEndResult | null;
   startedAt: number;       // Epoch ms — hand start time for HandLog
   history: HandHistoryEntry[]; // Accumulated log for persistence
+  // Set once an all-in runout begins (>1 non-folded, <=1 still able to act).
+  // In-memory only, never persisted — a runout always reaches real showdown,
+  // so HandEndResult.revealedHoles covers the historical record anyway. This
+  // is purely a live/transient signal for early hole-card reveal + the
+  // "trailing player" river highlight.
+  allInRevealPayload?: Array<{ userId: string; name: string; holeCards: [Card, Card] }>;
 }
 
 // Recompute deadline based on current turn. Call after every mutation that
@@ -428,10 +434,12 @@ function advancePhase(hand: HandState): void {
     nextPhase === 'turn' ||
     nextPhase === 'river'
   ) {
+    maybeRevealAllIn(hand);
     hand.history.push({
       kind: 'street',
       phase: nextPhase,
       cards: hand.community.slice(),
+      trailingUserId: computeTrailingUserId(hand),
     });
   }
 
@@ -483,10 +491,12 @@ function maybeAdvanceIfNoAction(hand: HandState): void {
       nextPhase === 'turn' ||
       nextPhase === 'river'
     ) {
+      maybeRevealAllIn(hand);
       hand.history.push({
         kind: 'street',
         phase: nextPhase,
         cards: hand.community.slice(),
+        trailingUserId: computeTrailingUserId(hand),
       });
     }
     if (nextPhase === 'showdown') {
@@ -510,6 +520,43 @@ function dealCommunity(hand: HandState, count: number): void {
     if (!c) throw new Error('dealCommunity: deck underflow');
     hand.community.push(c);
   }
+}
+
+// Idempotent: once set, an all-in runout's hole cards stay revealed for the
+// rest of the hand. Triggers on the same condition maybeAdvanceIfNoAction
+// uses to fast-forward (>1 non-folded, <=1 of them still able to act).
+function maybeRevealAllIn(hand: HandState): void {
+  if (hand.allInRevealPayload) return;
+  const nonFolded = hand.players.filter((p) => p.status !== 'folded');
+  const stillActive = nonFolded.filter((p) => p.status === 'active');
+  if (nonFolded.length > 1 && stillActive.length <= 1) {
+    hand.allInRevealPayload = nonFolded.map((p) => ({
+      userId: p.userId,
+      name: p.name,
+      holeCards: p.holeCards,
+    }));
+  }
+}
+
+// Who's currently behind, for the river-flip highlight. Only meaningful (and
+// only computed) once an all-in reveal has happened — a normal in-progress
+// hand must never leak "who's ahead" via this path.
+function computeTrailingUserId(hand: HandState): string | undefined {
+  if (!hand.allInRevealPayload) return undefined;
+  const boardStrs = hand.community.map(cardToStr);
+  if (boardStrs.length === 0) return undefined;
+  const contenders = hand.players.filter((p) => p.status !== 'folded');
+  const solved = contenders.map((p) => {
+    const cards = [...p.holeCards.map(cardToStr), ...boardStrs];
+    return { player: p, hand: PokerHand.solve(cards) };
+  });
+  // Seat-ordered iteration so an exact tie keeps the lower-seat player as
+  // "trailing" (deterministic, matches the side-pot tie simplification).
+  let worst = solved[0];
+  for (const s of solved.slice(1)) {
+    if (s.hand.loseTo(worst.hand)) worst = s;
+  }
+  return worst.player.userId;
 }
 
 // ============================================================

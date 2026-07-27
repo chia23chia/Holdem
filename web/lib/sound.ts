@@ -1,18 +1,21 @@
 // Audio cue player. Client-only (references Audio + localStorage). Every cue
 // is optional — if the file 404s or autoplay is blocked, the call is a
-// silent no-op. Sound files live at web/public/sounds/{key}.mp3 and are
+// silent no-op. Sound files live at web/public/sounds/{key}.wav and are
 // deployed as static assets; missing files just mean the cue is silent.
+// Shipped as short synthesized placeholder tones (see
+// scripts/gen-sounds.mjs) — swap in real recordings by replacing the .wav
+// files, no code change needed as long as the filenames match.
 
 const CUE_FILES = {
-  deal: '/sounds/deal.mp3',
-  fold: '/sounds/fold.mp3',
-  check: '/sounds/check.mp3',
-  call: '/sounds/call.mp3',
-  raise: '/sounds/raise.mp3',
-  allin: '/sounds/allin.mp3',
-  street: '/sounds/street.mp3',
-  win: '/sounds/win.mp3',
-  myturn: '/sounds/myturn.mp3',
+  deal: '/sounds/deal.wav',
+  fold: '/sounds/fold.wav',
+  check: '/sounds/check.wav',
+  call: '/sounds/call.wav',
+  raise: '/sounds/raise.wav',
+  allin: '/sounds/allin.wav',
+  street: '/sounds/street.wav',
+  win: '/sounds/win.wav',
+  myturn: '/sounds/myturn.wav',
 } as const;
 
 export type SoundCue = keyof typeof CUE_FILES;

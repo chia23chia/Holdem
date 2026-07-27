@@ -2,7 +2,7 @@
 
 Holdem 專案的深度參考文件。README 負責入門(如何啟動),本檔負責描述程式碼結構、契約與設計決策。有架構性變動(新事件、新 model、新 endpoint、新踩坑)才更新。
 
-最後更新:2026-07-29(修正 all-in 跑池時公共牌紀錄/音效漏掉的 bug)
+最後更新:2026-07-29(All-in 跑池動畫:逐街翻牌 + 落後者翻河牌)
 
 ---
 
@@ -293,7 +293,8 @@ Server(server/src/auth.ts authMiddleware):
 | `game:state` | `HandStatePublic` | `room:<id>` channel | 每次 action / 街轉換後廣播的新公開狀態(含 `deadline` epoch ms) |
 | `game:hole` | `HandStatePrivate` | 單一 socket | 該座位玩家的私人手牌 + 當前最佳牌型;每次翻公共牌後 server 會**重推**讓 handRank 更新 |
 | `game:action-log` | `ActionLogEntry` | `room:<id>` channel | 每次玩家 action 後推一筆(seat、name、phase、actionType、amount);client 累積成本手動作紀錄,`game:started` 時清空 |
-| `game:street-log` | `{phase, cards}` | `room:<id>` channel | 每次公共牌翻牌就推一筆,一次動作可能連續推好幾筆(all-in 跑池時一次翻完 flop+turn+river);client 直接 append 到本手歷史 + 播 `street` 音效,不靠 `gameState.phase` 推測(見 §11.25) |
+| `game:street-log` | `{phase, cards, trailingUserId?}` | `room:<id>` channel | 每次公共牌翻牌就推一筆,一次動作可能連續推好幾筆(all-in 跑池時一次翻完 flop+turn+river);client 直接 append 到本手歷史 + 播 `street` 音效,不靠 `gameState.phase` 推測(見 §11.25)。`trailingUserId` 只在 all-in 跑池時才會有值,用於 §11.26 的逐街動畫 + 河牌落後者高亮 |
+| `game:allin-reveal` | `{players: Array<{userId,name,holeCards}>}` | `room:<id>` channel | All-in 跑池開始時觸發一次,提前公開所有還在手牌裡的人的手牌(已無法再行動,不算洩密)。見 §11.26 |
 | `game:ended` | `{roomId, result?}` | `room:<id>` channel | 手牌自然結束時帶 `result`(winners + hole reveal + handRank);manual `game:end` 不帶 result 直接清狀態 |
 | `sticker:show` | `StickerEvent` | `room:<id>` channel | 有人送 emoji reaction;client 疊到全螢幕飛過的貼圖層(見 §11.22) |
 
@@ -620,7 +621,7 @@ Header 底下一條 fixed-height(`h-6`)的跑馬燈,即時顯示 chat 訊息一�
 
 `web/lib/sound.ts` — 極簡的 audio cue player,依 event 觸發播 `deal / fold / check / call / raise / allin / street / win / myturn` 短音效。全域 localStorage 記錄 mute 狀態(header 的 `🔊/🔇` 按鈕切換),沒設定預設有聲音。
 
-- **音檔位置**:`web/public/sounds/{key}.mp3`。**檔案不存在就靜音,不會壞掉任何流程** —— `Audio.play().catch(() => {})` 吞掉 404 / autoplay policy / codec 錯誤,不做 fallback。使用者自行把免費 CC0 音效 drop 進去,沒放也沒關係。
+- **音檔位置**:`web/public/sounds/{key}.wav`。**檔案不存在就靜音,不會壞掉任何流程** —— `Audio.play().catch(() => {})` 吞掉 404 / autoplay policy / codec 錯誤,不做 fallback。功能剛做出來那幾天(2026-07-28)這個資料夾其實是空的,音效系統本身沒問題但整個靜音——2026-07-29 補上 `web/scripts/gen-sounds.mjs` 用純 Node(無外部依賴)合成的 9 個短提示音當佔位音效(正弦波 + 淡入淡出包絡,不是真的錄音),之後要換成真的音效檔,直接覆蓋同名 `.wav` 檔即可,不用改程式碼。
 - **Autoplay policy**:iOS Safari / Chrome 都要求首次播放要在 user gesture 內。因為玩家一定會先點過「就座」或「開始牌局」等按鈕才會聽到第一個 cue,所以實際上不會被擋。真被擋的話 `.catch` 也吞掉了,不用手動 unlock。
 - **Cue 對應**:
   - `game:started` → `deal`
@@ -637,6 +638,50 @@ Header 底下一條 fixed-height(`h-6`)的跑馬燈,即時顯示 chat 訊息一�
 舊機制是 client 端一個 `useEffect` 盯著 `gameState.phase`,只在 `phase` 剛好是 `'flop'/'turn'/'river'` 時才把公共牌 append 進本手的 history(順便觸發 `street` 音效)。All-in 跑池的情況下 `phase` 永遠不會被 client 觀察到停在 flop 或 turn(直接跳到 `ended`),導致這三街**完全沒有**被記進本手歷史紀錄 —— 重整頁面後(REST 重新 fetch 已經 persist 好的 `HandLogData.history`)看起來是對的,但當場、沒重整的即時畫面上,那手的公共牌紀錄整個是空的。音效也是同一個 bug:`street` cue 從來沒響過。
 
 **修法**:不再讓 client 用「觀察 `gameState.phase` 變化」去猜公共牌是什麼時候翻的,改成 server 端直接把答案送過去。`server/src/index.ts` 的 `game:action` handler 跟 `runAutoAction` 現在都會在呼叫 `applyAction` **之前**先記下 `hand.history.length`(`historyLenBefore`),`broadcastAfterAction` 收到這個值後,用 `hand.history.slice(historyLenBefore)` 抓出「這次動作新增的所有 history entry」(可能是 1 個街,也可能是 all-in 跑池時一次新增 3 個),過濾出 `kind==='street'` 的部分,逐一 emit 新事件 `game:street-log`(見 §7.1)。Client 端直接訂閱這個事件 append 到 history + 播音效,不再自己用 `gameState.phase`/`community` 猜測 —— 不管一次動作觸發幾條街,都會收到對應數量的事件,順序保證跟 server 端 push 的順序一致(flop 先、river 後)。
+
+### 11.26 All-in 跑池動畫:逐街翻牌 + 落後者翻河牌(2026-07-29)
+
+在 §11.25 修好「街事件不會漏」的基礎上,進一步做成有懸念感的呈現:河牌前所有人 all-in 時,公共牌不再一次全部跳出來,而是照街(flop 3 張一起、turn 1 張、river 1 張)一批一批翻,河牌翻出來那瞬間額外標示目前暫居下風的玩家。
+
+**Server(`hands.ts`)**:
+- `HandState` 新增 `allInRevealPayload?: Array<{userId, name, holeCards}>` —— **純記憶體、不 persist**。`maybeRevealAllIn(hand)` 在 `advancePhase`/`maybeAdvanceIfNoAction` 每次 `dealCommunity` 之後呼叫,冪等,一旦「未蓋牌人數 > 1 且其中還能行動的 (`status==='active'`) <= 1」就把所有未蓋牌玩家的手牌記下來,之後不會再變。不 persist 的理由:all-in 跑池最後一定會走到真正攤牌,`HandEndResult.revealedHoles` 屆時本來就會完整記錄這些人的牌,這欄位只是給「還在跑池過程中」的即時畫面用。
+- `computeTrailingUserId(hand)` 只有在 `allInRevealPayload` 已經設定時才會算(避免一般手牌透過這個欄位洩漏誰目前領先/落後),用 `PokerHand.solve` 算出所有未蓋牌玩家目前最佳牌,再用 pokersolver 的 `loseTo`(完整 kicker 比較,不是只比較粗略的 `.rank`)找出真正「輸給全部人」的那位;平手(含還沒開牌前 `community.length===0` 一律回傳 `undefined`)時取座位序在前的,跟既有 side-pot 平手處理一樣簡化。
+- 兩個 push `{kind:'street'}` history 的地方都在 push 前呼叫 `maybeRevealAllIn` + `computeTrailingUserId`,把 `trailingUserId` 一併存進該街的 history entry。
+
+**Shared 型別**:`HandHistoryEntry` 的 street 變體加 `trailingUserId?: string`;新增 `game:allin-reveal` 事件(`{players: Array<{userId,name,holeCards}>}`,整手只會收到一次);`game:street-log` payload 也帶 `trailingUserId?`。
+
+**Server 廣播(`index.ts`)**:`game:action` handler / `runAutoAction` 在呼叫 `applyAction` 前多記一個 `hadAllInReveal = !!hand.allInRevealPayload`(跟既有的 `historyLenBefore` 是同一個「動作前快照」套路),`broadcastAfterAction` 用 `!hadAllInReveal && hand.allInRevealPayload` 判斷要不要 emit `game:allin-reveal`(保證整手只送一次),`game:street-log` 迴圈額外帶上 `trailingUserId`。`startHandForRoom` 也補了同一個 emit —— 涵蓋短籌碼盲注就直接讓全員 all-in、`startHand` 內部一開局就觸發跑池的極端情況。
+
+**Client(`web/app/room/[id]/page.tsx`)**:
+- 新增 `displayedCommunity` state,取代畫面正中央公共牌顯示原本直接讀的 `gameState.community`。`game:started`(含重連/重整)時**立即**設成當下真實盤面,不做動畫——重連這個 client 早就錯過了對應的 `game:street-log` 事件,沒有東西可以重播,直接顯示正確現況才對。`game:street-log` 進來時改成推進一個 `useRef` 佇列(`streetQueueRef`),用 `streetPlayingRef` 旗標 + `setTimeout` 鏈(`playNextQueuedStreet`)每 700ms 取一組出來才真的 `setDisplayedCommunity` + 播 `street` 音效,街與街之間看得出停頓。700ms 這個延遲對一般沒人 all-in 的手牌來說遠短於真人思考時間,不會有感。
+- 新增 `allInReveal: Map<userId, [Card,Card]>`,由 `game:allin-reveal` 整包覆蓋(立即顯示、不用動畫)。座位卡原本只有「真正攤牌後」才會顯示 `reveal`,現在多一個 fallback:沒有真正 `revealEntry` 時退回查 `allInReveal`——牌型標籤(`revealHandRank`)刻意不跟著提前顯示,留到真正攤牌才出現,前端也沒有另外算牌力。
+- 新增 `revealingSeatUserId` state:street-log 佇列處理到 `phase==='river'` 且該 entry 帶 `trailingUserId` 時設定,~1.8s 後自動清空。`SeatCard` 新增 `isRevealingRiver` prop,套用紅色邊框 + `animate-pulse`(Tailwind 內建,沒加新 CSS keyframe)+ 「翻牌中...」文字。
+- 已知簡化:重連/重整期間如果剛好錯過 `game:allin-reveal`,提前公開的手牌看不到(要等真正攤牌才看得到,跟修這個功能之前的行為一樣,不是回歸);多人平手「暫居下風」只用座位序決定顯示誰,不做並列標示。
+
+### 11.27 座位即時動作回饋(2026-07-29)
+
+**問題**:座位卡在 all-in / 蓋牌之外沒有任何「剛剛發生了什麼動作」的即時提示——`bet {bet}` 這行只在該玩家這輪有真的下注時才顯示,過牌(check)不會讓 `bet` 變成非零,所以過牌時座位卡上完全沒有任何變化,直接輪到下一位,玩家反饋是「check 沒有顯示,直接跳下一家」。動作紀錄(`actionZh` / `ACTION_ZH`)雖然存在,但只用在「歷史」分頁裡,而且那個分頁在手牌進行中會被 `inProgress` 擋住只顯示「本手進行中...」的提示文字,不會即時列出動作,所以座位上的視覺回饋是唯一即時管道,卻剛好漏了 check 這個 case。同時 `bet {bet}` 不分加注還是跟注一律同一個顏色(emerald),玩家也反應想要用顏色區分「主動加注/all-in」跟「單純跟注」。
+
+**修法**:新增 `lastActionBySeat: Record<seat, ActionLogEntry['actionType']>` state,由既有的 `game:action-log` 事件(本來就會為每個動作觸發一次,用來播音效跟寫歷史)順便更新;在 `game:street-log`(新的一輪開始,舊動作標籤已經過期)跟 `game:started`(新的一手)時清空。`SeatCard` 新增 `lastActionType` prop:
+- `lastActionType === 'check'` 時顯示一個獨立的「過牌」灰字標籤(不管 `bet` 是不是 0 都會顯示,例如 BB preflop check 時 `bet` 還是盲注金額,兩個標籤會一起出現)。
+- `bet {bet}` 這行的顏色改成依 `lastActionType` 決定:`raise`/`all-in` → 紅色(`text-red-400`),其他(call、blind 入池但還沒真的行動過)→ 維持原本的 emerald。
+
+FOLD / ALL-IN 本來就有靠 `status` 算出來的持久標籤(不受這輪動作重置影響),不受這次改動影響,`lastActionType` 只補 check 跟顏色這兩個缺口。
+
+### 11.28 閒置連續兩次自動過牌/棄牌 → 強制站起(2026-07-29)
+
+**規則**:同一位玩家「因逾時被 server 自動代打」連續兩次(中間沒有任何一次是自己真的點按鈕),就強制站起——現金局比照 §11.17 的暫離規則(`seat` 設回 `null`,籌碼保留,可隨時坐回來);錦標賽比照 §11.20 的淘汰規則(視同主動站起 = 淘汰,`chipsAtTable` 歸零、記錄名次)。任何一次「真的自己按按鈕」的動作都會把這個連續計數歸零。
+
+**Server(`index.ts`)**:
+- `idleStreakByRoom: Map<roomId, Map<userId, number>>` 記錄「連續」被 `runAutoAction` 代打的次數,**跨手牌保留**(不是每手歸零)——因為要抓的是「這人根本不在電腦前」,不是「這手剛好沒空」,folded 就沒有下一次可以行動,只有下一手才能再犯規。`game:action` handler(真的收到玩家點擊)跟 `room:standup`(玩家自己站起)都會呼叫 `resetIdleStreak` 歸零。
+- `runAutoAction` 每次代打後 `bumpIdleStreak`,達到 `AUTO_ACTION_STANDUP_THRESHOLD`(= 2)就觸發強制站起。用當次送出的 `action.type` 判斷(不是讀 mutate 後的 `cur.status`,避免 TS narrowing 誤報,而且語意上更直接):
+  - 代打結果是 `fold` → 這位玩家已經蓋牌,跟 §11.17 允許蓋牌者 mid-hand 站起是同一個安全前提,直接呼叫共用的 `forceStandUp(roomId, userId)`。
+  - 代打結果是 `check`(還在牌局裡、狀態仍是 `active`)→ 現在站起會把還在場上的玩家拉走,不安全,改成 `queuePendingForcedStandup` 排進 `pendingForcedStandupByRoom: Map<roomId, Set<userId>>`,等 `broadcastAfterAction` 偵測到這手結束(`ended` 分支)時,跟既有的 `drainPendingRebuys` 同一個位置呼叫 `drainPendingForcedStandups` 套用——這個時間點手牌已經結束,站起絕對安全,而且早於 client 有機會請求開下一手,沒有 race。
+- `forceStandUp(roomId, userId)` 是從原本寫在 `room:standup` handler 裡的邏輯抽出來的共用函式(現金局呼叫 `unseatUser` + `finalizeRoomState`;錦標賽呼叫 `eliminateStandingPlayer`,賽事因此結束的話一路 teardown 到 `room:closed`),`room:standup` handler 現在只保留「牌局進行中必須已蓋牌才能站起」的權限檢查,實際動作呼叫同一個函式——手動站起跟被強制站起走的是完全相同的一條路徑,行為保證一致。
+- `resetIdleStreak` 除了清 `idleStreakByRoom`,也會順便清掉 `pendingForcedStandupByRoom` 裡對這個人排的隊——同一手裡如果先被排進強制站起佇列(check 觸發),後來又真的自己動作了一次(證明人回來了),那筆排隊會被取消,不會等到手牌結束還被莫名其妙站起來。
+- `idleStreakByRoom` / `pendingForcedStandupByRoom` 在所有既有的「房間狀態整個清掉」的地方(`finalizeRoomState`、`broadcastAfterAction` 的錦標賽結束分支、`forceStandUp` 的錦標賽結束分支、`room:close`)都比照 `pendingRebuysByRoom` 一起 `.delete(roomId)`,避免長期掛著空房間的殘留資料。
+
+**已知簡化**:被強制站起的玩家目前沒有專屬的提示訊息(例如「你因閒置太久被移出座位」)——房間的 `room:detail` 會照常廣播座位變化,前端看得到自己的座位變空,但沒有額外解釋原因;之後有需要再補。
 
 ---
 

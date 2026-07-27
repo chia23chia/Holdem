@@ -1,5 +1,6 @@
 // Minimal ambient declaration for the `pokersolver` package.
-// Package is CommonJS with no official @types. We only use `Hand.solve` and `Hand.winners`.
+// Package is CommonJS with no official @types. We only use `Hand.solve`, `Hand.winners`,
+// and instance method `loseTo`.
 // Import pattern (ESM consumer):
 //   import pokersolver from 'pokersolver';
 //   const { Hand } = pokersolver;
@@ -10,6 +11,7 @@ declare module 'pokersolver' {
     rank: number;         // Higher = stronger
     cards: unknown[];     // Best 5-card selection (opaque; we don't inspect)
     cardPool?: unknown[]; // 7-card pool passed in
+    loseTo(hand: SolvedHand): boolean; // full kicker-level comparison
   }
 
   export interface HandStatic {

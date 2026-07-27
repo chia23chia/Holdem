@@ -54,6 +54,29 @@ export default function RoomPage() {
   const [gameState, setGameState] = useState<HandStatePublic | null>(null);
   const [holeCards, setHoleCards] = useState<[Card, Card] | null>(null);
   const [handRank, setHandRank] = useState<string | null>(null);
+  // Community cards actually shown on the felt — decoupled from
+  // gameState.community so an all-in runout can reveal flop/turn/river one
+  // street at a time instead of jumping straight to the final board. Set
+  // instantly (no animation) on game:started/reconnect; staggered in by the
+  // game:street-log queue below otherwise.
+  const [displayedCommunity, setDisplayedCommunity] = useState<Card[]>([]);
+  // Hole cards revealed early during an all-in runout (before real showdown).
+  // Folded players never appear here — only players still in the hand who
+  // have no more decisions left.
+  const [allInReveal, setAllInReveal] = useState<Map<string, [Card, Card]>>(
+    new Map(),
+  );
+  // userId currently shown with the river-flip highlight; auto-clears.
+  const [revealingSeatUserId, setRevealingSeatUserId] = useState<
+    string | null
+  >(null);
+  // Most recent action per seat THIS betting round — check has no bet amount
+  // to display, so without this the felt shows no feedback at all when
+  // someone checks. Cleared at the start of each new street/hand so a stale
+  // "過牌"/"跟注" tag doesn't linger once the round moves on.
+  const [lastActionBySeat, setLastActionBySeat] = useState<
+    Record<number, ActionLogEntry['actionType']>
+  >({});
   const [hands, setHands] = useState<HandRecord[]>([]);
   // null = follow latest hand; number = viewing a specific past hand
   const [selectedIdx, setSelectedIdx] = useState<number | null>(null);
@@ -117,6 +140,39 @@ export default function RoomPage() {
   // Debounces the myturn sound to only fire on the false→true transition, so
   // re-renders while it's still my turn don't spam-play the ding.
   const prevMyTurnRef = useRef(false);
+  // Staggered street-reveal queue (see game:street-log handler below). Plain
+  // refs, not state — the setTimeout chain reads/mutates them directly and
+  // re-rendering on every queue mutation would be pointless churn.
+  const streetQueueRef = useRef<
+    Array<{ cards: Card[]; phase: string; trailingUserId?: string }>
+  >([]);
+  const streetPlayingRef = useRef(false);
+  const streetTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const revealTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Pops one queued street, waits ~700ms so the previous reveal is actually
+  // seen, then reveals it on the felt (+ sound, + river highlight). Keeps
+  // going until the queue drains. 700ms is well under normal human action
+  // pacing, so non-all-in hands don't feel artificially slowed down.
+  function playNextQueuedStreet() {
+    streetTimeoutRef.current = setTimeout(() => {
+      const next = streetQueueRef.current.shift();
+      if (!next) {
+        streetPlayingRef.current = false;
+        return;
+      }
+      setDisplayedCommunity((prev) => [...prev, ...next.cards]);
+      playCue('street');
+      if (next.phase === 'river' && next.trailingUserId) {
+        const userId = next.trailingUserId;
+        setRevealingSeatUserId(userId);
+        revealTimeoutRef.current = setTimeout(() => {
+          setRevealingSeatUserId((cur) => (cur === userId ? null : cur));
+        }, 1800);
+      }
+      playNextQueuedStreet();
+    }, 700);
+  }
 
   useEffect(() => {
     if (status !== 'authenticated' || !roomId) return;
@@ -169,6 +225,20 @@ export default function RoomPage() {
           setHoleCards(null);
           setHandRank(null);
           setSelectedIdx(null); // Snap back to newest on each new hand
+          // New hand: drop any leftover reveal/animation state from the
+          // previous one. Community is set instantly here (not staggered) —
+          // this also covers reconnect/refresh mid-hand, where the
+          // game:street-log events for streets already dealt were sent to
+          // OTHER clients before this socket ever connected, so there's
+          // nothing to replay and showing the real current board is correct.
+          if (streetTimeoutRef.current) clearTimeout(streetTimeoutRef.current);
+          if (revealTimeoutRef.current) clearTimeout(revealTimeoutRef.current);
+          streetQueueRef.current = [];
+          streetPlayingRef.current = false;
+          setDisplayedCommunity(state.community);
+          setAllInReveal(new Map());
+          setRevealingSeatUserId(null);
+          setLastActionBySeat({});
           setHands((prev) => {
             // If already have a record for this handNumber (e.g. subscribe
             // catch-up after refresh), skip; otherwise append.
@@ -201,6 +271,12 @@ export default function RoomPage() {
             };
             return copy;
           });
+          // Live per-seat feedback — check has no bet amount to show, so
+          // this is the only visible sign a check just happened.
+          setLastActionBySeat((prev) => ({
+            ...prev,
+            [entry.seat]: entry.actionType,
+          }));
           const cue: SoundCue | null =
             entry.actionType === 'fold'
               ? 'fold'
@@ -215,12 +291,22 @@ export default function RoomPage() {
                       : null;
           if (cue) playCue(cue);
         });
+        // Early hole-card reveal for everyone still in an all-in runout —
+        // fires once per hand, before the delayed board catches up.
+        s.on('game:allin-reveal', ({ players }) => {
+          setAllInReveal(
+            new Map(players.map((p) => [p.userId, p.holeCards])),
+          );
+        });
         // One event per community-card reveal, explicitly emitted by the
         // server (not inferred from gameState.phase) — an all-in runout can
         // fast-forward through flop+turn+river in a single broadcast, so
         // watching phase transitions alone would miss every street except
         // whichever one happened to be "current" in the final update.
-        s.on('game:street-log', ({ phase, cards }) => {
+        // The felt display (displayedCommunity) is staggered ~700ms/street
+        // via the queue below for runout drama; the history record itself
+        // still updates immediately since there's no reason to delay it.
+        s.on('game:street-log', ({ phase, cards, trailingUserId }) => {
           setHands((prev) => {
             if (prev.length === 0) return prev;
             const last = prev[prev.length - 1];
@@ -230,11 +316,17 @@ export default function RoomPage() {
             const copy = [...prev];
             copy[copy.length - 1] = {
               ...last,
-              history: [...last.history, { kind: 'street', phase, cards }],
+              history: [...last.history, { kind: 'street', phase, cards, trailingUserId }],
             };
             return copy;
           });
-          playCue('street');
+          // New betting round — last round's check/call/raise tags are stale.
+          setLastActionBySeat({});
+          streetQueueRef.current.push({ cards, phase, trailingUserId });
+          if (!streetPlayingRef.current) {
+            streetPlayingRef.current = true;
+            playNextQueuedStreet();
+          }
         });
         s.on('game:ended', ({ result }) => {
           if (result) {
@@ -274,6 +366,8 @@ export default function RoomPage() {
       socketRef.current?.emit('room:leave', { roomId });
       socketRef.current?.disconnect();
       socketRef.current = null;
+      if (streetTimeoutRef.current) clearTimeout(streetTimeoutRef.current);
+      if (revealTimeoutRef.current) clearTimeout(revealTimeoutRef.current);
     };
   }, [status, roomId, router]);
 
@@ -779,12 +873,12 @@ export default function RoomPage() {
                 {gameState ? (
                   <>
                     <div className="flex gap-1">
-                      {gameState.community.length === 0 ? (
+                      {displayedCommunity.length === 0 ? (
                         <span className="text-[10px] text-slate-300 sm:text-xs">
                           Preflop · 尚未翻牌
                         </span>
                       ) : (
-                        gameState.community.map((c, i) => (
+                        displayedCommunity.map((c, i) => (
                           <CardView key={i} card={c} size="sm" />
                         ))
                       )}
@@ -827,14 +921,21 @@ export default function RoomPage() {
                   gameState && gameState.dealerSeat === seatNum;
                 // Show revealed hole cards + hand rank on seat card ONLY for
                 // other players at showdown. Your own cards live in the
-                // dedicated "你的手牌" area below the ring.
+                // dedicated "你的手牌" area below the ring. Before real
+                // showdown, an all-in runout can also reveal cards early
+                // (allInReveal) — shown without a hand-rank label since we
+                // don't compute hand strength client-side.
                 const revealEntry =
                   occupant && occupant.userId !== myUserId
                     ? currentEndResult?.revealedHoles.find(
                         (r) => r.userId === occupant.userId,
                       )
                     : undefined;
-                const reveal = revealEntry?.holeCards ?? null;
+                const reveal =
+                  revealEntry?.holeCards ??
+                  (occupant && occupant.userId !== myUserId
+                    ? (allInReveal.get(occupant.userId) ?? null)
+                    : null);
                 const revealHandRank = revealEntry?.handRank ?? null;
                 return (
                   <div
@@ -858,6 +959,10 @@ export default function RoomPage() {
                         isMe={occupant.userId === myUserId}
                         isActive={isActive}
                         isDealer={!!isDealer}
+                        isRevealingRiver={
+                          !!occupant && occupant.userId === revealingSeatUserId
+                        }
+                        lastActionType={lastActionBySeat[seatNum]}
                         reveal={reveal}
                         revealHandRank={revealHandRank}
                         secondsLeft={
@@ -1621,6 +1726,8 @@ function SeatCard({
   isMe,
   isActive,
   isDealer,
+  isRevealingRiver,
+  lastActionType,
   reveal,
   revealHandRank,
   secondsLeft,
@@ -1635,17 +1742,21 @@ function SeatCard({
   isMe: boolean;
   isActive: boolean;
   isDealer: boolean;
+  isRevealingRiver?: boolean;
+  lastActionType?: ActionLogEntry['actionType'];
   reveal: [Card, Card] | null;
   revealHandRank: string | null;
   secondsLeft: number | null;
 }) {
   const isFolded = status === 'folded';
   const isAllIn = status === 'all-in';
-  const border = isActive
-    ? 'border-amber-400 ring-2 ring-amber-400/50'
-    : isMe
-      ? 'border-emerald-500'
-      : 'border-slate-700';
+  const border = isRevealingRiver
+    ? 'border-red-500 ring-2 ring-red-500/60 animate-pulse'
+    : isActive
+      ? 'border-amber-400 ring-2 ring-amber-400/50'
+      : isMe
+        ? 'border-emerald-500'
+        : 'border-slate-700';
   const bg = eliminated
     ? 'bg-slate-950 opacity-40'
     : isFolded
@@ -1673,8 +1784,19 @@ function SeatCard({
         {chips}
       </div>
       {typeof bet === 'number' && bet > 0 && (
-        <div className="text-[9px] font-bold text-emerald-300 sm:text-[10px]">
+        <div
+          className={`text-[9px] font-bold sm:text-[10px] ${
+            lastActionType === 'raise' || lastActionType === 'all-in'
+              ? 'text-red-400'
+              : 'text-emerald-300'
+          }`}
+        >
           bet {bet}
+        </div>
+      )}
+      {lastActionType === 'check' && (
+        <div className="text-[9px] font-bold text-slate-400 sm:text-[10px]">
+          過牌
         </div>
       )}
       {eliminated && (
@@ -1688,6 +1810,11 @@ function SeatCard({
       {isAllIn && (
         <div className="text-[9px] font-bold text-red-400 sm:text-[10px]">
           ALL-IN
+        </div>
+      )}
+      {isRevealingRiver && (
+        <div className="text-[9px] font-bold text-red-400 sm:text-[10px]">
+          翻牌中...
         </div>
       )}
       {reveal && (
@@ -2195,6 +2322,7 @@ type HistoryItem =
       kind: 'street';
       phase: 'flop' | 'turn' | 'river';
       cards: Card[];
+      trailingUserId?: string;
     };
 
 type HandRecord = {
