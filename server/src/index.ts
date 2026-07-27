@@ -196,20 +196,22 @@ async function runAutoAction(roomId: string): Promise<void> {
   if (cur.status !== 'active') return;
   const canCheck = cur.bet === hand.currentBet;
   const action: PlayerAction = canCheck ? { type: 'check' } : { type: 'fold' };
+  const historyLenBefore = hand.history.length;
   const outcome = applyAction(roomId, cur.userId, action);
   if (!outcome.ok) return;
   const phaseBefore = hand.phase; // captured before applyAction re-entered
-  await broadcastAfterAction(roomId, outcome.log, phaseBefore, outcome.ended);
+  await broadcastAfterAction(roomId, outcome.log, phaseBefore, outcome.ended, historyLenBefore);
 }
 
-// Shared post-action broadcast: action-log + state + optional phase re-emit
-// of game:hole + hand-end persistence + timer reschedule. Called from both
-// the game:action socket handler and runAutoAction.
+// Shared post-action broadcast: action-log + street-log + state + optional
+// phase re-emit of game:hole + hand-end persistence + timer reschedule.
+// Called from both the game:action socket handler and runAutoAction.
 async function broadcastAfterAction(
   roomId: string,
   log: AppliedActionLog,
   phaseBefore: string | undefined,
   ended: boolean,
+  historyLenBefore: number,
 ): Promise<void> {
   const hand = getHand(roomId);
   if (!hand) return;
@@ -223,6 +225,18 @@ async function broadcastAfterAction(
     amount: log.amount,
     ts: Date.now(),
   });
+  // A single action can fast-forward through several streets at once (e.g.
+  // everyone's all-in before the river) — emit every street that got
+  // revealed since this action started, not just whatever the final phase
+  // happens to be, so the client never silently drops a board.
+  for (const entry of hand.history.slice(historyLenBefore)) {
+    if (entry.kind === 'street') {
+      io.to(roomChannel(roomId)).emit('game:street-log', {
+        phase: entry.phase,
+        cards: entry.cards,
+      });
+    }
+  }
   io.to(roomChannel(roomId)).emit('game:state', toPublicState(hand));
 
   // Below this point, every step is wrapped individually: a transient
@@ -620,11 +634,13 @@ io.on('connection', (socket) => {
   });
 
   socket.on('game:action', async ({ roomId, action }, cb) => {
-    const phaseBefore = getHand(roomId)?.phase;
+    const handBefore = getHand(roomId);
+    const phaseBefore = handBefore?.phase;
+    const historyLenBefore = handBefore?.history.length ?? 0;
     const outcome = applyAction(roomId, user.userId, action);
     if (!outcome.ok) return cb({ ok: false, error: outcome.error });
     cb({ ok: true });
-    await broadcastAfterAction(roomId, outcome.log, phaseBefore, outcome.ended);
+    await broadcastAfterAction(roomId, outcome.log, phaseBefore, outcome.ended, historyLenBefore);
   });
 
   // Voluntary reveal — any player still recorded in this ended hand.

@@ -331,6 +331,12 @@ export interface ServerToClientEvents {
   'game:state': (state: HandStatePublic) => void; // Broadcast after each action / phase change
   'game:hole': (data: HandStatePrivate) => void;   // Re-emitted per seated player after phase advances (handRank updates)
   'game:action-log': (entry: ActionLogEntry) => void; // One per player action
+  // One per community-card reveal. Emitted explicitly (not inferred from
+  // gameState.phase transitions) so an all-in runout that fast-forwards
+  // through flop+turn+river in a single server-side action still sends
+  // each street as its own event instead of the client only ever seeing
+  // the final "ended" phase and missing the intermediate boards.
+  'game:street-log': (entry: { phase: 'flop' | 'turn' | 'river'; cards: Card[] }) => void;
   'game:ended': (data: { roomId: string; result?: HandEndResult }) => void;
 }
 

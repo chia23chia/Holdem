@@ -2,7 +2,7 @@
 
 Holdem 專案的深度參考文件。README 負責入門(如何啟動),本檔負責描述程式碼結構、契約與設計決策。有架構性變動(新事件、新 model、新 endpoint、新踩坑)才更新。
 
-最後更新:2026-07-26(side pot、rebuy 選擇制、broadcastAfterAction 容錯、Google Sheets 自動同步、SNG 錦標賽模式 v1)
+最後更新:2026-07-29(修正 all-in 跑池時公共牌紀錄/音效漏掉的 bug)
 
 ---
 
@@ -293,6 +293,7 @@ Server(server/src/auth.ts authMiddleware):
 | `game:state` | `HandStatePublic` | `room:<id>` channel | 每次 action / 街轉換後廣播的新公開狀態(含 `deadline` epoch ms) |
 | `game:hole` | `HandStatePrivate` | 單一 socket | 該座位玩家的私人手牌 + 當前最佳牌型;每次翻公共牌後 server 會**重推**讓 handRank 更新 |
 | `game:action-log` | `ActionLogEntry` | `room:<id>` channel | 每次玩家 action 後推一筆(seat、name、phase、actionType、amount);client 累積成本手動作紀錄,`game:started` 時清空 |
+| `game:street-log` | `{phase, cards}` | `room:<id>` channel | 每次公共牌翻牌就推一筆,一次動作可能連續推好幾筆(all-in 跑池時一次翻完 flop+turn+river);client 直接 append 到本手歷史 + 播 `street` 音效,不靠 `gameState.phase` 推測(見 §11.25) |
 | `game:ended` | `{roomId, result?}` | `room:<id>` channel | 手牌自然結束時帶 `result`(winners + hole reveal + handRank);manual `game:end` 不帶 result 直接清狀態 |
 | `sticker:show` | `StickerEvent` | `room:<id>` channel | 有人送 emoji reaction;client 疊到全螢幕飛過的貼圖層(見 §11.22) |
 
@@ -624,10 +625,18 @@ Header 底下一條 fixed-height(`h-6`)的跑馬燈,即時顯示 chat 訊息一�
 - **Cue 對應**:
   - `game:started` → `deal`
   - `game:action-log` → 依 `actionType` 對應到 `fold/check/call/raise/allin`
-  - `phase` 從 preflop 進 flop/turn/river → `street`(只在真的 append 新 street entry 時響,不會因為 `game:state` 重播同一階段就重響)
+  - `game:street-log` 收到新的一街 → `street`(見 §11.25;不是從 `gameState.phase` 推的,同一街不會重響)
   - `game:ended` 帶 `result` → `win`
   - 自己成為當前輪次的玩家(false→true transition,靠 `prevMyTurnRef` 去抖動)→ `myturn`
 - **Audio pool**:每個 cue key 第一次播才 lazy new `Audio()` 存進 `audioPool: Map`,之後 rewind `currentTime = 0` 重播,不重複建立 Element。
+
+### 11.25 All-in 提前跑完全部街時,公共牌紀錄漏掉的修復(2026-07-29)
+
+**問題**:河牌前所有人 all-in 時,`maybeAdvanceIfNoAction`(`hands.ts`)在**同一次** `applyAction` 呼叫裡同步跑完 flop→turn→river→showdown,整手只會觸發**一次** `broadcastAfterAction`,client 只收到一次 `game:state`,而且那次收到時 `phase` 已經是 `'ended'`。
+
+舊機制是 client 端一個 `useEffect` 盯著 `gameState.phase`,只在 `phase` 剛好是 `'flop'/'turn'/'river'` 時才把公共牌 append 進本手的 history(順便觸發 `street` 音效)。All-in 跑池的情況下 `phase` 永遠不會被 client 觀察到停在 flop 或 turn(直接跳到 `ended`),導致這三街**完全沒有**被記進本手歷史紀錄 —— 重整頁面後(REST 重新 fetch 已經 persist 好的 `HandLogData.history`)看起來是對的,但當場、沒重整的即時畫面上,那手的公共牌紀錄整個是空的。音效也是同一個 bug:`street` cue 從來沒響過。
+
+**修法**:不再讓 client 用「觀察 `gameState.phase` 變化」去猜公共牌是什麼時候翻的,改成 server 端直接把答案送過去。`server/src/index.ts` 的 `game:action` handler 跟 `runAutoAction` 現在都會在呼叫 `applyAction` **之前**先記下 `hand.history.length`(`historyLenBefore`),`broadcastAfterAction` 收到這個值後,用 `hand.history.slice(historyLenBefore)` 抓出「這次動作新增的所有 history entry」(可能是 1 個街,也可能是 all-in 跑池時一次新增 3 個),過濾出 `kind==='street'` 的部分,逐一 emit 新事件 `game:street-log`(見 §7.1)。Client 端直接訂閱這個事件 append 到 history + 播音效,不再自己用 `gameState.phase`/`community` 猜測 —— 不管一次動作觸發幾條街,都會收到對應數量的事件,順序保證跟 server 端 push 的順序一致(flop 先、river 後)。
 
 ---
 

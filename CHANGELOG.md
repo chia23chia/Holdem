@@ -2,6 +2,10 @@
 
 所有值得記錄的變動都記在這裡,新的在最上面。日期是 commit 當天(UTC+8),不是嚴格的版本號。
 
+## 2026-07-29
+
+- **修正 all-in 跑池時公共牌紀錄跟音效漏掉的問題**:河牌前所有人 all-in 時,server 會在同一次動作裡跑完 flop→turn→river→showdown,只廣播一次 `game:state`(此時 phase 已經是 `ended`)。原本 client 靠「觀察 `gameState.phase` 有沒有停在 flop/turn/river」來記錄公共牌翻牌歷史,這種情況下永遠觀察不到中間狀態,導致那三街完全沒進本手歷史(重整頁面才會因為重新 fetch 到正確的 persisted 資料而看起來正常)、`street` 音效也從沒響過。改成 server 明確送新事件 `game:street-log`,每次動作新增幾條街的 history 就送幾筆,client 直接訂閱、不再用猜的。細節見 `ARCHITECTURE.zh-TW.md` §11.25。
+
 ## 2026-07-28
 
 這一天量特別大(4 新功能 + 2 修正),破例加上小標題把兩類切開;其他日期維持 flat bullet。

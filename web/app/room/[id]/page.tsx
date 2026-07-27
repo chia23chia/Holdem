@@ -215,6 +215,27 @@ export default function RoomPage() {
                       : null;
           if (cue) playCue(cue);
         });
+        // One event per community-card reveal, explicitly emitted by the
+        // server (not inferred from gameState.phase) — an all-in runout can
+        // fast-forward through flop+turn+river in a single broadcast, so
+        // watching phase transitions alone would miss every street except
+        // whichever one happened to be "current" in the final update.
+        s.on('game:street-log', ({ phase, cards }) => {
+          setHands((prev) => {
+            if (prev.length === 0) return prev;
+            const last = prev[prev.length - 1];
+            if (last.history.some((h) => h.kind === 'street' && h.phase === phase)) {
+              return prev;
+            }
+            const copy = [...prev];
+            copy[copy.length - 1] = {
+              ...last,
+              history: [...last.history, { kind: 'street', phase, cards }],
+            };
+            return copy;
+          });
+          playCue('street');
+        });
         s.on('game:ended', ({ result }) => {
           if (result) {
             // Natural end (or voluntary show re-fire) → update last hand's endResult.
@@ -335,34 +356,6 @@ export default function RoomPage() {
     room?.tournamentClockStartedAt,
     gameState?.deadline,
   ]);
-
-  // Append a street entry to the current (last) hand when new community cards reveal.
-  useEffect(() => {
-    if (!gameState) return;
-    const phase = gameState.phase;
-    if (phase !== 'flop' && phase !== 'turn' && phase !== 'river') return;
-    let didAppend = false;
-    setHands((prev) => {
-      if (prev.length === 0) return prev;
-      const last = prev[prev.length - 1];
-      if (last.history.some((h) => h.kind === 'street' && h.phase === phase)) {
-        return prev;
-      }
-      didAppend = true;
-      const copy = [...prev];
-      copy[copy.length - 1] = {
-        ...last,
-        history: [
-          ...last.history,
-          { kind: 'street', phase, cards: gameState.community.slice() },
-        ],
-      };
-      return copy;
-    });
-    // Only ding on the actual reveal (not on redundant re-broadcasts of the
-    // same phase, which would replay the sound on every re-render).
-    if (didAppend) playCue('street');
-  }, [gameState?.phase, gameState?.community]);
 
   // Play a distinct "your turn" cue only when it transitions to my turn —
   // watching the derived boolean via a ref avoids replaying the sound every
