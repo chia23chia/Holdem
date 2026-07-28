@@ -411,13 +411,38 @@ async function snapshotMonthTab(
   const dates: DateSnapshot[] = [];
   let vrIdx = 0;
   for (let i = 0; i < dateSerials.length; i += 1) {
-    const entriesByUserId = new Map<string, number[]>();
+    // First pass: collect raw cells for every player so we can compute
+    // sessionCount = length of longest row (ignoring trailing blanks).
+    // Preserves column positions — critical because a blank in the middle
+    // means the player skipped that session, not that they never played.
+    const raw: Array<{ userId: string; cells: unknown[] }> = [];
+    let sessionCount = 0;
     for (let p = 0; p < N_old; p += 1) {
       const userId = rosterAtBuildTime[p].userId;
       const cells = allVRs[vrIdx].values?.[0] ?? [];
       vrIdx += 1;
-      const nums = cells.filter((v): v is number => typeof v === 'number');
-      if (nums.length > 0) entriesByUserId.set(userId, nums);
+      let lastNonEmpty = 0;
+      for (let j = cells.length - 1; j >= 0; j -= 1) {
+        if (typeof cells[j] === 'number') {
+          lastNonEmpty = j + 1;
+          break;
+        }
+      }
+      if (lastNonEmpty > sessionCount) sessionCount = lastNonEmpty;
+      raw.push({ userId, cells });
+    }
+    // Second pass: pad every player's row to sessionCount with 0 for
+    // blanks. Absent-players and internal-blank cases both become 0.
+    const entriesByUserId = new Map<string, number[]>();
+    if (sessionCount > 0) {
+      for (const r of raw) {
+        const padded: number[] = [];
+        for (let j = 0; j < sessionCount; j += 1) {
+          const v = r.cells[j];
+          padded.push(typeof v === 'number' ? v : 0);
+        }
+        entriesByUserId.set(r.userId, padded);
+      }
     }
     dates.push({ serial: dateSerials[i], entriesByUserId });
   }
@@ -425,8 +450,10 @@ async function snapshotMonthTab(
 }
 
 // One-shot write of every player's entries for a single date's check block.
-// Used only during replay — the normal single-session path still goes
-// through appendSessionEntries.
+// Used only during replay. Every player (including new roster additions
+// beyond N_old, who have no map entry) gets a row padded with 0s to the
+// date's session count — this is what makes their prior dates read as 0
+// instead of blank and keeps session columns aligned across all players.
 async function bulkWriteBlockEntries(
   spreadsheetId: string,
   tabName: string,
@@ -434,25 +461,27 @@ async function bulkWriteBlockEntries(
   rosterSlots: RosterEntry[],
   entriesByUserId: Map<string, number[]>,
 ): Promise<void> {
-  const data: ValueRange[] = [];
-  for (let i = 0; i < rosterSlots.length; i += 1) {
-    const nums = entriesByUserId.get(rosterSlots[i].userId);
-    if (!nums || nums.length === 0) continue;
-    const row = blockRow + 1 + i;
-    const startCol = colLetter(CHECK_ENTRY_FIRST_COL);
-    const endCol = colLetter(CHECK_ENTRY_FIRST_COL + nums.length - 1);
-    data.push({
-      range: `${tabName}!${startCol}${row}:${endCol}${row}`,
-      values: [nums],
-    });
-  }
-  if (data.length > 0) await batchUpdateValues(spreadsheetId, data);
+  // All entries in the map are the same length after snapshotMonthTab
+  // (padded to sessionCount), so any one gives us the width.
+  const firstRow = entriesByUserId.values().next().value;
+  const sessionCount = firstRow?.length ?? 0;
+  if (sessionCount === 0) return;
+
+  const startCol = colLetter(CHECK_ENTRY_FIRST_COL);
+  const endCol = colLetter(CHECK_ENTRY_FIRST_COL + sessionCount - 1);
+  const zeros: number[] = new Array(sessionCount).fill(0);
+  const data: ValueRange[] = rosterSlots.map((r, i) => ({
+    range: `${tabName}!${startCol}${blockRow + 1 + i}:${endCol}${blockRow + 1 + i}`,
+    values: [entriesByUserId.get(r.userId) ?? zeros],
+  }));
+  await batchUpdateValues(spreadsheetId, data);
 }
 
 // Snapshot → clear values → rewrite skeleton with new N → replay every
 // prior date's entries into the new layout. New players (those in
-// fullRoster beyond N_old) end up with empty rows, so their prior-date
-// C column SUM naturally reads 0 — exactly what the friend group wants.
+// fullRoster beyond N_old) get rows of 0s for every prior session, and
+// pre-existing internal blanks also get normalized to 0 — so every date's
+// session columns stay aligned across all players.
 //
 // Not atomic: if the process dies between clear and replay, the tab is
 // partially empty. Snapshot content is logged BEFORE clear so it's
@@ -570,9 +599,11 @@ async function findOrCreateDateBlock(
   return blockRow;
 }
 
-// Appends one sub-entry per player into today's block — each player's row
-// gets its own next-empty-column independently, since not everyone plays
-// every session.
+// Writes ONE session's entries into today's block — every player in the
+// roster gets a cell in the same target column (0 for absent players), so
+// session-N is column-aligned across all players. Also opportunistically
+// rewrites internal blanks in existing rows as 0, cleaning up any
+// misalignment left by pre-2026-07-29 writes.
 async function appendSessionEntries(
   spreadsheetId: string,
   tabName: string,
@@ -580,28 +611,52 @@ async function appendSessionEntries(
   rosterSlots: RosterEntry[],
   entriesByUserId: Map<string, number>,
 ): Promise<void> {
-  const rows = rosterSlots
-    .map((r, i) => ({ slotIndex: i, userId: r.userId }))
-    .filter((r) => entriesByUserId.has(r.userId));
-  if (rows.length === 0) return;
+  if (rosterSlots.length === 0) return;
 
-  const ranges = rows.map(
-    (r) =>
-      `${tabName}!${colLetter(CHECK_ENTRY_FIRST_COL)}${blockRow + 1 + r.slotIndex}:${colLetter(CHECK_ENTRY_LAST_COL)}${blockRow + 1 + r.slotIndex}`,
+  // Read every player row's check-entry range so we can (a) pick one
+  // aligned target column and (b) rewrite each row filling internal blanks.
+  const ranges = rosterSlots.map(
+    (_, i) =>
+      `${tabName}!${colLetter(CHECK_ENTRY_FIRST_COL)}${blockRow + 1 + i}:${colLetter(CHECK_ENTRY_LAST_COL)}${blockRow + 1 + i}`,
   );
   const existing = await batchGetValues(spreadsheetId, ranges);
 
-  const data: ValueRange[] = rows.map((r, idx) => {
-    const rowValues = existing[idx].values?.[0] ?? [];
-    let firstEmpty = 0;
-    while (firstEmpty < rowValues.length && rowValues[firstEmpty] !== '') {
-      firstEmpty += 1;
+  // Target column offset = max(lastNonEmpty+1) across all rows. Using
+  // lastNonEmpty (rather than firstEmpty) so a row that has an internal
+  // blank doesn't get its later entry overwritten. If someone else's row is
+  // longer, we align to that.
+  let targetOffset = 0;
+  for (const vr of existing) {
+    const cells = vr.values?.[0] ?? [];
+    let lastNonEmpty = 0;
+    for (let j = cells.length - 1; j >= 0; j -= 1) {
+      if (typeof cells[j] === 'number') {
+        lastNonEmpty = j + 1;
+        break;
+      }
     }
-    const col = CHECK_ENTRY_FIRST_COL + firstEmpty;
-    const row = blockRow + 1 + r.slotIndex;
+    if (lastNonEmpty > targetOffset) targetOffset = lastNonEmpty;
+  }
+
+  // Rewrite every player's row from column E up through the new target
+  // column, filling with 0 for both internal blanks and absent players.
+  const rowLen = targetOffset + 1;
+  const startCol = colLetter(CHECK_ENTRY_FIRST_COL);
+  const endCol = colLetter(CHECK_ENTRY_FIRST_COL + rowLen - 1);
+  const data: ValueRange[] = rosterSlots.map((r, i) => {
+    const cells = existing[i].values?.[0] ?? [];
+    const rowValues: number[] = [];
+    for (let j = 0; j < rowLen; j += 1) {
+      if (j === targetOffset) {
+        rowValues.push(entriesByUserId.get(r.userId) ?? 0);
+      } else {
+        const v = cells[j];
+        rowValues.push(typeof v === 'number' ? v : 0);
+      }
+    }
     return {
-      range: `${tabName}!${colLetter(col)}${row}`,
-      values: [[entriesByUserId.get(r.userId)]],
+      range: `${tabName}!${startCol}${blockRow + 1 + i}:${endCol}${blockRow + 1 + i}`,
+      values: [rowValues],
     };
   });
 
