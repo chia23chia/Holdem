@@ -4,6 +4,7 @@
 
 ## 2026-07-29
 
+- **音效 `.mp3` 自動 fallback**:`sound.ts` 從寫死 `.wav` 改成先找 `.mp3`、找不到再退回 `.wav`(HEAD 探測結果 cache 起來)。這樣從 Pixabay/Mixkit 抓的 `.mp3` 直接丟進 `web/public/sounds/` 就會響,不用 ffmpeg 轉檔、也不用刪掉原本的 `.wav` 佔位檔(有 `.mp3` 就贏)。模組載入時對 9 個 cue 全部背景 HEAD 探一次,第一個 playCue 時已經是 cache hit,不會漏第一聲。
 - **Google Sheet 沒玩的人填 0 不填空**:先前 `appendSessionEntries` 每位玩家各自找「下一個空格」寫,結果只要有人跳過一場,他的後續紀錄就整排往左靠,對不上其他人的第 N 場(圖見討論記錄)。改成所有列先算出**共同**目標欄(取每列 lastNonEmpty+1 的最大值),沒參加的人補 0,順便把每列的**中間空格**也補成 0(修 2026-07-29 前留下的歷史錯位)。`snapshotMonthTab` 也一起改成保留欄位位置,rebuild 時新玩家的舊日期是 sessionCount 個 0(不是空白)。對 SUM 結果零影響(SUM 本來就把空格當 0)。細節見 §11.19。
 - **閒置連續兩次自動過牌/棄牌 → 強制站起**:同一位玩家連續兩次被 server 因逾時自動代打(中間沒有真的自己動作過),就強制站起——現金局暫離(籌碼保留,可坐回來),錦標賽視同淘汰。蓋牌代打可以立刻站起(跟既有規則一樣安全);過牌代打因為人還在場上,延到這手結束才套用,不會打斷正在進行的牌局。細節見 `ARCHITECTURE.zh-TW.md` §11.28。
 - **音效補上實際音檔**:2026-07-28 做的音效系統(§11.24)一直是靜音的——`web/public/sounds/` 資料夾當時根本沒建,所以 `deal/fold/check/call/raise/allin/street/win/myturn` 全部 404 靜音,程式邏輯本身沒問題。補上 `web/scripts/gen-sounds.mjs`(純 Node 合成短提示音,無外部依賴)產生 9 個佔位 `.wav`,以後要換真的音效檔直接覆蓋同名檔案即可。
