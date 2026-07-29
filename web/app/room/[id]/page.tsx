@@ -161,7 +161,11 @@ export default function RoomPage() {
         streetPlayingRef.current = false;
         return;
       }
-      setDisplayedCommunity((prev) => [...prev, ...next.cards]);
+      // next.cards is the full cumulative board as of this street (server
+      // sends hand.community.slice(), not just the newly-dealt cards) — set
+      // it directly, don't append, or flop/turn/river stack on top of each
+      // other into one giant duplicated row.
+      setDisplayedCommunity(next.cards);
       playCue('street');
       if (next.phase === 'river' && next.trailingUserId) {
         const userId = next.trailingUserId;

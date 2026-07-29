@@ -2,7 +2,7 @@
 
 Holdem 專案的深度參考文件。README 負責入門(如何啟動),本檔負責描述程式碼結構、契約與設計決策。有架構性變動(新事件、新 model、新 endpoint、新踩坑)才更新。
 
-最後更新:2026-07-29(All-in 跑池動畫:逐街翻牌 + 落後者翻河牌)
+最後更新:2026-07-29(依 CHANGELOG 同步 Handoff 快照 + Phase 進度)
 
 ---
 
@@ -33,13 +33,15 @@ docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --build
 docker compose -f docker-compose.prod.yml --env-file .env.prod logs -f --tail=50
 ```
 
-### 現況(2026-07-25)
+### 現況(2026-07-29)
 
-- ✅ Phase 1-2 全部完成(OAuth、lobby、rooms、game engine 含下注/showdown/side-pot/timeout/reconnect/hand-log/rebuy)
-- ✅ Phase 5 已實際部署,`https` 拿到 Let's Encrypt,Google OAuth prod client 已加 `alan-holdem.duckdns.org` callback
-- ✅ play-money 模式 + rebuy + 結算輸贏欄已部署上 prod
-- ✅ 正確 side pot、rebuy 規則(歸零才能補 + chip-leader 上限,捨到 500,玩家自選金額)、broadcastAfterAction 容錯(避免 lag 導致 auto-action 計時器掛掉卡死整桌)、歷史紀錄補籌碼快照 —— 皆已部署上 prod(VM 已 pull `54fb117` 並 rebuild)
-- ❌ 未做:Phase 3 chat 系統訊息、Phase 4 SNG、雲端手牌 log 匯出、跨房 chipsBalance 追蹤
+- ✅ Phase 1-2 全部完成(OAuth、lobby、rooms、game engine 含下注/showdown/正確 side-pot/timeout/reconnect/hand-log/rebuy),Phase 5 已實際部署上 `https://alan-holdem.duckdns.org`(Let's Encrypt、Google OAuth prod client 皆已設好)
+- ✅ Phase 4 SNG 錦標賽 v1 雛形已上線(單桌、盲注自動調漲、淘汰記名次、winner-take-all——已知簡化見 §11.20),與現金局共用引擎、UI 切換
+- ✅ Play-money 核心規則皆已定案並上線:正確 side-pot 分層、rebuy(歸零才能補 + chip-leader 上限捨 500 + 玩家自選金額)、broadcastAfterAction 容錯(防 lag 卡死整桌)、站起改「暫離」(seat 可為 null,籌碼保留,§11.17)、蓋牌者可 mid-hand 站起、閒置連續兩次自動代打強制站起(§11.28)
+- ✅ All-in 跑池體驗:side-pot 正確分池、公共牌逐街揭露動畫 + 落後者河牌高亮(§11.26)、街事件不再靠 client 猜測(§11.25)
+- ✅ 周邊功能:音效 cue(含 `.mp3` 優先 / `.wav` 佔位 fallback)、貼圖 reaction、聊天跑馬燈、即時戰績面板、座位即時動作回饋(過牌標籤 + bet 顏色,§11.27)、Google Sheets 自動同步結算(月曆式戰績表 + 人員分頁,§11.19)
+- ❌ 未做:Phase 3 lobby chat model 整理、雲端手牌 log 匯出(目前房間關閉即清)、跨房 chipsBalance 追蹤、錦標賽多桌/獎金分配/延遲報名
+- 完整逐版本記錄見 `CHANGELOG.md`;本節只列「目前實際上線的狀態」,不是逐項變更史
 
 ### 已知踩過的坑(避免重蹈)
 
@@ -399,18 +401,18 @@ Server(server/src/auth.ts authMiddleware):
 ## 10. Phase 進度
 
 - [x] **Phase 0**(2026-07-24)— 骨架、mock 暱稱登入、Socket.IO smoke test
-- [ ] **Phase 1**(進行中)— Google OAuth、大廳、房間
+- [x] **Phase 1** — Google OAuth、大廳、房間
   - [x] Auth.js v5 Google OAuth(split-config for Edge middleware)
   - [x] Lobby 頁:列房、建房、加入房
   - [x] Room 頁:座位顯示、聊天、離房
   - [x] 全域唯一可編輯暱稱(DB 支援、儲存後 hot reload)
   - [x] 房主關房(確認框、全部退籌、進行中禁止、廣播導離)
   - [x] 手動選座位 + 觀戰模式(入房 = 觀戰;點空位就座;「快速就座」自動找第一個空位)
-  - [x] 站起(退籌但保留訂閱,繼續看牌;若空房則自動關閉)
-- [ ] **Phase 2** — 單桌現金局引擎(牌堆、下注輪、邊池、超時、斷線重連)
+  - [x] 站起(2026-07-27 改為「暫離」:`seat` 設回 null、籌碼保留,不再是退籌,見 §11.17)
+- [x] **Phase 2** — 單桌現金局引擎(牌堆、下注輪、邊池、超時、斷線重連)
   - [x] **Milestone 2.1** — 牌堆 + 洗牌(`crypto.randomInt`)、in-memory `HandState`、房主觸發發手牌(≥2 人)、`game:hole` 只私推給該座位 socket、debug 結束牌局按鈕、dealer button 跨手輪換(in-memory `lastDealerByRoom` map)、環狀桌面布局搭配德撲位置代號(BTN/SB/BB/UTG/…)由 client 從 `dealerSeat` 推導、Session 計時器(30/60/90/120 分,預設 30,不允許無限)**按下「開始牌局」才開始倒數**、server 每 30s 掃描到期房間 → auto-close + 結算 modal、每局 action timeout 選擇(15/30/60s)存進 `HandState` + ring 顯示(實際 auto-fold 行為留給 2.4)。尚無下注;`Room.status` 不動。
   - [x] **Milestone 2.2** — No-Limit Hold'em 完整一手:自動貼盲注、preflop 開始下注輪(fold/check/call/raise/all-in)、行動順序(heads-up + 3+ 特殊 first-to-act 處理)、`toAct` set 追蹤還沒行動的人(BB 選項 + 加注重新 reopen action 都靠這個)、flop/turn/river 依 street 發公共牌 + 每街新一輪下注、只剩 1 人未 fold → fold-out 直接贏、走到 showdown → `pokersolver` 判贏、平手 pot 平分、贏家 chips 累加後 persist 到 `Membership.chipsAtTable`、環狀桌面顯示 chips/bet/dealer(D)/位置代號/active player 高亮/showdown 揭手牌 + 中文牌型(自己的手牌只在環下方 "你的手牌" 區顯示,不重複貼在座位卡)、手牌結束 8 秒倒數**純自動**開下一手(client-side,owner 端 emit,無提前按鈕;倒數 key 綁 `handNumber` 所以中途秀牌 re-emit 不會 reset)、**action timeout 設定改為 room-level**(建房 form 選一次,整局固定,`game:start` 不再帶 param → 避免每手都問玩家)、pokersolver hand `name` 送到 client 翻譯 10 種牌型為中文(皇家同花順 / 同花順 / 四條 / 葫蘆 / 同花 / 順子 / 三條 / 兩對 / 一對 / 高牌)、**即時牌型**(自己的當前最佳牌型顯示在手牌旁,每翻一張公共牌 server 重推 `game:hole`;preflop 用簡單 2-card check「一對」或「高牌」)、**動作紀錄** 側邊面板 tab(聊天 / 本手紀錄 切換);client 累積每手成 `HandRecord[]`(hand number、history、endResult),**跨手保留**在 client memory,可用「上一手 / 下一手 / 回到最新」導覽;每手手牌進行中內文隱藏、結束才展開動作 + 各街公共牌 + 攤牌/秀牌;fold-out 贏家可按「秀牌」emit `game:show-cards` 讓 server 補進 `endResult.revealedHoles` → 再廣播 `game:ended` 讓大家看到。**尚未 persist**(重整 tab 就沒了、server 也不存),未來規劃寫進雲端資料夾。**簡化**:min raise = big blind、沒有 side pot(all-in 多層時大 pot 全給高手優先,不完全準確 → 2.2c 才補)。
-  - [ ] Milestone 2.2c — Side pot(all-in 多層正確分派)
+  - [x] **Milestone 2.2c**(`54fb117`,2026-07-26)— Side pot 正確分派:`buildSidePots` 依貢獻金額分層,短籌碼 all-in 只贏他能 cover 的層,多下沒人跟的錢退回原下注者;`endWithShowdown` 逐層獨立算贏家
   - [x] **Milestone 2.4** — 行動超時 auto-action:server 每次輪到新玩家算 `deadline = now + Room.actionTimeoutSeconds*1000`,寫進 `HandState.deadline` 廣播;server 用 `setTimeout` 綁 deadline,到期沒動作就自動 check(可過的話)或 fold;client 依 deadline tick 顯示座位卡 + ActionBar 剩餘秒數(<=5s 變紅);cancel 時機:每次 action / 街轉換 / hand 結束 / 房間關 / 系統關房 |
   - [x] **Milestone 2.5** — Session 內座位/籌碼持久化 + Room.status 互鎖:
     - **`room:leave` 不 unseat**、**`disconnect` 不 unseat**(手牌中 auto-fold 靠 deadline 機制,手牌後 chipsAtTable 保留)。玩家關 tab / 換分頁 / 掉線後,座位跟 chipsAtTable 都留著,回同房會拿回原座位跟籌碼
@@ -419,16 +421,17 @@ Server(server/src/auth.ts authMiddleware):
     - `standup` 不再依賴 socket-local `seatedRoomId`,以 DB Membership 為準,支援 fresh socket 重連後站起
     - **未做**:「XX 斷線中」座位 UI 提示、mid-hand `standup` 允許(仍拒絕,要等手牌結束)
   - [x] **Milestone 2.6** — 手牌 persist 到 DB(`HandLog` model,一手一 row jsonb `HandLogData`);server 在 `broadcastAfterAction` 手牌結束後寫入,`handNumber` 由 server `countHandLogs + 1` 決定並塞進 `HandStatePublic` 避免 client 端 race;`GET /api/rooms/:id/hands` REST 供 client mount 時 fetch merge(**只保留當前房間 session 期間**);voluntary `game:show-cards` 也會 patch `handLog.data.endResult`;隱私:muck 手牌不寫進 log(照使用者選 (b) 攤牌 + 自願秀才可見);**房間關閉時**(owner close / session expired / 房間空掉自動關)`deleteHandLogsForRoom(roomId)` 整批清掉該房 log,不跨 session 累積;**雲端資料夾** (Google Drive / S3 / 檔案系統匯出)未做
-- [ ] **Phase 3** — 房間聊天升級(目前部分有;lobby chat model 要重整)
-- [ ] **Phase 4** — SNG 錦標賽(盲注升級、淘汰、獎金分配)
-- [ ] **Phase 5** — UI 打磨 + Oracle VPS 部署(Docker Compose + Caddy)
+- [ ] **Phase 3** — 房間聊天升級(lobby chat model 仍未重整;2026-07-28 加了聊天跑馬燈 §11.23,算周邊補強不算這個 Phase 完成)
+- [x] **Phase 4** — SNG 錦標賽 v1 雛形(`cda3cce`,2026-07-26)— 單桌、盲注每級 ×1.5 自動調漲、輸光即淘汰(不可 rebuy)、winner-take-all、剩 1 人自動結算。已知 v1 簡化(單桌、無獎金拆分、無延遲報名)記在 §11.20,尚未列入排程
+- [x] **Phase 5** — UI 打磨 + Oracle VPS 部署(Docker Compose + Caddy)
   - [x] 部署 artefacts:`Dockerfile.web` / `Dockerfile.server` / `docker-compose.prod.yml` / `Caddyfile` / `.env.prod.example` / `DEPLOY.md`
     - Web:multi-stage,build 時 bake `NEXT_PUBLIC_SOCKET_URL`
     - Server:直接跑 `tsx src/index.ts`(避開 workspace TS 解析),進 container 前先 `prisma db push --accept-data-loss`
     - Caddy:反向代理 `alan-holdem.duckdns.org` → `web:3000`(Next.js)+ `/socket.io/*` → `server:3001`;auto SSL(Let's Encrypt)
     - Postgres:同 network,`postgres:5432`
     - DuckDNS 更新器 sidecar 每 5 min ping token 保持 DNS
-  - [ ] **實際部署到 VM**(需 SSH 執行 `DEPLOY.md` 步驟)
+  - [x] **實際部署到 VM** — 已上線 `https://alan-holdem.duckdns.org`,持續用 §Handoff 快照的「部署更新流程」滾動更新
+  - [x] 後續打磨(未列入原始 Phase 規劃,依使用者反饋陸續加做,細節見 `CHANGELOG.md` 逐日條目):音效 cue、貼圖 reaction、聊天跑馬燈、即時戰績面板、Google Sheets 自動同步、all-in 跑池動畫、座位即時動作回饋、閒置強制站起(§11.19、§11.21–§11.28)
 
 ---
 
@@ -622,7 +625,7 @@ Header 底下一條 fixed-height(`h-6`)的跑馬燈,即時顯示 chat 訊息一�
 
 `web/lib/sound.ts` — 極簡的 audio cue player,依 event 觸發播 `deal / fold / check / call / raise / allin / street / win / myturn` 短音效。全域 localStorage 記錄 mute 狀態(header 的 `🔊/🔇` 按鈕切換),沒設定預設有聲音。
 
-- **音檔位置**:`web/public/sounds/{key}.wav`。**檔案不存在就靜音,不會壞掉任何流程** —— `Audio.play().catch(() => {})` 吞掉 404 / autoplay policy / codec 錯誤,不做 fallback。功能剛做出來那幾天(2026-07-28)這個資料夾其實是空的,音效系統本身沒問題但整個靜音——2026-07-29 補上 `web/scripts/gen-sounds.mjs` 用純 Node(無外部依賴)合成的 9 個短提示音當佔位音效(正弦波 + 淡入淡出包絡,不是真的錄音),之後要換成真的音效檔,直接覆蓋同名 `.wav` 檔即可,不用改程式碼。
+- **音檔位置**:`web/public/sounds/{key}.mp3` 優先、找不到才退回 `{key}.wav`。功能剛做出來那幾天(2026-07-28)這個資料夾其實是空的,音效系統本身沒問題但整個靜音——2026-07-29 先補上 `web/scripts/gen-sounds.mjs` 用純 Node(無外部依賴)合成的 9 個短提示音當佔位 `.wav`(正弦波 + 淡入淡出包絡,不是真的錄音)。同一天 `sound.ts` 又改寫成 `.mp3` 優先的 fallback 機制:每個 cue 用 HEAD request 先探 `.mp3`、沒有才探 `.wav`,探測結果 cache 進 `audioPool: Map<SoundCue, HTMLAudioElement | null>`(`null` = 兩種副檔名都探不到,永久靜音;探測中用 `resolvePending: Set` 去重複)——這樣從 Pixabay/Mixkit 之類的地方下載 `.mp3` 可以直接丟進資料夾覆蓋,不用 ffmpeg 轉檔也不用刪掉原本的 `.wav` 佔位檔(`.mp3` 存在就贏)。模組載入時背景探測全部 9 個 cue,所以正常情況下第一次 `playCue` 就已經是 cache hit;真的卡在探測窗口內呼叫到才會那一次靜音。**檔案不存在就靜音,不會壞掉任何流程** —— `Audio.play().catch(() => {})` 吞掉 autoplay policy / codec 錯誤。目前 `allin.wav`(真實錄音,取代原本的合成佔位)、`check.mp3`(真實錄音,贏過 `check.wav` 佔位檔)已經換成真的音效,其餘 7 個仍是合成佔位音。
 - **Autoplay policy**:iOS Safari / Chrome 都要求首次播放要在 user gesture 內。因為玩家一定會先點過「就座」或「開始牌局」等按鈕才會聽到第一個 cue,所以實際上不會被擋。真被擋的話 `.catch` 也吞掉了,不用手動 unlock。
 - **Cue 對應**:
   - `game:started` → `deal`
@@ -658,6 +661,7 @@ Header 底下一條 fixed-height(`h-6`)的跑馬燈,即時顯示 chat 訊息一�
 - 新增 `allInReveal: Map<userId, [Card,Card]>`,由 `game:allin-reveal` 整包覆蓋(立即顯示、不用動畫)。座位卡原本只有「真正攤牌後」才會顯示 `reveal`,現在多一個 fallback:沒有真正 `revealEntry` 時退回查 `allInReveal`——牌型標籤(`revealHandRank`)刻意不跟著提前顯示,留到真正攤牌才出現,前端也沒有另外算牌力。
 - 新增 `revealingSeatUserId` state:street-log 佇列處理到 `phase==='river'` 且該 entry 帶 `trailingUserId` 時設定,~1.8s 後自動清空。`SeatCard` 新增 `isRevealingRiver` prop,套用紅色邊框 + `animate-pulse`(Tailwind 內建,沒加新 CSS keyframe)+ 「翻牌中...」文字。
 - 已知簡化:重連/重整期間如果剛好錯過 `game:allin-reveal`,提前公開的手牌看不到(要等真正攤牌才看得到,跟修這個功能之前的行為一樣,不是回歸);多人平手「暫居下風」只用座位序決定顯示誰,不做並列標示。
+- **上線後修的 bug**(2026-07-29):`playNextQueuedStreet` 原本寫成 `setDisplayedCommunity(prev => [...prev, ...next.cards])`,誤把 `next.cards` 當成「這一街新翻的牌」去 append。實際上 `game:street-log` 的 `cards` 是 `hand.community.slice()`,**每次都是當下累積的完整公共牌**(flop 送 3 張、turn 送 4 張、river 送 5 張,不是新增的 1 張)——結果桌面公共牌區變成 3+4+5=12 張疊在一起(K6♦3♦ 出現三次、逐漸變長)。修法是直接 `setDisplayedCommunity(next.cards)`(取代,不是 append),跟 `game:started` 設定當下快照的語意一致。
 
 ### 11.27 座位即時動作回饋(2026-07-29)
 
