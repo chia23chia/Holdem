@@ -4,6 +4,7 @@
 
 ## 2026-07-29
 
+- **下一手自動開始倒數 8 秒 → 4 秒**:`AUTO_MS` 縮短一半,手牌結束後等比較短就自動開下一手。
 - **修正跑池公共牌疊成一長排的問題**:上線後發現逐街翻牌動畫(§11.26)桌面公共牌區會疊成 12 張(K6♦3♦ 出現三次)——`game:street-log` 的 `cards` 其實是當下累積的完整公共牌(flop 3 張、turn 4 張、river 5 張),不是新翻的那幾張,client 卻寫成 append,三街疊起來變 3+4+5=12 張。改成直接取代(跟 `game:started` 設快照同一個語意),不再 append。
 - **音效 `.mp3` 自動 fallback**:`sound.ts` 從寫死 `.wav` 改成先找 `.mp3`、找不到再退回 `.wav`(HEAD 探測結果 cache 起來)。這樣從 Pixabay/Mixkit 抓的 `.mp3` 直接丟進 `web/public/sounds/` 就會響,不用 ffmpeg 轉檔、也不用刪掉原本的 `.wav` 佔位檔(有 `.mp3` 就贏)。模組載入時對 9 個 cue 全部背景 HEAD 探一次,第一個 playCue 時已經是 cache hit,不會漏第一聲。
 - **Google Sheet 沒玩的人填 0 不填空**:先前 `appendSessionEntries` 每位玩家各自找「下一個空格」寫,結果只要有人跳過一場,他的後續紀錄就整排往左靠,對不上其他人的第 N 場(圖見討論記錄)。改成所有列先算出**共同**目標欄(取每列 lastNonEmpty+1 的最大值),沒參加的人補 0,順便把每列的**中間空格**也補成 0(修 2026-07-29 前留下的歷史錯位)。`snapshotMonthTab` 也一起改成保留欄位位置,rebuild 時新玩家的舊日期是 sessionCount 個 0(不是空白)。對 SUM 結果零影響(SUM 本來就把空格當 0)。細節見 §11.19。

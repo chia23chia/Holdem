@@ -497,7 +497,7 @@ export default function RoomPage() {
     const iAmOwner =
       !!roomOwnerId && !!currentUserId && roomOwnerId === currentUserId;
     const startTs = Date.now();
-    const AUTO_MS = 8_000;
+    const AUTO_MS = 4_000;
     setAutoNextIn(Math.ceil(AUTO_MS / 1000));
     const tick = setInterval(() => {
       const remMs = Math.max(0, AUTO_MS - (Date.now() - startTs));
