@@ -19,6 +19,7 @@ const CUE_KEYS = [
   'street',
   'win',
   'myturn',
+  'time_alert',
 ] as const;
 
 export type SoundCue = (typeof CUE_KEYS)[number];

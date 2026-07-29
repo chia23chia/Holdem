@@ -140,6 +140,8 @@ export default function RoomPage() {
   // Debounces the myturn sound to only fire on the false→true transition, so
   // re-renders while it's still my turn don't spam-play the ding.
   const prevMyTurnRef = useRef(false);
+  // Guards the session-ending time_alert cue to one shot per session.
+  const timeAlertFiredRef = useRef(false);
   // Staggered street-reveal queue (see game:street-log handler below). Plain
   // refs, not state — the setTimeout chain reads/mutates them directly and
   // re-rendering on every queue mutation would be pointless churn.
@@ -481,7 +483,24 @@ export default function RoomPage() {
     session?.user?.id,
   ]);
 
-  // After a hand ends, run an 8-second countdown visible to everyone. Only the
+  // One-shot alert when the cash-game session has ~3 minutes left, so
+  // players get a heads-up before the room auto-closes and settles.
+  // Tournaments don't use sessionEndsAt so this never fires for them.
+  // timeAlertFiredRef resets whenever sessionEndsAt itself changes (new
+  // room/session) so a later session can alert again.
+  useEffect(() => {
+    timeAlertFiredRef.current = false;
+  }, [room?.sessionEndsAt]);
+  useEffect(() => {
+    if (!room?.sessionEndsAt || timeAlertFiredRef.current) return;
+    const remainingMs = new Date(room.sessionEndsAt).getTime() - now;
+    if (remainingMs > 0 && remainingMs <= 3 * 60 * 1000) {
+      timeAlertFiredRef.current = true;
+      playCue('time_alert');
+    }
+  }, [room?.sessionEndsAt, now]);
+
+  // After a hand ends, run an AUTO_MS countdown visible to everyone. Only the
   // owner's client actually emits `game:start` on reaching 0; server pulls the
   // action timeout from the Room record (fixed at room-create for the whole session).
   // Key the effect on the ENDED hand's number so a subsequent voluntary

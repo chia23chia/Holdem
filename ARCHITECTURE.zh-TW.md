@@ -2,7 +2,7 @@
 
 Holdem 專案的深度參考文件。README 負責入門(如何啟動),本檔負責描述程式碼結構、契約與設計決策。有架構性變動(新事件、新 model、新 endpoint、新踩坑)才更新。
 
-最後更新:2026-07-29(依 CHANGELOG 同步 Handoff 快照 + Phase 進度)
+最後更新:2026-07-30(新增 time_alert 音效)
 
 ---
 
@@ -623,9 +623,9 @@ Header 底下一條 fixed-height(`h-6`)的跑馬燈,即時顯示 chat 訊息一�
 
 ### 11.24 音效 cue(2026-07-28 起)
 
-`web/lib/sound.ts` — 極簡的 audio cue player,依 event 觸發播 `deal / fold / check / call / raise / allin / street / win / myturn` 短音效。全域 localStorage 記錄 mute 狀態(header 的 `🔊/🔇` 按鈕切換),沒設定預設有聲音。
+`web/lib/sound.ts` — 極簡的 audio cue player,依 event 觸發播 `deal / fold / check / call / raise / allin / street / win / myturn / time_alert` 短音效。全域 localStorage 記錄 mute 狀態(header 的 `🔊/🔇` 按鈕切換),沒設定預設有聲音。
 
-- **音檔位置**:`web/public/sounds/{key}.mp3` 優先、找不到才退回 `{key}.wav`。功能剛做出來那幾天(2026-07-28)這個資料夾其實是空的,音效系統本身沒問題但整個靜音——2026-07-29 先補上 `web/scripts/gen-sounds.mjs` 用純 Node(無外部依賴)合成的 9 個短提示音當佔位 `.wav`(正弦波 + 淡入淡出包絡,不是真的錄音)。同一天 `sound.ts` 又改寫成 `.mp3` 優先的 fallback 機制:每個 cue 用 HEAD request 先探 `.mp3`、沒有才探 `.wav`,探測結果 cache 進 `audioPool: Map<SoundCue, HTMLAudioElement | null>`(`null` = 兩種副檔名都探不到,永久靜音;探測中用 `resolvePending: Set` 去重複)——這樣從 Pixabay/Mixkit 之類的地方下載 `.mp3` 可以直接丟進資料夾覆蓋,不用 ffmpeg 轉檔也不用刪掉原本的 `.wav` 佔位檔(`.mp3` 存在就贏)。模組載入時背景探測全部 9 個 cue,所以正常情況下第一次 `playCue` 就已經是 cache hit;真的卡在探測窗口內呼叫到才會那一次靜音。**檔案不存在就靜音,不會壞掉任何流程** —— `Audio.play().catch(() => {})` 吞掉 autoplay policy / codec 錯誤。目前 `allin.wav`(真實錄音,取代原本的合成佔位)、`check.mp3`(真實錄音,贏過 `check.wav` 佔位檔)已經換成真的音效,其餘 7 個仍是合成佔位音。
+- **音檔位置**:`web/public/sounds/{key}.mp3` 優先、找不到才退回 `{key}.wav`。功能剛做出來那幾天(2026-07-28)這個資料夾其實是空的,音效系統本身沒問題但整個靜音——2026-07-29 先補上 `web/scripts/gen-sounds.mjs` 用純 Node(無外部依賴)合成的 9 個短提示音當佔位 `.wav`(正弦波 + 淡入淡出包絡,不是真的錄音)。同一天 `sound.ts` 又改寫成 `.mp3` 優先的 fallback 機制:每個 cue 用 HEAD request 先探 `.mp3`、沒有才探 `.wav`,探測結果 cache 進 `audioPool: Map<SoundCue, HTMLAudioElement | null>`(`null` = 兩種副檔名都探不到,永久靜音;探測中用 `resolvePending: Set` 去重複)——這樣從 Pixabay/Mixkit 之類的地方下載 `.mp3` 可以直接丟進資料夾覆蓋,不用 ffmpeg 轉檔也不用刪掉原本的 `.wav` 佔位檔(`.mp3` 存在就贏)。模組載入時背景探測全部 cue,所以正常情況下第一次 `playCue` 就已經是 cache hit;真的卡在探測窗口內呼叫到才會那一次靜音。**檔案不存在就靜音,不會壞掉任何流程** —— `Audio.play().catch(() => {})` 吞掉 autoplay policy / codec 錯誤。目前 `allin.wav`、`check.mp3`、`time_alert.mp3` 是真實錄音,其餘仍是合成佔位音。
 - **Autoplay policy**:iOS Safari / Chrome 都要求首次播放要在 user gesture 內。因為玩家一定會先點過「就座」或「開始牌局」等按鈕才會聽到第一個 cue,所以實際上不會被擋。真被擋的話 `.catch` 也吞掉了,不用手動 unlock。
 - **Cue 對應**:
   - `game:started` → `deal`
@@ -633,6 +633,7 @@ Header 底下一條 fixed-height(`h-6`)的跑馬燈,即時顯示 chat 訊息一�
   - `game:street-log` 收到新的一街 → `street`(見 §11.25;不是從 `gameState.phase` 推的,同一街不會重響)
   - `game:ended` 帶 `result` → `win`
   - 自己成為當前輪次的玩家(false→true transition,靠 `prevMyTurnRef` 去抖動)→ `myturn`
+  - 現金局 session 剩餘時間 <= 3 分鐘(2026-07-30 起):`room.sessionEndsAt - now <= 3*60*1000` 時觸發一次 `time_alert`,靠 `timeAlertFiredRef` 去抖動(只播一次,直到 `sessionEndsAt` 本身變動 —— 例如新開一個 session 的房間 —— 才會重置能再播)。錦標賽房不用 `sessionEndsAt`,不會觸發。
 - **Audio pool**:每個 cue key 第一次播才 lazy new `Audio()` 存進 `audioPool: Map`,之後 rewind `currentTime = 0` 重播,不重複建立 Element。
 
 ### 11.25 All-in 提前跑完全部街時,公共牌紀錄漏掉的修復(2026-07-29)
