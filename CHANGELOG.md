@@ -4,6 +4,7 @@
 
 ## 2026-08-03
 
+- **Fix physical-roster bug + drop-user maintenance CLI**:設計上一直有個潛在 bug —— `rebuildMonthTab` / `snapshotMonthTab` 用 `fullRoster.slice(0, N_old)` 假設 tab 第 N 列對應 slot N,drop 過的 tab 就不成立(dropped slot 留下 gap,實際物理列跟 slot 序不再對齊)。今天新加的 `drop-user-from-month.ts` CLI 第一次觸發這個 bug,把 2026/08 corrupt 掉(竹北車銀優消失、加演拿到 Sheng 的 1143、slot 3 停用者拿到 北海道 的 -3010)。修法:新增 `readPhysicalRoster` 從 tab 的 column B `=人員!B<row>` 公式反解出實際 slot 順序,`rebuild` / `snapshot` / `removeUsers` 都改吃 physicalRoster。同時 `clearAllValues` 也順便補了 `userEnteredFormat` 一起清(否則 date format 會殘留讓數字顯示成日期,見 §11.19)。CLI 使用方式與 zero-sum 安全檢查見 §11.19。2026/08 已用一次性 `restore-2026-08.ts` 從 server log 印出的 pre-drop snapshot 復原完成。
 - **Google Sheet 停用玩家**:「人員」分頁加第 4 欄 `停用`,填任何非空值(`V` / `1` / `TRUE` / 勾選框皆可)就把這個玩家從**未來新建的月分頁**完全排除。已存在的月分頁不動(歷史保留),停用者的行仍在原本位置(名字改什麼就顯示什麼),沒新資料就一路 0。用途:有人退出、換帳號時,新月不再顯示他,舊月完整保留。細節見 `ARCHITECTURE.zh-TW.md` §11.29。**⚠️ 一樣不能刪「人員」的整列**(會讓所有月分頁名字公式錯位)。
 
 ## 2026-07-30

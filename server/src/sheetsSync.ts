@@ -74,10 +74,11 @@ interface ValueRange {
 async function batchGetValues(
   spreadsheetId: string,
   ranges: string[],
+  renderOption: 'UNFORMATTED_VALUE' | 'FORMULA' = 'UNFORMATTED_VALUE',
 ): Promise<ValueRange[]> {
   const qs = ranges
     .map((r) => `ranges=${encodeURIComponent(r)}`)
-    .concat('valueRenderOption=UNFORMATTED_VALUE')
+    .concat(`valueRenderOption=${renderOption}`)
     .join('&');
   const body = await sheetsRequest<{ valueRanges: ValueRange[] }>(
     `/${spreadsheetId}/values:batchGet?${qs}`,
@@ -336,17 +337,50 @@ async function writeMonthSkeleton(
   await batchUpdateValues(spreadsheetId, data);
 }
 
+// Reads the existing month tab's PHYSICAL row-to-roster mapping by parsing
+// column B's `=人員!B<row>` formulas. Necessary because after any drop the
+// physical row order no longer matches fullRoster's slot order — e.g. a
+// tab with 10 slots that had slot 3 dropped now has rows [1,2,4,5,6,7,8,
+// 9,10] in that order, while fullRoster.slice(0, 9) would give [1..9]
+// (wrong). Assuming slot order was the original bug that corrupted 2026/08.
+async function readPhysicalRoster(
+  spreadsheetId: string,
+  tabName: string,
+  N: number,
+  fullRoster: RosterEntry[],
+): Promise<RosterEntry[]> {
+  const dStart = dailyStartRow(N);
+  const dEnd = dailyEndRow(N);
+  const [vr] = await batchGetValues(
+    spreadsheetId,
+    [`${tabName}!B${dStart}:B${dEnd}`],
+    'FORMULA',
+  );
+  const rows = vr.values ?? [];
+  const bySlot = new Map(fullRoster.map((r) => [r.slot, r]));
+  return rows.slice(0, N).map((r, i) => {
+    const formula = String(r[0] ?? '');
+    // Match `=人員!B<N>` (or the actual roster sheet name). Slot = N - 1
+    // because roster has a header row at row 1.
+    const m = /!B(\d+)$/.exec(formula);
+    if (!m) throw new Error(`Row ${dStart + i}: expected =${ROSTER_SHEET}!B<n>, got "${formula}"`);
+    const slot = Number(m[1]) - 1;
+    const entry = bySlot.get(slot);
+    if (!entry) throw new Error(`Row ${dStart + i}: slot ${slot} not in roster`);
+    return entry;
+  });
+}
+
 // Creates the month's tab (leaderboard + daily-table skeleton) the first
 // time it's needed. Two roster inputs:
 // - activeRoster: roster minus 停用-flagged users. Used for FIRST-TIME
 //   creation so a stopped player never appears in a brand-new month tab.
-// - fullRoster: everyone, for existing-tab continuity (N_old rows were
-//   written using the full roster's slot order, so we must keep matching
-//   that when reading back / rebuilding, even if some of those slots are
-//   now hidden — dropping them would misalign historical data).
+// - fullRoster: everyone, needed to look up entries when parsing the
+//   existing tab's physical roster (rows may reference already-hidden
+//   users from before they were flagged).
 // If the tab already exists AND new *active* players have been added
-// beyond N_old, rebuilds in place to make room for them; a new hidden
-// player alone does NOT trigger rebuild.
+// beyond the tab's current rows, rebuilds in place to make room for them;
+// a new hidden player alone does NOT trigger rebuild.
 async function ensureMonthTab(
   spreadsheetId: string,
   tabName: string,
@@ -362,13 +396,22 @@ async function ensureMonthTab(
     let N_old = 0;
     while (N_old < names.length && names[N_old][0]) N_old += 1;
 
-    // Count NEW active players beyond N_old — hidden latecomers don't
-    // warrant a rebuild since they wouldn't have gotten a row anyway.
-    const newActive = fullRoster.slice(N_old).filter((r) => !r.hidden);
-    if (newActive.length > 0) {
-      return rebuildMonthTab(spreadsheetId, tabName, N_old, fullRoster);
+    const physicalRoster = await readPhysicalRoster(
+      spreadsheetId,
+      tabName,
+      N_old,
+      fullRoster,
+    );
+    const physicalUserIds = new Set(physicalRoster.map((r) => r.userId));
+
+    // Trigger rebuild only if there's an ACTIVE (non-hidden) roster
+    // member who isn't already in the tab. Hidden latecomers wouldn't
+    // have gotten a row so their absence is fine.
+    const missingActive = activeRoster.filter((r) => !physicalUserIds.has(r.userId));
+    if (missingActive.length > 0) {
+      return rebuildMonthTab(spreadsheetId, tabName, physicalRoster, activeRoster);
     }
-    return { N: N_old, rosterSlots: fullRoster.slice(0, N_old) };
+    return { N: N_old, rosterSlots: physicalRoster };
   }
 
   const N = activeRoster.length;
@@ -461,16 +504,16 @@ interface DateSnapshot {
 }
 
 // Reads back everything we need from an existing month tab so we can
-// replay it into a fresh layout with a larger N. Assumes the roster's
-// first N_old entries match the tab's current player row order (which is
-// true because roster is append-only and month layout uses slot order).
+// replay it into a fresh layout. Physical roster (passed in) determines
+// which userId each row maps to — do NOT assume this is fullRoster's
+// slot order (that assumption broke 2026/08 when slot 3 was dropped).
 async function snapshotMonthTab(
   spreadsheetId: string,
   tabName: string,
-  N_old: number,
-  rosterAtBuildTime: RosterEntry[],
+  physicalRoster: RosterEntry[],
 ): Promise<DateSnapshot[]> {
-  const headerRow = dailyHeaderRow(N_old);
+  const N = physicalRoster.length;
+  const headerRow = dailyHeaderRow(N);
   const [headerVR] = await batchGetValues(spreadsheetId, [
     `${tabName}!${colLetter(DAILY_DATE_FIRST_COL)}${headerRow}:${colLetter(DAILY_DATE_LAST_COL)}${headerRow}`,
   ]);
@@ -482,8 +525,8 @@ async function snapshotMonthTab(
   // Batch-read every player row of every check block in a single call.
   const ranges: string[] = [];
   for (let i = 0; i < dateSerials.length; i += 1) {
-    const blockRow = checkBlockStartRow(N_old, i);
-    for (let p = 0; p < N_old; p += 1) {
+    const blockRow = checkBlockStartRow(N, i);
+    for (let p = 0; p < N; p += 1) {
       const row = blockRow + 1 + p;
       ranges.push(
         `${tabName}!${colLetter(CHECK_ENTRY_FIRST_COL)}${row}:${colLetter(CHECK_ENTRY_LAST_COL)}${row}`,
@@ -501,8 +544,8 @@ async function snapshotMonthTab(
     // means the player skipped that session, not that they never played.
     const raw: Array<{ userId: string; cells: unknown[] }> = [];
     let sessionCount = 0;
-    for (let p = 0; p < N_old; p += 1) {
-      const userId = rosterAtBuildTime[p].userId;
+    for (let p = 0; p < N; p += 1) {
+      const userId = physicalRoster[p].userId;
       const cells = allVRs[vrIdx].values?.[0] ?? [];
       vrIdx += 1;
       let lastNonEmpty = 0;
@@ -574,17 +617,17 @@ async function bulkWriteBlockEntries(
 async function rebuildMonthTab(
   spreadsheetId: string,
   tabName: string,
-  N_old: number,
-  fullRoster: RosterEntry[],
+  physicalRoster: RosterEntry[],
+  activeRoster: RosterEntry[],
 ): Promise<MonthTab> {
-  // Preserve the N_old rows this tab already has (may include now-hidden
-  // users — dropping them retroactively would corrupt historical data),
-  // then append only NEW ACTIVE players. A hidden latecomer wouldn't
-  // trigger a rebuild in the first place, and if one somehow slips in
-  // via a same-batch registration we skip them here too.
-  const rosterAtBuildTime = fullRoster.slice(0, N_old);
-  const newActive = fullRoster.slice(N_old).filter((r) => !r.hidden);
-  const rosterSlots = [...rosterAtBuildTime, ...newActive];
+  // Preserve every row that's already physically in the tab (may include
+  // now-hidden users — dropping them retroactively would corrupt historical
+  // data), then append only the ACTIVE roster members who don't already
+  // have a row.
+  const physicalUserIds = new Set(physicalRoster.map((r) => r.userId));
+  const newActive = activeRoster.filter((r) => !physicalUserIds.has(r.userId));
+  const rosterSlots = [...physicalRoster, ...newActive];
+  const N_old = physicalRoster.length;
   const N = rosterSlots.length;
   console.warn(
     `[sheetsSync] ${tabName} rebuild: N ${N_old}→${N} (+` +
@@ -594,8 +637,7 @@ async function rebuildMonthTab(
   const dates = await snapshotMonthTab(
     spreadsheetId,
     tabName,
-    N_old,
-    rosterAtBuildTime,
+    physicalRoster,
   );
   console.warn(
     `[sheetsSync] ${tabName} pre-rebuild snapshot (` +
@@ -664,26 +706,26 @@ export async function removeUsersFromMonthTab(
   while (N_old < names.length && names[N_old][0]) N_old += 1;
   if (N_old === 0) throw new Error(`Tab ${tabName} not found or empty`);
 
-  // Match the tab's first-N_old rows to roster entries (they're in slot order).
+  // Read the tab's PHYSICAL row-to-roster mapping — NOT fullRoster's slot
+  // order, which desyncs after any drop (that assumption is what corrupted
+  // 2026/08 the first time).
   const fullRoster = await getRoster(spreadsheetId);
-  const rosterAtBuildTime = fullRoster.slice(0, N_old);
-  const rosterUserIds = new Set(rosterAtBuildTime.map((r) => r.userId));
-  for (const uid of dropSet) {
-    if (!rosterUserIds.has(uid)) {
-      throw new Error(
-        `userId ${uid} is not in ${tabName}'s first ${N_old} rows`,
-      );
-    }
-  }
-  const droppedEntries = rosterAtBuildTime.filter((r) => dropSet.has(r.userId));
-  const droppedNames = droppedEntries.map((r) => r.name);
-
-  const dates = await snapshotMonthTab(
+  const physicalRoster = await readPhysicalRoster(
     spreadsheetId,
     tabName,
     N_old,
-    rosterAtBuildTime,
+    fullRoster,
   );
+  const physicalUserIds = new Set(physicalRoster.map((r) => r.userId));
+  for (const uid of dropSet) {
+    if (!physicalUserIds.has(uid)) {
+      throw new Error(`userId ${uid} is not present in ${tabName}`);
+    }
+  }
+  const droppedEntries = physicalRoster.filter((r) => dropSet.has(r.userId));
+  const droppedNames = droppedEntries.map((r) => r.name);
+
+  const dates = await snapshotMonthTab(spreadsheetId, tabName, physicalRoster);
 
   // Zero-sum safety: check for any non-zero entry belonging to a dropped
   // user. If found and !force, refuse and list which dates + users.
@@ -700,7 +742,7 @@ export async function removeUsersFromMonthTab(
     const summary = violations
       .map((v) => {
         const name =
-          rosterAtBuildTime.find((r) => r.userId === v.userId)?.name ?? v.userId;
+          physicalRoster.find((r) => r.userId === v.userId)?.name ?? v.userId;
         return `  serial=${v.date} ${name}: [${v.nums.join(', ')}]`;
       })
       .join('\n');
@@ -752,7 +794,7 @@ export async function removeUsersFromMonthTab(
 
   await clearAllValues(spreadsheetId, tabName);
 
-  const rosterSlots = rosterAtBuildTime.filter((r) => !dropSet.has(r.userId));
+  const rosterSlots = physicalRoster.filter((r) => !dropSet.has(r.userId));
   const N = rosterSlots.length;
   const month: MonthTab = { N, rosterSlots };
   await writeMonthSkeleton(spreadsheetId, tabName, N, rosterSlots);
