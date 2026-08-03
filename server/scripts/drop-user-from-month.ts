@@ -32,18 +32,21 @@ function parseArgs(argv: string[]): {
     }
   }
   if (!month) throw new Error('--month <YYYY/MM> is required');
-  if (users.length === 0) throw new Error('at least one --user <userId> is required');
+  // No --user = "just rebuild in place" (fixes format leftovers without
+  // dropping anyone). --user can be given multiple times to drop multiple.
   return { month, users, force };
 }
 
 async function main(): Promise<void> {
   const { month, users, force } = parseArgs(process.argv.slice(2));
+  const mode = users.length === 0 ? 'rebuild-in-place' : 'drop';
   console.log(
-    `[drop-user] month=${month} users=${users.join(',')} force=${force}`,
+    `[drop-user] month=${month} mode=${mode} users=${users.join(',') || '(none)'} force=${force}`,
   );
   const result = await removeUsersFromMonthTab(month, users, { force });
+  const dropped = result.droppedNames.length > 0 ? result.droppedNames.join('、') : '(none)';
   console.log(
-    `[drop-user] done: N ${result.N_before}→${result.N_after}, removed ${result.droppedNames.join('、')}`,
+    `[drop-user] done: N ${result.N_before}→${result.N_after}, removed ${dropped}`,
   );
 }
 

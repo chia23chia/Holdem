@@ -408,32 +408,6 @@ async function lookupSheetMeta(spreadsheetId: string, tabName: string): Promise<
   return meta;
 }
 
-// One-off maintenance: reset cell-level formatting on a whole tab without
-// touching values or formulas. Fixes the "numbers displaying as dates"
-// symptom without any data risk. Column widths / sheet id / data
-// validations preserved.
-export async function resetTabFormatting(tabName: string): Promise<void> {
-  const spreadsheetId = process.env.GOOGLE_SHEETS_SPREADSHEET_ID;
-  if (!spreadsheetId || !getAuthClient()) {
-    throw new Error('Sheets sync not configured (env GOOGLE_SHEETS_*)');
-  }
-  const meta = await lookupSheetMeta(spreadsheetId, tabName);
-  await sheetsRequest(`/${spreadsheetId}:batchUpdate`, {
-    method: 'POST',
-    body: JSON.stringify({
-      requests: [
-        {
-          updateCells: {
-            range: { sheetId: meta.sheetId },
-            fields: 'userEnteredFormat',
-          },
-        },
-      ],
-    }),
-  });
-  console.warn(`[sheetsSync] ${tabName} formatting reset (values untouched)`);
-}
-
 // Inverse of sheetsDateSerial — reconstruct a Date from the numeric serial
 // we read back out of the header row. Used during replay so
 // findOrCreateDateBlock's label + serial matching stays consistent.
@@ -641,8 +615,10 @@ export async function removeUsersFromMonthTab(
   if (!spreadsheetId || !getAuthClient()) {
     throw new Error('Sheets sync not configured (env GOOGLE_SHEETS_*)');
   }
+  // Empty drop set = "just rebuild in place" — useful to fix format issues
+  // without changing content. All the snapshot/clear/rewrite/replay logic
+  // still runs, but no rows are filtered out.
   const dropSet = new Set(userIdsToDrop);
-  if (dropSet.size === 0) throw new Error('No userIds provided to drop');
 
   // Determine N_old from the tab's current row count.
   const [vr] = await batchGetValues(spreadsheetId, [`${tabName}!B2:B50`]);
