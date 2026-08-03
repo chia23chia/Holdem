@@ -562,9 +562,10 @@ DB 持久化延到 Milestone 2.5(斷線寬限)才做。
 - **寫入方式**:直接呼叫 Sheets API v4 REST(`values:batchGet`/`values:batchUpdate`),`google-auth-library` 只拿來換 access token,沒有用整包 `googleapis`。
 
 **分頁「人員」(全域,不分月)** —— 唯一的玩家身份來源:
-- 欄位:`userId | 顯示名稱 | 列位`。`列位` 是每個 userId 第一次出現時分配的固定序號,之後永不改變
+- 欄位:`userId | 顯示名稱 | 列位 | 停用`。`列位` 是每個 userId 第一次出現時分配的固定序號,之後永不改變
 - 每次結算會檢查每位玩家的 `userId`:沒登記過就 append 新列(下一個列位);已登記但顯示名稱變了(玩家在 app 內改暱稱)就更新該列的顯示名稱、列位不動 —— 所以改名不會讓歷史資料對不上人
 - 月分頁的 B 欄(玩家名)都是 `='人員'!B<row>` 公式,不是寫死字串,所以人員表改名會自動反映到所有月份
+- `停用` 欄(D)是**手動**的,填任何非空值(`V` / `1` / `TRUE` / `停用` 都可、勾選框也可)即視為停用 —— 見 §11.29
 
 **每月一個分頁**(命名 `YYYY/MM`,如 `2026/08`),結構(N = 該分頁**當前**「人員」表總人數;月中有新人加入會 rebuild,詳見下方):
 
@@ -688,6 +689,24 @@ FOLD / ALL-IN 本來就有靠 `status` 算出來的持久標籤(不受這輪動�
 - `idleStreakByRoom` / `pendingForcedStandupByRoom` 在所有既有的「房間狀態整個清掉」的地方(`finalizeRoomState`、`broadcastAfterAction` 的錦標賽結束分支、`forceStandUp` 的錦標賽結束分支、`room:close`)都比照 `pendingRebuysByRoom` 一起 `.delete(roomId)`,避免長期掛著空房間的殘留資料。
 
 **已知簡化**:被強制站起的玩家目前沒有專屬的提示訊息(例如「你因閒置太久被移出座位」)——房間的 `room:detail` 會照常廣播座位變化,前端看得到自己的座位變空,但沒有額外解釋原因;之後有需要再補。
+
+### 11.29 Google Sheet 停用玩家(2026-08-03 起)
+
+**情境**:有玩家不再參加(退出、換帳號…),需要讓他**從未來的月分頁完全消失**,同時**歷史月分頁的資料一格都不動**。
+
+**用法**:去 Google Sheet 的「人員」分頁,對想停用的那一列在 **D 欄(`停用`)** 填任何非空值(`V` / `1` / `TRUE` / `停用` / 勾選框都可),存檔就好。**不要動 A/B/C 欄,尤其不能刪整列**(刪列會讓所有月分頁的名字公式錯位,見 §11.19 開頭警告)。
+
+**Server 邏輯**(`sheetsSync.ts`):
+- `RosterEntry` 加 `hidden: boolean`,`getRoster` 讀 D 欄用 `Boolean(r[3])` 判斷(任何 truthy 都算停用)
+- `ensureRosterTab` 每次呼叫都寫一次 4 欄 header(冪等),自動 backfill `停用` 欄名到舊 sheet
+- `syncSettlementToSheet` 算出 `activeRoster = fullRoster.filter(!hidden)`,把兩個 roster 都傳給 `ensureMonthTab`
+- `ensureMonthTab`:
+  - **建新月分頁**(該月首次結算):用 `activeRoster` 當 N,停用者**完全沒有那一列**
+  - **既有月分頁**:讀 tab 的 N_old,只在有**新的未停用**玩家超過 N_old 時 rebuild(新的停用玩家不觸發 rebuild)。已存在的列**絕不縮減**——包含現在被標停用的舊玩家,他們的歷史仍完整
+- `rebuildMonthTab`:保留 N_old 原本所有列(含現在被停用的人),只 append 新的**未停用**玩家。停用者的名字在該 tab 是 `=人員!B<row>` 公式,你在人員表把他改名成什麼就顯示什麼(建議改成 `—` 或空白仍留一個字讓 N_old 偵測不誤判)
+- 停用者未來的結算:玩家不會再登入 = server 不會收到他的結算 payload = 他的列一路 0(在既有月分頁中)。新月分頁根本沒他
+
+**已知邊界**:停用者的**顯示名稱不能完全空白**——`ensureMonthTab` 讀 N_old 靠掃 B2:B50 的非空 cell,如果他的名字被改成純空白,月分頁對應列的公式會回傳空字串,N_old 計數會提前停止、後面所有列被當成不存在。改成 `—` / `已停用` 之類任何非空字串就好。
 
 ---
 

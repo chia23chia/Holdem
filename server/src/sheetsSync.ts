@@ -13,7 +13,11 @@ import type { SettlementSummary } from '@holdem/shared';
 
 const SHEETS_API = 'https://sheets.googleapis.com/v4/spreadsheets';
 const ROSTER_SHEET = '人員';
-const ROSTER_HEADER = ['userId', '顯示名稱', '列位'];
+// Column D `停用` is a manual flag — put any non-empty value in a user's D
+// cell to exclude them from NEWLY-created month tabs. Existing month tabs
+// (including the current one if already bootstrapped) still show their row
+// so historical data is never lost. See §11.29.
+const ROSTER_HEADER = ['userId', '顯示名稱', '列位', '停用'];
 
 // Check-block sub-entries live in columns E..AD (26 slots/day/player) —
 // same span as the original. Daily-table date columns live in D..AH (31
@@ -144,23 +148,27 @@ async function addTab(
 interface RosterEntry {
   userId: string;
   name: string;
-  slot: number; // 1-based, stable
+  slot: number;   // 1-based, stable
+  hidden: boolean; // manual "停用" flag in col D, see §11.29
 }
 
 async function ensureRosterTab(
   spreadsheetId: string,
   existingTabs: SheetMeta[],
 ): Promise<void> {
-  if (existingTabs.some((t) => t.title === ROSTER_SHEET)) return;
-  await addTab(spreadsheetId, ROSTER_SHEET);
+  if (!existingTabs.some((t) => t.title === ROSTER_SHEET)) {
+    await addTab(spreadsheetId, ROSTER_SHEET);
+  }
+  // Idempotent header write — cheap, and backfills the new col-D 停用
+  // header for rosters created before that column existed.
   await batchUpdateValues(spreadsheetId, [
-    { range: `${ROSTER_SHEET}!A1:C1`, values: [ROSTER_HEADER] },
+    { range: `${ROSTER_SHEET}!A1:D1`, values: [ROSTER_HEADER] },
   ]);
 }
 
 async function getRoster(spreadsheetId: string): Promise<RosterEntry[]> {
   const [vr] = await batchGetValues(spreadsheetId, [
-    `${ROSTER_SHEET}!A2:C`,
+    `${ROSTER_SHEET}!A2:D`,
   ]);
   const rows = vr.values ?? [];
   return rows
@@ -169,6 +177,9 @@ async function getRoster(spreadsheetId: string): Promise<RosterEntry[]> {
       userId: String(r[0]),
       name: String(r[1] ?? ''),
       slot: Number(r[2]),
+      // Any truthy value = hidden. Boolean(true) from a Sheets checkbox
+      // and any non-empty string ('V', '1', 'TRUE', '停用', ...) both work.
+      hidden: Boolean(r[3]),
     }))
     .sort((a, b) => a.slot - b.slot);
 }
@@ -192,11 +203,16 @@ async function registerAndSyncRoster(
   for (const p of players) {
     const existing = byUserId.get(p.userId);
     if (!existing) {
-      const entry: RosterEntry = { userId: p.userId, name: p.name, slot: nextSlot };
+      const entry: RosterEntry = {
+        userId: p.userId,
+        name: p.name,
+        slot: nextSlot,
+        hidden: false,
+      };
       nextSlot += 1;
       byUserId.set(p.userId, entry);
       roster.push(entry);
-      appends.push([entry.userId, entry.name, entry.slot]);
+      appends.push([entry.userId, entry.name, entry.slot, '']);
     } else if (existing.name !== p.name) {
       nameUpdates.push({
         range: `${ROSTER_SHEET}!B${existing.slot + 1}`,
@@ -208,7 +224,7 @@ async function registerAndSyncRoster(
 
   if (appends.length > 0) {
     await sheetsRequest(
-      `/${spreadsheetId}/values/${encodeURIComponent(`${ROSTER_SHEET}!A:C`)}:append?valueInputOption=USER_ENTERED`,
+      `/${spreadsheetId}/values/${encodeURIComponent(`${ROSTER_SHEET}!A:D`)}:append?valueInputOption=USER_ENTERED`,
       { method: 'POST', body: JSON.stringify({ values: appends }) },
     );
   }
@@ -321,15 +337,22 @@ async function writeMonthSkeleton(
 }
 
 // Creates the month's tab (leaderboard + daily-table skeleton) the first
-// time it's needed, fixed to however many players are in the roster right
-// now. If the tab already exists AND the roster has grown since it was
-// built, rebuilds in place to make room for the new players (their prior
-// dates come out empty = 0, per the user ask). Otherwise reads back N.
+// time it's needed. Two roster inputs:
+// - activeRoster: roster minus 停用-flagged users. Used for FIRST-TIME
+//   creation so a stopped player never appears in a brand-new month tab.
+// - fullRoster: everyone, for existing-tab continuity (N_old rows were
+//   written using the full roster's slot order, so we must keep matching
+//   that when reading back / rebuilding, even if some of those slots are
+//   now hidden — dropping them would misalign historical data).
+// If the tab already exists AND new *active* players have been added
+// beyond N_old, rebuilds in place to make room for them; a new hidden
+// player alone does NOT trigger rebuild.
 async function ensureMonthTab(
   spreadsheetId: string,
   tabName: string,
   existingTabs: SheetMeta[],
   fullRoster: RosterEntry[],
+  activeRoster: RosterEntry[],
 ): Promise<MonthTab> {
   const exists = existingTabs.some((t) => t.title === tabName);
 
@@ -339,14 +362,17 @@ async function ensureMonthTab(
     let N_old = 0;
     while (N_old < names.length && names[N_old][0]) N_old += 1;
 
-    if (fullRoster.length > N_old) {
+    // Count NEW active players beyond N_old — hidden latecomers don't
+    // warrant a rebuild since they wouldn't have gotten a row anyway.
+    const newActive = fullRoster.slice(N_old).filter((r) => !r.hidden);
+    if (newActive.length > 0) {
       return rebuildMonthTab(spreadsheetId, tabName, N_old, fullRoster);
     }
     return { N: N_old, rosterSlots: fullRoster.slice(0, N_old) };
   }
 
-  const N = fullRoster.length;
-  const rosterSlots = fullRoster.slice(0, N);
+  const N = activeRoster.length;
+  const rosterSlots = activeRoster;
   await addTab(spreadsheetId, tabName);
   await writeMonthSkeleton(spreadsheetId, tabName, N, rosterSlots);
   return { N, rosterSlots };
@@ -493,11 +519,18 @@ async function rebuildMonthTab(
   N_old: number,
   fullRoster: RosterEntry[],
 ): Promise<MonthTab> {
-  const N = fullRoster.length;
+  // Preserve the N_old rows this tab already has (may include now-hidden
+  // users — dropping them retroactively would corrupt historical data),
+  // then append only NEW ACTIVE players. A hidden latecomer wouldn't
+  // trigger a rebuild in the first place, and if one somehow slips in
+  // via a same-batch registration we skip them here too.
   const rosterAtBuildTime = fullRoster.slice(0, N_old);
+  const newActive = fullRoster.slice(N_old).filter((r) => !r.hidden);
+  const rosterSlots = [...rosterAtBuildTime, ...newActive];
+  const N = rosterSlots.length;
   console.warn(
-    `[sheetsSync] ${tabName} rebuild: N ${N_old}→${N} (` +
-      `${fullRoster.slice(N_old).map((r) => r.name).join('、')})`,
+    `[sheetsSync] ${tabName} rebuild: N ${N_old}→${N} (+` +
+      `${newActive.map((r) => r.name).join('、')})`,
   );
 
   const dates = await snapshotMonthTab(
@@ -519,7 +552,6 @@ async function rebuildMonthTab(
 
   await clearAllValues(spreadsheetId, tabName);
 
-  const rosterSlots = fullRoster.slice();
   const month: MonthTab = { N, rosterSlots };
   await writeMonthSkeleton(spreadsheetId, tabName, N, rosterSlots);
 
@@ -679,7 +711,16 @@ export async function syncSettlementToSheet(
   const tabsAfterRoster = tabs.some((t) => t.title === ROSTER_SHEET)
     ? tabs
     : await listTabs(spreadsheetId);
-  const month = await ensureMonthTab(spreadsheetId, tabName, tabsAfterRoster, fullRoster);
+  // 停用-flagged users are excluded from NEW month tab creation only.
+  // Existing tabs keep their rows (fullRoster passed for continuity).
+  const activeRoster = fullRoster.filter((r) => !r.hidden);
+  const month = await ensureMonthTab(
+    spreadsheetId,
+    tabName,
+    tabsAfterRoster,
+    fullRoster,
+    activeRoster,
+  );
 
   // ensureMonthTab guarantees month.rosterSlots contains every roster entry
   // (auto-rebuilds if the roster grew since the tab was first written), so
