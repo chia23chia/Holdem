@@ -385,9 +385,7 @@ async function ensureMonthTab(
 // format) still shows dates even after being overwritten with a numeric
 // SUM formula — that's the "1258 → 6/11" bug we hit during drop-user.
 async function clearAllValues(spreadsheetId: string, tabName: string): Promise<void> {
-  const tabs = await listTabs(spreadsheetId);
-  const meta = tabs.find((t) => t.title === tabName);
-  if (!meta) throw new Error(`Cannot clear ${tabName}: tab not found`);
+  const meta = await lookupSheetMeta(spreadsheetId, tabName);
   await sheetsRequest(`/${spreadsheetId}:batchUpdate`, {
     method: 'POST',
     body: JSON.stringify({
@@ -401,6 +399,39 @@ async function clearAllValues(spreadsheetId: string, tabName: string): Promise<v
       ],
     }),
   });
+}
+
+async function lookupSheetMeta(spreadsheetId: string, tabName: string): Promise<SheetMeta> {
+  const tabs = await listTabs(spreadsheetId);
+  const meta = tabs.find((t) => t.title === tabName);
+  if (!meta) throw new Error(`Tab ${tabName} not found`);
+  return meta;
+}
+
+// One-off maintenance: reset cell-level formatting on a whole tab without
+// touching values or formulas. Fixes the "numbers displaying as dates"
+// symptom without any data risk. Column widths / sheet id / data
+// validations preserved.
+export async function resetTabFormatting(tabName: string): Promise<void> {
+  const spreadsheetId = process.env.GOOGLE_SHEETS_SPREADSHEET_ID;
+  if (!spreadsheetId || !getAuthClient()) {
+    throw new Error('Sheets sync not configured (env GOOGLE_SHEETS_*)');
+  }
+  const meta = await lookupSheetMeta(spreadsheetId, tabName);
+  await sheetsRequest(`/${spreadsheetId}:batchUpdate`, {
+    method: 'POST',
+    body: JSON.stringify({
+      requests: [
+        {
+          updateCells: {
+            range: { sheetId: meta.sheetId },
+            fields: 'userEnteredFormat',
+          },
+        },
+      ],
+    }),
+  });
+  console.warn(`[sheetsSync] ${tabName} formatting reset (values untouched)`);
 }
 
 // Inverse of sheetsDateSerial — reconstruct a Date from the numeric serial
