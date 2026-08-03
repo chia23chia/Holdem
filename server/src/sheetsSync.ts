@@ -575,6 +575,144 @@ async function rebuildMonthTab(
   return month;
 }
 
+// One-off maintenance: physically remove specific userIds' rows from an
+// existing month tab (not just hide via 停用 — that only affects NEW tabs,
+// see §11.29). Reuses the same snapshot/clear/rewrite/replay path as
+// rebuildMonthTab, but shrinks the roster instead of growing it.
+//
+// Safety: refuses to drop any user who has a non-zero entry on any date
+// in this tab, because zero-sum would break (they took/gave chips to real
+// players — removing them silently re-writes history). Pass `force: true`
+// to override. Non-zero warnings are per-date so the caller can see which
+// dates would be affected.
+export async function removeUsersFromMonthTab(
+  tabName: string,
+  userIdsToDrop: string[],
+  opts: { force?: boolean } = {},
+): Promise<{ N_before: number; N_after: number; droppedNames: string[] }> {
+  const spreadsheetId = process.env.GOOGLE_SHEETS_SPREADSHEET_ID;
+  if (!spreadsheetId || !getAuthClient()) {
+    throw new Error('Sheets sync not configured (env GOOGLE_SHEETS_*)');
+  }
+  const dropSet = new Set(userIdsToDrop);
+  if (dropSet.size === 0) throw new Error('No userIds provided to drop');
+
+  // Determine N_old from the tab's current row count.
+  const [vr] = await batchGetValues(spreadsheetId, [`${tabName}!B2:B50`]);
+  const names = vr.values ?? [];
+  let N_old = 0;
+  while (N_old < names.length && names[N_old][0]) N_old += 1;
+  if (N_old === 0) throw new Error(`Tab ${tabName} not found or empty`);
+
+  // Match the tab's first-N_old rows to roster entries (they're in slot order).
+  const fullRoster = await getRoster(spreadsheetId);
+  const rosterAtBuildTime = fullRoster.slice(0, N_old);
+  const rosterUserIds = new Set(rosterAtBuildTime.map((r) => r.userId));
+  for (const uid of dropSet) {
+    if (!rosterUserIds.has(uid)) {
+      throw new Error(
+        `userId ${uid} is not in ${tabName}'s first ${N_old} rows`,
+      );
+    }
+  }
+  const droppedEntries = rosterAtBuildTime.filter((r) => dropSet.has(r.userId));
+  const droppedNames = droppedEntries.map((r) => r.name);
+
+  const dates = await snapshotMonthTab(
+    spreadsheetId,
+    tabName,
+    N_old,
+    rosterAtBuildTime,
+  );
+
+  // Zero-sum safety: check for any non-zero entry belonging to a dropped
+  // user. If found and !force, refuse and list which dates + users.
+  const violations: Array<{ date: number; userId: string; nums: number[] }> = [];
+  for (const d of dates) {
+    for (const uid of dropSet) {
+      const nums = d.entriesByUserId.get(uid) ?? [];
+      if (nums.some((n) => n !== 0)) {
+        violations.push({ date: d.serial, userId: uid, nums });
+      }
+    }
+  }
+  if (violations.length > 0 && !opts.force) {
+    const summary = violations
+      .map((v) => {
+        const name =
+          rosterAtBuildTime.find((r) => r.userId === v.userId)?.name ?? v.userId;
+        return `  serial=${v.date} ${name}: [${v.nums.join(', ')}]`;
+      })
+      .join('\n');
+    throw new Error(
+      `Dropping these users would break zero-sum on some dates:\n${summary}\n` +
+        `Re-run with force:true to proceed anyway.`,
+    );
+  }
+
+  console.warn(
+    `[sheetsSync] ${tabName} drop-users: N ${N_old}→${N_old - dropSet.size} (` +
+      `removing ${droppedNames.join('、')})`,
+  );
+  console.warn(
+    `[sheetsSync] ${tabName} pre-drop snapshot: ` +
+      JSON.stringify(
+        dates.map((d) => ({
+          serial: d.serial,
+          entries: Object.fromEntries(d.entriesByUserId),
+        })),
+      ),
+  );
+
+  // Filter each date's entries to drop the target users. Also recompute
+  // row width from the remaining rows' non-zero extent — a dropped user's
+  // trailing 0-padding shouldn't inflate width in the rebuilt tab. Dates
+  // where nothing non-zero remains get skipped entirely (would just be an
+  // empty column that adds noise).
+  const filteredDates = dates
+    .map((d) => {
+      const kept = new Map(
+        [...d.entriesByUserId.entries()].filter(([uid]) => !dropSet.has(uid)),
+      );
+      let maxLen = 0;
+      for (const nums of kept.values()) {
+        for (let i = nums.length - 1; i >= 0; i -= 1) {
+          if (nums[i] !== 0) {
+            if (i + 1 > maxLen) maxLen = i + 1;
+            break;
+          }
+        }
+      }
+      const trimmed = new Map(
+        [...kept.entries()].map(([uid, nums]) => [uid, nums.slice(0, maxLen)]),
+      );
+      return { serial: d.serial, entriesByUserId: trimmed, width: maxLen };
+    })
+    .filter((d) => d.width > 0);
+
+  await clearAllValues(spreadsheetId, tabName);
+
+  const rosterSlots = rosterAtBuildTime.filter((r) => !dropSet.has(r.userId));
+  const N = rosterSlots.length;
+  const month: MonthTab = { N, rosterSlots };
+  await writeMonthSkeleton(spreadsheetId, tabName, N, rosterSlots);
+
+  for (const d of filteredDates) {
+    const date = dateFromSerial(d.serial);
+    const blockRow = await findOrCreateDateBlock(spreadsheetId, tabName, month, date);
+    await bulkWriteBlockEntries(
+      spreadsheetId,
+      tabName,
+      blockRow,
+      month.rosterSlots,
+      d.entriesByUserId,
+    );
+  }
+
+  console.warn(`[sheetsSync] ${tabName} drop-users done`);
+  return { N_before: N_old, N_after: N, droppedNames };
+}
+
 // Finds today's check-block if it already exists (another settlement
 // earlier today), otherwise creates it — including wiring the new date
 // column into the daily table. Returns the block's header row.
