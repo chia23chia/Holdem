@@ -378,13 +378,29 @@ async function ensureMonthTab(
   return { N, rosterSlots };
 }
 
-// Wipes VALUES ONLY (formatting, column widths, sheet id preserved). Used
-// before rebuild so cell formatting the users care about survives.
+// Wipes values AND cell formatting for the tab (column widths + sheetId
+// preserved). Used before rebuild — clearing FORMAT too is important:
+// values:clear alone preserves numberFormat, so a cell that used to be
+// the daily-table date header (which parses as a date and gets date
+// format) still shows dates even after being overwritten with a numeric
+// SUM formula — that's the "1258 → 6/11" bug we hit during drop-user.
 async function clearAllValues(spreadsheetId: string, tabName: string): Promise<void> {
-  await sheetsRequest(
-    `/${spreadsheetId}/values/${encodeURIComponent(tabName)}:clear`,
-    { method: 'POST' },
-  );
+  const tabs = await listTabs(spreadsheetId);
+  const meta = tabs.find((t) => t.title === tabName);
+  if (!meta) throw new Error(`Cannot clear ${tabName}: tab not found`);
+  await sheetsRequest(`/${spreadsheetId}:batchUpdate`, {
+    method: 'POST',
+    body: JSON.stringify({
+      requests: [
+        {
+          updateCells: {
+            range: { sheetId: meta.sheetId },
+            fields: 'userEnteredValue,userEnteredFormat',
+          },
+        },
+      ],
+    }),
+  });
 }
 
 // Inverse of sheetsDateSerial — reconstruct a Date from the numeric serial
