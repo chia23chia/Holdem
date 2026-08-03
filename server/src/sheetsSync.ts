@@ -408,6 +408,43 @@ async function lookupSheetMeta(spreadsheetId: string, tabName: string): Promise<
   return meta;
 }
 
+// One-off recovery: force-write a specific month tab from an explicit
+// {userId → per-session values} map for a single date. Everything is
+// rewritten from scratch — used when the tab got corrupted (e.g. a bad
+// rebuild misassigned data to wrong rows) and we have the correct data
+// in-hand from a prior log. Uses the current activeRoster (人員 filtered
+// by 停用) as the row layout; userIds not in the roster are ignored.
+export async function restoreMonthTab(
+  tabName: string,
+  dateData: { dateSerial: number; entriesByUserId: Map<string, number[]> },
+): Promise<void> {
+  const spreadsheetId = process.env.GOOGLE_SHEETS_SPREADSHEET_ID;
+  if (!spreadsheetId || !getAuthClient()) {
+    throw new Error('Sheets sync not configured (env GOOGLE_SHEETS_*)');
+  }
+  const fullRoster = await getRoster(spreadsheetId);
+  const rosterSlots = fullRoster.filter((r) => !r.hidden);
+  const N = rosterSlots.length;
+  console.warn(
+    `[sheetsSync] ${tabName} RESTORE: N=${N}, date serial=${dateData.dateSerial}, ` +
+      `entries=${JSON.stringify([...dateData.entriesByUserId.entries()])}`,
+  );
+
+  await clearAllValues(spreadsheetId, tabName);
+  const month: MonthTab = { N, rosterSlots };
+  await writeMonthSkeleton(spreadsheetId, tabName, N, rosterSlots);
+  const date = dateFromSerial(dateData.dateSerial);
+  const blockRow = await findOrCreateDateBlock(spreadsheetId, tabName, month, date);
+  await bulkWriteBlockEntries(
+    spreadsheetId,
+    tabName,
+    blockRow,
+    month.rosterSlots,
+    dateData.entriesByUserId,
+  );
+  console.warn(`[sheetsSync] ${tabName} RESTORE done`);
+}
+
 // Inverse of sheetsDateSerial — reconstruct a Date from the numeric serial
 // we read back out of the header row. Used during replay so
 // findOrCreateDateBlock's label + serial matching stays consistent.
