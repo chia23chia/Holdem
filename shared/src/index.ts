@@ -303,14 +303,18 @@ export interface ChatMessage {
 // is shared so the picker options and the server-side validator stay in
 // lockstep — sending anything not in this list is dropped.
 export const STICKER_EMOJIS = [
-  '👍',
-  '😂',
-  '🎉',
-  '🙈',
   '💩',
   '🔥',
-  '❤️',
-  '😱',
+  '🧯',
+  '🫢',
+  '🤫',
+  '😘',
+  '🤏',
+  '👋',
+  '♠️',
+  '♣️',
+  '♥️',
+  '♦️'
 ] as const;
 export type StickerEmoji = (typeof STICKER_EMOJIS)[number];
 
