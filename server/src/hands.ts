@@ -423,12 +423,21 @@ export function applyAction(
 
   // Build log entry BEFORE advancing (which might change hand.phase).
   const amountAdded = cur.bet - betBefore; // chips actually put in this action
+  // If a call/raise put the player at 0 chips, log as 'all-in' instead of
+  // the raw action type — that way client audio + history reflect "went
+  // all-in" regardless of which button the player used to get there.
+  // (Fold never commits chips; explicit 'all-in' stays 'all-in'.)
+  // Re-read status via array — TS narrows `cur.status` to exclude 'all-in'
+  // after the switch above (doesn't see commitBet mutating it).
+  const finalStatus = hand.players[hand.currentPlayerIdx].status;
+  const effectiveActionType: AppliedActionLog['actionType'] =
+    finalStatus === 'all-in' ? 'all-in' : action.type;
   const log: AppliedActionLog = {
     seat: logSeat,
     userId,
     name: logName,
     phase: logPhase,
-    actionType: action.type,
+    actionType: effectiveActionType,
     amount: amountAdded > 0 ? amountAdded : undefined,
   };
   // Persist into the hand's own history (for HandLog snapshot at end).
@@ -439,7 +448,7 @@ export function applyAction(
       seat: logSeat,
       name: logName,
       phase: logPhase,
-      actionType: action.type,
+      actionType: effectiveActionType,
       amount: amountAdded > 0 ? amountAdded : undefined,
       ts: Date.now(),
     },
