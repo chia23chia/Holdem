@@ -140,6 +140,10 @@ export default function RoomPage() {
   // Debounces the myturn sound to only fire on the false→true transition, so
   // re-renders while it's still my turn don't spam-play the ding.
   const prevMyTurnRef = useRef(false);
+  // Tracks currentTurnExtended false→true transition so the timebank cue
+  // plays for everyone once per activation (not on every game:state during
+  // the extended window).
+  const prevTurnExtendedRef = useRef(false);
   // Guards the session-ending time_alert cue to one shot per session.
   const timeAlertFiredRef = useRef(false);
   // Staggered street-reveal queue (see game:street-log handler below). Plain
@@ -483,6 +487,17 @@ export default function RoomPage() {
     session?.user?.id,
   ]);
 
+  // Time bank activation: play a public cue for everyone in the room on the
+  // currentTurnExtended false→true edge. Fires exactly once per activation
+  // (turn advance resets the flag, so the next transition is a distinct edge).
+  useEffect(() => {
+    const nowExtended = !!gameState?.currentTurnExtended;
+    if (nowExtended && !prevTurnExtendedRef.current) {
+      playCue('timebank');
+    }
+    prevTurnExtendedRef.current = nowExtended;
+  }, [gameState?.currentTurnExtended]);
+
   // One-shot alert when the cash-game session has ~3 minutes left, so
   // players get a heads-up before the room auto-closes and settles.
   // Tournaments don't use sessionEndsAt so this never fires for them.
@@ -649,6 +664,14 @@ export default function RoomPage() {
     if (!socketRef.current || !roomId) return;
     setError(null);
     socketRef.current.emit('game:action', { roomId, action }, (res) => {
+      if (!res.ok) setError(res.error);
+    });
+  }
+
+  function handleTimeBank() {
+    if (!socketRef.current || !roomId) return;
+    setError(null);
+    socketRef.current.emit('game:time-bank', { roomId }, (res) => {
       if (!res.ok) setError(res.error);
     });
   }
@@ -996,6 +1019,8 @@ export default function RoomPage() {
                               )
                             : null
                         }
+                        timeBankMs={handPlayer?.timeBankMs}
+                        extended={isActive && !!gameState?.currentTurnExtended}
                       />
                     ) : (
                       <button
@@ -1087,6 +1112,7 @@ export default function RoomPage() {
                     )
                   : null
               }
+              extended={!!gameState.currentTurnExtended}
               currentBet={gameState.currentBet}
               minRaise={gameState.minRaise}
               pot={gameState.pot}
@@ -1157,6 +1183,25 @@ export default function RoomPage() {
           )}
         </section>
       </div>
+
+      {/* Time-bank extend button — floats bottom-center only when you have
+          ≤5 seconds left on your turn, haven't already extended, and your
+          bank has time available. Purposefully separate from the ActionBar
+          so it's a distinct visual event, not a normal action. */}
+      {itsMyTurn &&
+        gameState &&
+        myHandPlayer &&
+        gameState.deadline &&
+        !gameState.currentTurnExtended &&
+        myHandPlayer.timeBankMs > 0 &&
+        Math.ceil((gameState.deadline - now) / 1000) <= 5 && (
+          <button
+            onClick={handleTimeBank}
+            className="fixed bottom-24 left-1/2 z-30 -translate-x-1/2 animate-pulse rounded-full border-2 border-purple-400 bg-purple-950 px-6 py-3 text-base font-bold text-purple-100 shadow-xl hover:bg-purple-900 sm:bottom-20"
+          >
+            ⚡ 延時({Math.min(30, Math.ceil(myHandPlayer.timeBankMs / 1000))}s)
+          </button>
+        )}
 
       {/* Sticker FAB — always visible; on mobile sits next to the chat FAB */}
       <div className="fixed bottom-4 right-4 z-30 flex flex-col items-end gap-2">
@@ -1754,6 +1799,8 @@ function SeatCard({
   reveal,
   revealHandRank,
   secondsLeft,
+  timeBankMs,
+  extended,
 }: {
   seatNum: number;
   name: string;
@@ -1770,6 +1817,13 @@ function SeatCard({
   reveal: [Card, Card] | null;
   revealHandRank: string | null;
   secondsLeft: number | null;
+  // Time bank remaining for this player (ms). Undefined = no active hand,
+  // don't render the TB indicator.
+  timeBankMs?: number;
+  // True when this player has activated their time bank on the CURRENT
+  // turn — timer display switches to purple to signal it's the extended
+  // portion, not the base window.
+  extended?: boolean;
 }) {
   const isFolded = status === 'folded';
   const isAllIn = status === 'all-in';
@@ -1851,13 +1905,26 @@ function SeatCard({
           {chineseHandRank(revealHandRank)}
         </div>
       )}
+      {typeof timeBankMs === 'number' && !eliminated && !isFolded && (
+        <div
+          className={`text-[9px] sm:text-[10px] ${
+            timeBankMs === 0 ? 'text-slate-600' : 'text-slate-500'
+          }`}
+        >
+          TB {Math.ceil(timeBankMs / 1000)}s
+        </div>
+      )}
       {typeof secondsLeft === 'number' && (
         <div
           className={`mt-0.5 text-[10px] font-bold sm:text-xs ${
-            secondsLeft <= 5 ? 'text-red-400' : 'text-amber-300'
+            extended
+              ? 'text-purple-300'
+              : secondsLeft <= 5
+                ? 'text-red-400'
+                : 'text-amber-300'
           }`}
         >
-          ⏱ {secondsLeft}s
+          {extended ? '⚡' : '⏱'} {secondsLeft}s
         </div>
       )}
     </div>
@@ -1866,6 +1933,7 @@ function SeatCard({
 
 function ActionBar({
   secondsLeft,
+  extended,
   currentBet,
   minRaise,
   pot,
@@ -1874,6 +1942,9 @@ function ActionBar({
   onAction,
 }: {
   secondsLeft: number | null;
+  // True after the player pressed 延時 on this turn — just changes color
+  // to signal the countdown is now in extended-time territory.
+  extended: boolean;
   currentBet: number;
   minRaise: number;
   pot: number;
@@ -1890,11 +1961,17 @@ function ActionBar({
   return (
     <div className="mt-4 rounded border border-slate-700 bg-slate-950 p-3">
       <div className="mb-2 flex items-center justify-between text-xs">
-        <span className="text-amber-300">輪到你行動</span>
+        <span className={extended ? 'font-bold text-purple-300' : 'text-amber-300'}>
+          {extended ? '⚡ 時間銀行' : '輪到你行動'}
+        </span>
         {typeof secondsLeft === 'number' && (
           <span
             className={`font-bold ${
-              secondsLeft <= 5 ? 'text-red-400' : 'text-amber-300'
+              extended
+                ? 'text-purple-300'
+                : secondsLeft <= 5
+                  ? 'text-red-400'
+                  : 'text-amber-300'
             }`}
           >
             剩 {secondsLeft}s

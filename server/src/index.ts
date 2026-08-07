@@ -38,6 +38,7 @@ import {
 } from './tournament.js';
 import {
   applyAction,
+  extendCurrentTurn,
   applyReveal,
   buildHandLogData,
   chipsSnapshot,
@@ -365,7 +366,7 @@ async function broadcastAfterAction(
       });
     }
   }
-  io.to(roomChannel(roomId)).emit('game:state', toPublicState(hand));
+  io.to(roomChannel(roomId)).emit('game:state', toPublicState(hand, roomId));
 
   // Below this point, every step is wrapped individually: a transient
   // failure (DB hiccup, slow socket under lag, etc.) in any one of them must
@@ -557,7 +558,7 @@ async function startHandForRoom(roomId: string): Promise<StartHandOutcome> {
   await broadcastRoomDetail(roomId);
 
   // Public state → all subscribers (players + spectators).
-  io.to(roomChannel(roomId)).emit('game:started', toPublicState(hand));
+  io.to(roomChannel(roomId)).emit('game:started', toPublicState(hand, roomId));
 
   // Edge case: extremely short-stacked blinds can put the hand all-in before
   // anyone acts, so startHand's internal maybeAdvanceIfNoAction may already
@@ -626,7 +627,7 @@ io.on('connection', (socket) => {
     // Catch up newly-subscribed client to any hand already in memory.
     const hand = getHand(roomId);
     if (hand) {
-      socket.emit('game:started', toPublicState(hand));
+      socket.emit('game:started', toPublicState(hand, roomId));
       const priv = getPrivateFor(hand, user.userId);
       if (priv) socket.emit('game:hole', priv);
       if (hand.phase === 'ended') {
@@ -774,6 +775,23 @@ io.on('connection', (socket) => {
       historyLenBefore,
       hadAllInReveal,
     );
+  });
+
+  socket.on('game:time-bank', async ({ roomId }, cb) => {
+    const outcome = extendCurrentTurn(roomId, user.userId);
+    if (!outcome.ok) return cb({ ok: false, error: outcome.error });
+    cb({ ok: true });
+    // Pressing the extend button counts as active engagement — clears any
+    // idle streak they've built up (parity with `game:action`).
+    resetIdleStreak(roomId, user.userId);
+    // Deadline moved out, so the existing auto-action timer needs to be
+    // rescheduled to the new deadline; then broadcast the updated state
+    // so every client sees the timer jump + the button hide.
+    rescheduleAutoAction(roomId);
+    const hand = getHand(roomId);
+    if (hand) {
+      io.to(roomChannel(roomId)).emit('game:state', toPublicState(hand, roomId));
+    }
   });
 
   // Voluntary reveal — any player still recorded in this ended hand.

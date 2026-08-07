@@ -2,6 +2,10 @@
 
 所有值得記錄的變動都記在這裡,新的在最上面。日期是 commit 當天(UTC+8),不是嚴格的版本號。
 
+## 2026-08-07
+
+- **Time bank(時間銀行)**:每位玩家有一份 **60 秒**個人時間銀行,基本時間**不會自動延伸**——剩 ≤5 秒時螢幕會浮出「⚡ 延時」按鈕,按下去 deadline 加 `min(30 秒, 剩餘 bank)`,同一 turn 只能按一次。沒按就照舊到時間 auto-fold/check。全站固定 60 秒(不在建房 UI 開設定)、不回補(只有房間結束才歸零)、跨手保留、現金局跟錦標賽規則一樣。跟 §11.28 閒置強制站起相容(按延時算作互動,會 reset idle streak)。細節見 `ARCHITECTURE.zh-TW.md` §11.30。
+
 ## 2026-08-03
 
 - **Fix physical-roster bug + drop-user maintenance CLI**:設計上一直有個潛在 bug —— `rebuildMonthTab` / `snapshotMonthTab` 用 `fullRoster.slice(0, N_old)` 假設 tab 第 N 列對應 slot N,drop 過的 tab 就不成立(dropped slot 留下 gap,實際物理列跟 slot 序不再對齊)。今天新加的 `drop-user-from-month.ts` CLI 第一次觸發這個 bug,把 2026/08 corrupt 掉(竹北車銀優消失、加演拿到 Sheng 的 1143、slot 3 停用者拿到 北海道 的 -3010)。修法:新增 `readPhysicalRoster` 從 tab 的 column B `=人員!B<row>` 公式反解出實際 slot 順序,`rebuild` / `snapshot` / `removeUsers` 都改吃 physicalRoster。同時 `clearAllValues` 也順便補了 `userEnteredFormat` 一起清(否則 date format 會殘留讓數字顯示成日期,見 §11.19)。CLI 使用方式與 zero-sum 安全檢查見 §11.19。2026/08 已用一次性 `restore-2026-08.ts` 從 server log 印出的 pre-drop snapshot 復原完成。

@@ -28,6 +28,9 @@ export interface HandPlayerPublic {
   bet: number;      // Chips committed THIS betting round
   totalBet: number; // Chips committed THIS entire hand (all rounds)
   status: 'active' | 'folded' | 'all-in';
+  // Personal time bank remaining (ms). Refills only on room close — once
+  // it hits 0 the player is stuck with the base action timer. See §11.30.
+  timeBankMs: number;
 }
 
 // Public state visible to every subscriber of the room.
@@ -42,6 +45,11 @@ export interface HandStatePublic {
   currentPlayerSeat: number | null; // Whose turn; null when hand ended / everyone all-in
   actionTimeoutSeconds: number;
   deadline: number | null;  // Epoch ms when current player's action expires; null when no turn
+  // True once the current player has activated their time bank on THIS
+  // turn (only one activation per turn). Reset when the turn advances.
+  // Used by the client to hide the "延長" button after it's been used.
+  // See §11.30.
+  currentTurnExtended: boolean;
   players: HandPlayerPublic[];      // Ordered by seat ascending
 }
 
@@ -391,6 +399,13 @@ export interface ClientToServerEvents {
   ) => void;
   // Fold-out winner can voluntarily reveal their hole cards to the room.
   'game:show-cards': (data: { roomId: string }) => void;
+  // Current player manually activates their time bank on this turn —
+  // extends the deadline by min(30s, remainingBank), deducts the same
+  // from bank. One activation per turn max. See §11.30.
+  'game:time-bank': (
+    data: { roomId: string },
+    cb: (res: GameActionResult) => void,
+  ) => void;
 }
 
 export type JoinRoomResult =

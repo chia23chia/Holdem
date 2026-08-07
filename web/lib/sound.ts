@@ -20,6 +20,7 @@ const CUE_KEYS = [
   'win',
   'myturn',
   'time_alert',
+  'timebank',
 ] as const;
 
 export type SoundCue = (typeof CUE_KEYS)[number];

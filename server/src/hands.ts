@@ -49,6 +49,10 @@ interface HandState {
   toAct: Set<number>;
   actionTimeoutSeconds: number;
   deadline: number | null; // Epoch ms; null when no current turn (ended / all-in)
+  // True once the CURRENT player has activated their time bank on this
+  // turn (max one activation per turn). Reset to false in refreshDeadline
+  // whenever the turn advances.
+  currentTurnExtended: boolean;
   endResult: HandEndResult | null;
   startedAt: number;       // Epoch ms — hand start time for HandLog
   history: HandHistoryEntry[]; // Accumulated log for persistence
@@ -60,13 +64,80 @@ interface HandState {
   allInRevealPayload?: Array<{ userId: string; name: string; holeCards: [Card, Card] }>;
 }
 
-// Recompute deadline based on current turn. Call after every mutation that
-// might change currentPlayerIdx.
+// Per-player time bank (see §11.30). Persists across hands within a room —
+// once used up, that's it for the session. Cleared on room close alongside
+// hand state. In-memory only.
+export const TIME_BANK_INITIAL_MS = 60_000;
+// Cap on how much bank a single activation can spend. Bank total may be
+// more; player just can't dump all of it into one decision.
+export const TIME_BANK_MAX_EXTEND_MS = 30_000;
+const timeBankByRoom = new Map<string, Map<string, number>>();
+
+export function getTimeBank(roomId: string, userId: string): number {
+  return timeBankByRoom.get(roomId)?.get(userId) ?? TIME_BANK_INITIAL_MS;
+}
+
+function setTimeBank(roomId: string, userId: string, ms: number): void {
+  let room = timeBankByRoom.get(roomId);
+  if (!room) {
+    room = new Map();
+    timeBankByRoom.set(roomId, room);
+  }
+  room.set(userId, Math.max(0, ms));
+}
+
+// Recompute deadline based on current turn — base timeout only, NO time
+// bank auto-added. Bank is only spent via explicit extendCurrentTurn.
+// Called after every mutation that might change currentPlayerIdx; also
+// resets currentTurnExtended so the new player gets a fresh chance to
+// use their bank this turn.
 function refreshDeadline(hand: HandState): void {
-  hand.deadline =
-    hand.currentPlayerIdx !== null && hand.phase !== 'ended'
-      ? Date.now() + hand.actionTimeoutSeconds * 1000
-      : null;
+  if (hand.currentPlayerIdx === null || hand.phase === 'ended') {
+    hand.deadline = null;
+    hand.currentTurnExtended = false;
+    return;
+  }
+  hand.deadline = Date.now() + hand.actionTimeoutSeconds * 1000;
+  hand.currentTurnExtended = false;
+}
+
+// Manual time-bank activation. Extends the current turn's deadline by
+// min(TIME_BANK_MAX_EXTEND_MS, remainingBank), deducts the same from the
+// player's bank, sets currentTurnExtended so the button won't reappear
+// for this turn. Callers should reschedule the auto-action timer after
+// this returns ok:true (deadline moved out).
+export type ExtendTimeBankOutcome =
+  | { ok: true; addedMs: number; newDeadline: number; remainingBankMs: number }
+  | { ok: false; error: string };
+
+export function extendCurrentTurn(
+  roomId: string,
+  userId: string,
+): ExtendTimeBankOutcome {
+  const hand = hands.get(roomId);
+  if (!hand) return { ok: false, error: '沒有進行中的牌局' };
+  if (hand.phase === 'ended') return { ok: false, error: '牌局已結束' };
+  if (hand.currentPlayerIdx === null || hand.deadline === null) {
+    return { ok: false, error: '目前無人可行動' };
+  }
+  const cur = hand.players[hand.currentPlayerIdx];
+  if (cur.userId !== userId) return { ok: false, error: '還沒輪到你' };
+  if (hand.currentTurnExtended) {
+    return { ok: false, error: '本回合已使用時間銀行' };
+  }
+  const bank = getTimeBank(roomId, userId);
+  if (bank <= 0) return { ok: false, error: '時間銀行已用完' };
+  const addedMs = Math.min(TIME_BANK_MAX_EXTEND_MS, bank);
+  hand.deadline = hand.deadline + addedMs;
+  hand.currentTurnExtended = true;
+  const remaining = bank - addedMs;
+  setTimeBank(roomId, userId, remaining);
+  return {
+    ok: true,
+    addedMs,
+    newDeadline: hand.deadline,
+    remainingBankMs: remaining,
+  };
 }
 
 // ============================================================
@@ -107,6 +178,7 @@ export function endHand(roomId: string): void {
 export function clearRoomState(roomId: string): void {
   hands.delete(roomId);
   lastDealerByRoom.delete(roomId);
+  timeBankByRoom.delete(roomId);
 }
 
 // ============================================================
@@ -192,6 +264,7 @@ export function startHand(
     toAct: new Set(),
     actionTimeoutSeconds,
     deadline: null,
+    currentTurnExtended: false,
     endResult: null,
     startedAt: Date.now(),
     history: [],
@@ -698,7 +771,7 @@ function nextActiveIdx(hand: HandState, fromIdx: number): number {
 // Serialization
 // ============================================================
 
-function toPublicPlayer(p: Player): HandPlayerPublic {
+function toPublicPlayer(p: Player, timeBankMs: number): HandPlayerPublic {
   return {
     seat: p.seat,
     userId: p.userId,
@@ -707,10 +780,11 @@ function toPublicPlayer(p: Player): HandPlayerPublic {
     bet: p.bet,
     totalBet: p.totalBet,
     status: p.status,
+    timeBankMs,
   };
 }
 
-export function toPublicState(hand: HandState): HandStatePublic {
+export function toPublicState(hand: HandState, roomId: string): HandStatePublic {
   return {
     handNumber: hand.handNumber,
     phase: hand.phase,
@@ -725,7 +799,8 @@ export function toPublicState(hand: HandState): HandStatePublic {
         : null,
     actionTimeoutSeconds: hand.actionTimeoutSeconds,
     deadline: hand.deadline,
-    players: hand.players.map(toPublicPlayer),
+    currentTurnExtended: hand.currentTurnExtended,
+    players: hand.players.map((p) => toPublicPlayer(p, getTimeBank(roomId, p.userId))),
   };
 }
 
