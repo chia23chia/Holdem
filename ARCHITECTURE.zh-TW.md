@@ -711,11 +711,12 @@ FOLD / ALL-IN 本來就有靠 `status` 算出來的持久標籤(不受這輪動�
 
 ### 11.30 Time bank(2026-08-07 起)
 
-**概念**:每個玩家除了現有的基本行動時間(`Room.actionTimeoutSeconds`,例如 30 秒)之外,還有一份**個人時間銀行**(60 秒)。基本時間**不會自動延伸**——玩家要在剩 ≤5 秒時**手動按「⚡ 延時」按鈕**才會啟用,每次啟用最多加 30 秒(不夠就加剩下的),同一 turn 只能按一次。用途:重要決策(all-in、河牌前思考)可以主動買時間,不會被逾時代打;沒按就照舊到時間 auto-fold/check。
+**概念**:每個玩家除了現有的基本行動時間(`Room.actionTimeoutSeconds`,例如 30 秒)之外,還有一份**個人時間銀行**(60 秒)。基本時間**不會自動延伸**——玩家要在剩 ≤5 秒時**手動按「⚡ 延時」按鈕**才啟用。啟用等於「開放**最多**再多 30 秒可用」,實際扣多少 bank 取決於他真的思考多久:按下後 5 秒內就 act → 只扣 5 秒;想到 auto-action 才觸發 → 扣滿 30 秒(或當時 bank 剩下的量)。同一 turn 只能按一次;沒按就照舊到時間 auto-fold/check。
 
 **規格 v1**:
 - 池子大小 = 60 秒 / 玩家,**全站固定**(不在建房 UI 開變數)
-- 每次啟用加 `min(30 秒, 剩餘 bank)`,同一 turn 上限一次
+- 每次啟用 deadline 立刻加 `addedMs = min(30 秒, 剩餘 bank)`;bank 當下**不扣**
+- 該 turn 結束時(自己 act 或 auto-action 觸發)才扣真實用量:`spent = min(TIME_BANK_MAX_EXTEND_MS, max(0, elapsed - baseMs))`
 - **手動觸發**:剩 ≤5 秒時才浮出按鈕,按下去 deadline 立刻跳、按鈕消失
 - **不回補**:用完就沒,只有 `clearRoomState`(空房自動關 / owner close / session-expire / 錦標賽結束)才歸零
 - 現金局跟錦標賽規則一樣
@@ -723,9 +724,11 @@ FOLD / ALL-IN 本來就有靠 `status` 算出來的持久標籤(不受這輪動�
 **Server(`hands.ts`)**:
 - 常數 `TIME_BANK_INITIAL_MS = 60_000`、`TIME_BANK_MAX_EXTEND_MS = 30_000`
 - 模組狀態 `timeBankByRoom: Map<roomId, Map<userId, number>>`(ms),跨手保留 —— 只有 `clearRoomState` 會 `.delete(roomId)`
-- `HandState.currentTurnExtended: boolean` —— 標記當前 turn 已被啟用過 bank,`refreshDeadline` 每次 turn 換手都重設為 `false`。這樣一個 turn 只能按一次,不會反覆按到把 bank 燒光
-- `refreshDeadline(hand)` 只設 base timeout(`now + actionTimeoutSeconds * 1000`),**不自動加 bank**。Bank 只透過下面的 `extendCurrentTurn` 明確加
-- `extendCurrentTurn(roomId, userId): ExtendTimeBankOutcome` —— 驗證(hand 存在、非 ended、輪到 userId、`!currentTurnExtended`、bank > 0)→ 加 `addedMs = min(30_000, bank)` 到 `hand.deadline` → 扣 bank → 設 `currentTurnExtended = true`
+- `HandState.turnStartedAt: number | null` —— 當前 turn 起算時間,`refreshDeadline` 換手時設 `now`,用來算實際 elapsed
+- `HandState.currentTurnExtended: boolean` —— 標記當前 turn 已按過延時,`refreshDeadline` 每次換手都重設為 `false`。這樣一個 turn 只能按一次(reopen action 讓同一位再輪次算新 turn,可以再按)
+- `refreshDeadline(hand)` 只設 base timeout(`now + actionTimeoutSeconds * 1000`),**不自動加 bank**。同時設 `turnStartedAt = now`、`currentTurnExtended = false`
+- `extendCurrentTurn(roomId, userId): ExtendTimeBankOutcome` —— 驗證(hand 存在、非 ended、輪到 userId、`!currentTurnExtended`、bank > 0)→ `addedMs = min(30_000, bank)` 加到 `hand.deadline` → 設 `currentTurnExtended = true`。**不扣 bank**
+- `consumeExtensionForCurrentTurn(hand, roomId)`:在 `applyAction` **advance 到下一位之前**呼叫。只有 `currentTurnExtended` 為 true 時才動作:算 `elapsed = now - turnStartedAt`、`overBase = elapsed - baseMs`、`spent = min(30_000, max(0, overBase))`,從 bank 扣。因為 `deadline = turnStartedAt + baseMs + addedMs` 且 auto-action 最晚在 deadline fire,所以 `elapsed ≤ baseMs + addedMs`,`overBase ≤ addedMs ≤ 30_000` —— 自然上限,不會扣超過該次啟用允許的量
 - `HandStatePublic` 帶 `currentTurnExtended`,每個 `HandPlayerPublic` 帶 `timeBankMs = getTimeBank(roomId, p.userId)`
 - 沒有 DB persistence —— server 重啟 bank 歸零(跟 HandState 一樣是記憶體)
 
@@ -739,8 +742,9 @@ FOLD / ALL-IN 本來就有靠 `status` 算出來的持久標籤(不受這輪動�
   3. `myHandPlayer.timeBankMs > 0`
   4. `Math.ceil((deadline - now) / 1000) <= 5`
 - 按下 emit `game:time-bank`(server 會回廣播 `game:state`,`currentTurnExtended` 變 true → 按鈕自然消失,timer 也跳到新的 deadline)
-- `SeatCard` 有 `timeBankMs?` + `extended?` 兩個 prop:座位卡下方常駐顯示 `TB Xs`(bank 剩多少);當前玩家如果已延時,計時字改紫色 + `⚡`
+- `SeatCard` 有 `timeBankMs?` + `extended?` 兩個 prop:座位卡下方常駐顯示 `TB Xs`(bank 剩多少 —— 這個數字在 turn 進行中不會即時扣,要等 turn 結束才更新);當前玩家如果已延時,計時字改紫色 + `⚡`
 - `ActionBar` 也有 `extended` prop:標題從「輪到你行動」→「⚡ 時間銀行」提示這段是延伸時間
+- 音效 cue `timebank`(`web/lib/sound.ts`):client 監聽 `gameState.currentTurnExtended` 的 false→true edge,用 ref 去抖動,啟用瞬間全房播一次
 
 **跟 §11.28(閒置強制站起)的互動**:按下延時按鈕會 `resetIdleStreak`(跟真的下注同樣算「有互動」)。如果玩家延時完仍然無操作到過期,`runAutoAction` 一樣 fire,idle streak 一樣 +1 —— 邏輯完全共用,不用改。
 

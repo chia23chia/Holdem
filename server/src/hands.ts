@@ -49,6 +49,10 @@ interface HandState {
   toAct: Set<number>;
   actionTimeoutSeconds: number;
   deadline: number | null; // Epoch ms; null when no current turn (ended / all-in)
+  // Epoch ms when the current player's turn started (base window counts
+  // from here). Used to compute how much time bank they actually spent
+  // when their turn ends. Null when no active turn.
+  turnStartedAt: number | null;
   // True once the CURRENT player has activated their time bank on this
   // turn (max one activation per turn). Reset to false in refreshDeadline
   // whenever the turn advances.
@@ -87,25 +91,31 @@ function setTimeBank(roomId: string, userId: string, ms: number): void {
 }
 
 // Recompute deadline based on current turn — base timeout only, NO time
-// bank auto-added. Bank is only spent via explicit extendCurrentTurn.
+// bank auto-added. Bank is only spent via explicit extendCurrentTurn +
+// actual elapsed time (see consumeExtensionForCurrentTurn below).
 // Called after every mutation that might change currentPlayerIdx; also
-// resets currentTurnExtended so the new player gets a fresh chance to
-// use their bank this turn.
+// resets turnStartedAt + currentTurnExtended so the new player gets a
+// fresh chance to use their bank this turn.
 function refreshDeadline(hand: HandState): void {
   if (hand.currentPlayerIdx === null || hand.phase === 'ended') {
     hand.deadline = null;
+    hand.turnStartedAt = null;
     hand.currentTurnExtended = false;
     return;
   }
-  hand.deadline = Date.now() + hand.actionTimeoutSeconds * 1000;
+  const now = Date.now();
+  hand.turnStartedAt = now;
+  hand.deadline = now + hand.actionTimeoutSeconds * 1000;
   hand.currentTurnExtended = false;
 }
 
 // Manual time-bank activation. Extends the current turn's deadline by
-// min(TIME_BANK_MAX_EXTEND_MS, remainingBank), deducts the same from the
-// player's bank, sets currentTurnExtended so the button won't reappear
-// for this turn. Callers should reschedule the auto-action timer after
-// this returns ok:true (deadline moved out).
+// min(TIME_BANK_MAX_EXTEND_MS, remainingBank) and sets currentTurnExtended
+// so the button won't reappear this turn. Does NOT deduct from the bank
+// immediately — the actual amount spent depends on how long the player
+// takes to act; the deduction happens in consumeExtensionForCurrentTurn
+// when the turn ends. Callers should reschedule the auto-action timer
+// after this returns ok:true (deadline moved out).
 export type ExtendTimeBankOutcome =
   | { ok: true; addedMs: number; newDeadline: number; remainingBankMs: number }
   | { ok: false; error: string };
@@ -130,14 +140,30 @@ export function extendCurrentTurn(
   const addedMs = Math.min(TIME_BANK_MAX_EXTEND_MS, bank);
   hand.deadline = hand.deadline + addedMs;
   hand.currentTurnExtended = true;
-  const remaining = bank - addedMs;
-  setTimeBank(roomId, userId, remaining);
+  // Bank NOT touched here — see consumeExtensionForCurrentTurn.
   return {
     ok: true,
     addedMs,
     newDeadline: hand.deadline,
-    remainingBankMs: remaining,
+    remainingBankMs: bank,
   };
+}
+
+// Called just before advancing to the next player. If the current player
+// activated their time bank on this turn, deduct the actual overrun past
+// the base window from their bank. Elapsed can never exceed base +
+// extendedMs because the auto-action timer fires at the extended
+// deadline — natural upper bound = min(TIME_BANK_MAX_EXTEND_MS, bank).
+function consumeExtensionForCurrentTurn(hand: HandState, roomId: string): void {
+  if (!hand.currentTurnExtended) return;
+  if (hand.currentPlayerIdx === null || hand.turnStartedAt === null) return;
+  const elapsedMs = Date.now() - hand.turnStartedAt;
+  const overBaseMs = elapsedMs - hand.actionTimeoutSeconds * 1000;
+  if (overBaseMs <= 0) return;
+  const player = hand.players[hand.currentPlayerIdx];
+  const spent = Math.min(TIME_BANK_MAX_EXTEND_MS, overBaseMs);
+  const currentBank = getTimeBank(roomId, player.userId);
+  setTimeBank(roomId, player.userId, currentBank - spent);
 }
 
 // ============================================================
@@ -264,6 +290,7 @@ export function startHand(
     toAct: new Set(),
     actionTimeoutSeconds,
     deadline: null,
+    turnStartedAt: null,
     currentTurnExtended: false,
     endResult: null,
     startedAt: Date.now(),
@@ -421,6 +448,10 @@ export function applyAction(
   // Current player is done for this round (unless a raise reopened them,
   // which the branch above handles by NOT re-adding themselves).
   hand.toAct.delete(hand.currentPlayerIdx);
+
+  // If they activated time bank on this turn, deduct actual overrun past
+  // the base window from their bank BEFORE refreshDeadline resets state.
+  consumeExtensionForCurrentTurn(hand, roomId);
 
   advanceAfterAction(hand);
   refreshDeadline(hand);
