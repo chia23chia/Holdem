@@ -334,6 +334,42 @@ async function writeMonthSkeleton(
     });
   }
 
+  // Settlement zone — dev fee %: right of leaderboard (cols I:L, row 1
+  // for title/total, spill starting at I2). Only rendered when
+  // DEV_USER_ID is set + present in this month's roster. Pure formula:
+  // updates live as daily totals change, no server rewrite needed after
+  // subsequent settlements.
+  const devUserId = process.env.DEV_USER_ID;
+  const devFeePercent = Number(process.env.DEV_FEE_PERCENT ?? 10);
+  if (devUserId && devFeePercent > 0) {
+    const devEntry = rosterSlots.find((r) => r.userId === devUserId);
+    if (devEntry) {
+      const devRosterRow = devEntry.slot + 1;
+      const bRange = `B${dStart}:B${dEnd}`;
+      const cRange = `C${dStart}:C${dEnd}`;
+      const devNameRef = `${ROSTER_SHEET}!B${devRosterRow}`;
+      const feeExpr = `ROUND(${cRange}*${devFeePercent}/100)`;
+      // Spill: name + fee for every positive-net player, excluding the dev
+      // themselves. Sorted by fee DESC. IFERROR("") so an empty result
+      // (no positive players yet) just leaves the cells blank.
+      const spillFormula = `=IFERROR(SORT(FILTER({${bRange},${feeExpr}},${cRange}>0,${bRange}<>${devNameRef}),2,FALSE),"")`;
+      // Total collected (same filter as spill).
+      const totalFormula = `=IFERROR(SUM(FILTER(${feeExpr},${cRange}>0,${bRange}<>${devNameRef})),0)`;
+      data.push(
+        {
+          range: `${tabName}!I1`,
+          values: [[`結算 手續費 ${devFeePercent}%`]],
+        },
+        {
+          range: `${tabName}!K1`,
+          values: [[`=CONCAT("收給 ",${devNameRef}," →")`]],
+        },
+        { range: `${tabName}!L1`, values: [[totalFormula]] },
+        { range: `${tabName}!I2`, values: [[spillFormula]] },
+      );
+    }
+  }
+
   await batchUpdateValues(spreadsheetId, data);
 }
 
