@@ -2674,7 +2674,7 @@ function ChatMessageRow({
           type="button"
           onClick={onNameClick}
           className={`${nameClass} underline decoration-transparent underline-offset-2 hover:decoration-current`}
-          title={`點名字屏蔽 ${msg.from} 的訊息`}
+          title={`點名字習禁屏 ${msg.from} 的訊息`}
         >
           {msg.from}
         </button>
@@ -2698,7 +2698,7 @@ function BlockedFooter({
   if (count <= 0) return null;
   return (
     <div className="mt-1 text-right text-[10px] text-slate-500">
-      已屏蔽 {count} 人{' '}
+      已習禁屏 {count} 人{' '}
       <button
         type="button"
         onClick={onManage}
@@ -2733,7 +2733,7 @@ function BlockPopover({
         onClick={(e) => e.stopPropagation()}
       >
         <p className="mb-4 text-sm text-slate-200">
-          {alreadyBlocked ? '解除屏蔽 ' : '屏蔽 '}
+          {alreadyBlocked ? '解除習禁屏 ' : '習禁屏 '}
           <span className="font-bold text-sky-400">{target.name}</span>
           {alreadyBlocked ? ' 的訊息?' : ' 的聊天、跑馬燈、貼圖?'}
         </p>
@@ -2754,7 +2754,7 @@ function BlockPopover({
                 : 'bg-red-700 hover:bg-red-600'
             }`}
           >
-            {alreadyBlocked ? '解除' : '屏蔽'}
+            {alreadyBlocked ? '解除' : '習禁屏'}
           </button>
         </div>
       </div>
@@ -2782,7 +2782,7 @@ function BlockManageModal({
         onClick={(e) => e.stopPropagation()}
       >
         <div className="mb-3 flex items-center justify-between">
-          <h2 className="text-base font-bold">已屏蔽的玩家</h2>
+          <h2 className="text-base font-bold">已習禁屏的玩家</h2>
           <button
             type="button"
             onClick={onClose}
@@ -2793,7 +2793,7 @@ function BlockManageModal({
         </div>
         {blocked.length === 0 ? (
           <p className="py-4 text-center text-sm text-slate-500">
-            目前沒有屏蔽任何人
+            目前沒有習禁屏任何人
           </p>
         ) : (
           <ul className="flex flex-col gap-1">
@@ -2815,7 +2815,7 @@ function BlockManageModal({
           </ul>
         )}
         <p className="mt-3 text-[10px] text-slate-500">
-          屏蔽紀錄只存在這台瀏覽器,清 cookies / 換裝置會消失。
+          習禁屏紀錄只存在這台瀏覽器,清 cookies / 換裝置會消失。
         </p>
       </div>
     </div>
