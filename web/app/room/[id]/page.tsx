@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import { createContext, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import { useSession } from 'next-auth/react';
 import type {
@@ -26,6 +26,18 @@ import {
 } from '@holdem/shared';
 import { connectSocket, type TypedSocket } from '@/lib/socket';
 import { isMuted, playCue, setMuted, type SoundCue } from '@/lib/sound';
+import {
+  loadBlocked,
+  loadFourColorDeck,
+  saveBlocked,
+  saveFourColorDeck,
+  type BlockedUser,
+} from '@/lib/prefs';
+
+// Deck color scheme is read deep in CardView / InlineCard — passing a prop
+// through 8 call sites (some inside SeatCard/HistoryList) would be noisy,
+// so hand it out via context set once at the top of RoomPage.
+const FourColorContext = createContext(true);
 
 // Display-only estimate of the server's rebuy cap (see rebuyChips in
 // server/src/rooms.ts for the authoritative rule): rounds down to the
@@ -101,13 +113,44 @@ export default function RoomPage() {
   // Local mute toggle (persisted to localStorage inside lib/sound). Seed from
   // storage on mount so refresh remembers the choice.
   const [muted, setMutedState] = useState(false);
+  const [fourColor, setFourColorState] = useState(true);
+  const [blocked, setBlockedState] = useState<BlockedUser[]>([]);
+  const [blockManageOpen, setBlockManageOpen] = useState(false);
+  // Anchor for the click-a-name-to-block popover: the userId of whichever
+  // chat message name is currently expanded. null = no popover open.
+  const [blockPopoverFor, setBlockPopoverFor] = useState<
+    { userId: string; name: string } | null
+  >(null);
   useEffect(() => {
     setMutedState(isMuted());
+    setFourColorState(loadFourColorDeck());
+    setBlockedState(loadBlocked());
   }, []);
   function toggleMuted() {
     const next = !muted;
     setMuted(next);
     setMutedState(next);
+  }
+  function toggleFourColor() {
+    const next = !fourColor;
+    saveFourColorDeck(next);
+    setFourColorState(next);
+  }
+  const blockedIds = useMemo(
+    () => new Set(blocked.map((b) => b.userId)),
+    [blocked],
+  );
+  // Socket handlers close over the initial blockedIds — read the live set
+  // via ref so blocking mid-session takes effect for new messages/stickers
+  // without re-registering handlers.
+  const blockedIdsRef = useRef<Set<string>>(blockedIds);
+  blockedIdsRef.current = blockedIds;
+  function toggleBlock(userId: string, name: string) {
+    const next = blocked.some((b) => b.userId === userId)
+      ? blocked.filter((b) => b.userId !== userId)
+      : [...blocked, { userId, name }];
+    saveBlocked(next);
+    setBlockedState(next);
   }
 
   // Derived at every render — safe to reference inside useEffects since it's
@@ -213,7 +256,12 @@ export default function RoomPage() {
           }
         });
         s.on('chat:message', (msg) => {
+          // Always keep the message in the chat log — a later unblock
+          // retroactively reveals past messages. Rendering applies the
+          // block filter.
           setMessages((prev) => [...prev.slice(-199), msg]);
+          const isBlocked = blockedIdsRef.current.has(msg.userId);
+          if (isBlocked) return;
           // Bump unread only when the mobile drawer is closed.
           // Desktop panel is always visible so we don't count there.
           if (!chatOpenRef.current) {
@@ -223,6 +271,7 @@ export default function RoomPage() {
           setMarqueeQueue((q) => [...q.slice(-19), msg]);
         });
         s.on('sticker:show', (evt) => {
+          if (blockedIdsRef.current.has(evt.userId)) return;
           setStickers((prev) => [...prev, evt]);
           // Auto-remove after animation completes (3s anim + small buffer).
           window.setTimeout(() => {
@@ -694,6 +743,7 @@ export default function RoomPage() {
     isOwner && !gameState && !!room && room.currentPlayers >= 2;
 
   return (
+    <FourColorContext.Provider value={fourColor}>
     <main className="mx-auto flex min-h-screen max-w-5xl flex-col gap-4 p-4 sm:gap-6 sm:p-6">
       <header className="flex items-start justify-between gap-2">
         <div className="min-w-0 flex-1">
@@ -725,6 +775,19 @@ export default function RoomPage() {
               aria-label={muted ? '開啟音效' : '靜音'}
             >
               {muted ? '🔇' : '🔊'}
+            </button>
+            <button
+              type="button"
+              onClick={toggleFourColor}
+              className="ml-1 inline-block rounded border border-slate-700 px-1.5 py-0.5 text-[10px] hover:bg-slate-800 sm:text-xs"
+              title={
+                fourColor
+                  ? '4-色牌組(♦藍/♣綠),點擊切回傳統 2-色'
+                  : '傳統 2-色牌組,點擊切 4-色(♦藍/♣綠)'
+              }
+              aria-label={fourColor ? '切傳統 2-色' : '切 4-色'}
+            >
+              {fourColor ? '🎨 4色' : '🎨 2色'}
             </button>
             {room?.roomType === 'tournament' ? (
               <BlindLevelInfo room={room} now={now} />
@@ -1135,21 +1198,29 @@ export default function RoomPage() {
                 {messages.length === 0 && (
                   <p className="text-slate-500">尚無訊息</p>
                 )}
-                {messages.map((m, i) => (
-                  <div key={i}>
-                    <span
-                      className={
+                {messages
+                  .filter((m) => !blockedIds.has(m.userId))
+                  .map((m, i) => (
+                    <ChatMessageRow
+                      key={i}
+                      msg={m}
+                      isMe={m.userId === myUserId}
+                      onNameClick={
                         m.userId === myUserId
-                          ? 'text-emerald-400'
-                          : 'text-sky-400'
+                          ? null
+                          : () =>
+                              setBlockPopoverFor({
+                                userId: m.userId,
+                                name: m.from,
+                              })
                       }
-                    >
-                      {m.from}
-                    </span>
-                    <span className="text-slate-500">:</span> {m.text}
-                  </div>
-                ))}
+                    />
+                  ))}
               </div>
+              <BlockedFooter
+                count={blocked.length}
+                onManage={() => setBlockManageOpen(true)}
+              />
               <form onSubmit={sendMessage} className="flex gap-2">
                 <input
                   className="flex-1 rounded border border-slate-700 bg-slate-950 px-3 py-2 text-sm"
@@ -1271,21 +1342,29 @@ export default function RoomPage() {
                   {messages.length === 0 && (
                     <p className="text-slate-500">尚無訊息</p>
                   )}
-                  {messages.map((m, i) => (
-                    <div key={i}>
-                      <span
-                        className={
+                  {messages
+                    .filter((m) => !blockedIds.has(m.userId))
+                    .map((m, i) => (
+                      <ChatMessageRow
+                        key={i}
+                        msg={m}
+                        isMe={m.userId === myUserId}
+                        onNameClick={
                           m.userId === myUserId
-                            ? 'text-emerald-400'
-                            : 'text-sky-400'
+                            ? null
+                            : () =>
+                                setBlockPopoverFor({
+                                  userId: m.userId,
+                                  name: m.from,
+                                })
                         }
-                      >
-                        {m.from}
-                      </span>
-                      <span className="text-slate-500">:</span> {m.text}
-                    </div>
-                  ))}
+                      />
+                    ))}
                 </div>
+                <BlockedFooter
+                  count={blocked.length}
+                  onManage={() => setBlockManageOpen(true)}
+                />
                 <form onSubmit={sendMessage} className="flex gap-2">
                   <input
                     className="flex-1 rounded border border-slate-700 bg-slate-950 px-3 py-2 text-sm"
@@ -1368,7 +1447,31 @@ export default function RoomPage() {
           </div>
         </div>
       )}
+
+      {/* Block popover — centered dialog when a chat name is clicked.
+          Row-level click handler filters out own name so this only opens
+          for other players. */}
+      {blockPopoverFor && (
+        <BlockPopover
+          target={blockPopoverFor}
+          alreadyBlocked={blockedIds.has(blockPopoverFor.userId)}
+          onConfirm={() => {
+            toggleBlock(blockPopoverFor.userId, blockPopoverFor.name);
+            setBlockPopoverFor(null);
+          }}
+          onCancel={() => setBlockPopoverFor(null)}
+        />
+      )}
+
+      {blockManageOpen && (
+        <BlockManageModal
+          blocked={blocked}
+          onUnblock={(userId) => toggleBlock(userId, '')}
+          onClose={() => setBlockManageOpen(false)}
+        />
+      )}
     </main>
+    </FourColorContext.Provider>
   );
 }
 
@@ -1716,17 +1819,37 @@ function HistoryList({
 
 // Tiny inline card for history log — smaller than the seat CardView.
 function InlineCard({ card }: { card: Card }) {
-  const red = card.suit === 'H' || card.suit === 'D';
+  const fourColor = useContext(FourColorContext);
   return (
     <span
-      className={`inline-block rounded border border-slate-500 bg-slate-100 px-1 text-[10px] font-bold leading-tight ${
-        red ? 'text-red-600' : 'text-slate-900'
-      }`}
+      className={`inline-block rounded border border-slate-500 bg-slate-100 px-1 text-[10px] font-bold leading-tight ${suitColorClass(
+        card.suit,
+        fourColor,
+      )}`}
     >
       {card.rank}
       {SUIT_SYMBOL[card.suit]}
     </span>
   );
+}
+
+// Suit → tailwind text-color class. Traditional 2-color: hearts+diamonds
+// red, spades+clubs black. 4-color (PokerStars-style): each suit distinct
+// so ♠ vs ♣ can't be confused (the reported readability issue).
+function suitColorClass(suit: Card['suit'], fourColor: boolean): string {
+  if (!fourColor) {
+    return suit === 'H' || suit === 'D' ? 'text-red-600' : 'text-slate-900';
+  }
+  switch (suit) {
+    case 'S':
+      return 'text-slate-900';
+    case 'H':
+      return 'text-red-600';
+    case 'D':
+      return 'text-blue-600';
+    case 'C':
+      return 'text-emerald-600';
+  }
 }
 
 function MenuItem({
@@ -1766,16 +1889,17 @@ const SUIT_SYMBOL: Record<Card['suit'], string> = {
 };
 
 function CardView({ card, size = 'md' }: { card: Card; size?: 'sm' | 'md' }) {
-  const red = card.suit === 'H' || card.suit === 'D';
+  const fourColor = useContext(FourColorContext);
   const sz =
     size === 'sm'
       ? 'h-9 w-7 text-xs sm:h-10 sm:w-8 sm:text-sm'
       : 'h-14 w-10 text-lg';
   return (
     <span
-      className={`inline-flex items-center justify-center rounded border border-slate-500 bg-slate-100 font-bold ${sz} ${
-        red ? 'text-red-600' : 'text-slate-900'
-      }`}
+      className={`inline-flex items-center justify-center rounded border border-slate-500 bg-slate-100 font-bold ${sz} ${suitColorClass(
+        card.suit,
+        fourColor,
+      )}`}
     >
       {card.rank}
       {SUIT_SYMBOL[card.suit]}
@@ -2523,4 +2647,177 @@ function getPositionLabel(
     (playerIdx - dealerIdx + sortedSeatedSeats.length) %
     sortedSeatedSeats.length;
   return labels[offset] ?? null;
+}
+
+// ============================================================
+// Chat block-list helpers
+// ============================================================
+
+// One row in the chat list. Name is a button when onNameClick is provided
+// (so `null` for your own messages naturally makes it non-clickable, no
+// weird "block myself" UI). Everything else styled identically to the
+// old inline version so the block feature can be a pure add-on.
+function ChatMessageRow({
+  msg,
+  isMe,
+  onNameClick,
+}: {
+  msg: ChatMessage;
+  isMe: boolean;
+  onNameClick: (() => void) | null;
+}) {
+  const nameClass = isMe ? 'text-emerald-400' : 'text-sky-400';
+  return (
+    <div>
+      {onNameClick ? (
+        <button
+          type="button"
+          onClick={onNameClick}
+          className={`${nameClass} underline decoration-transparent underline-offset-2 hover:decoration-current`}
+          title={`點名字屏蔽 ${msg.from} 的訊息`}
+        >
+          {msg.from}
+        </button>
+      ) : (
+        <span className={nameClass}>{msg.from}</span>
+      )}
+      <span className="text-slate-500">:</span> {msg.text}
+    </div>
+  );
+}
+
+// Small always-visible footer under the chat feed. Only rendered when
+// count > 0 so the UI stays clean for people who haven't blocked anyone.
+function BlockedFooter({
+  count,
+  onManage,
+}: {
+  count: number;
+  onManage: () => void;
+}) {
+  if (count <= 0) return null;
+  return (
+    <div className="mt-1 text-right text-[10px] text-slate-500">
+      已屏蔽 {count} 人{' '}
+      <button
+        type="button"
+        onClick={onManage}
+        className="underline hover:text-slate-300"
+      >
+        管理
+      </button>
+    </div>
+  );
+}
+
+// Centered confirm dialog — click a chat name → this. Simple confirm/cancel,
+// no fancy positioning (screen center is fine for the friend-app scale).
+function BlockPopover({
+  target,
+  alreadyBlocked,
+  onConfirm,
+  onCancel,
+}: {
+  target: { userId: string; name: string };
+  alreadyBlocked: boolean;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+      onClick={onCancel}
+    >
+      <div
+        className="w-full max-w-xs rounded-lg border border-slate-700 bg-slate-900 p-4"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <p className="mb-4 text-sm text-slate-200">
+          {alreadyBlocked ? '解除屏蔽 ' : '屏蔽 '}
+          <span className="font-bold text-sky-400">{target.name}</span>
+          {alreadyBlocked ? ' 的訊息?' : ' 的聊天、跑馬燈、貼圖?'}
+        </p>
+        <div className="flex justify-end gap-2 text-sm">
+          <button
+            type="button"
+            onClick={onCancel}
+            className="rounded border border-slate-700 px-3 py-1 hover:bg-slate-800"
+          >
+            取消
+          </button>
+          <button
+            type="button"
+            onClick={onConfirm}
+            className={`rounded px-3 py-1 font-semibold ${
+              alreadyBlocked
+                ? 'bg-emerald-700 hover:bg-emerald-600'
+                : 'bg-red-700 hover:bg-red-600'
+            }`}
+          >
+            {alreadyBlocked ? '解除' : '屏蔽'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Manage-list modal — see all currently-blocked users, unblock inline.
+function BlockManageModal({
+  blocked,
+  onUnblock,
+  onClose,
+}: {
+  blocked: BlockedUser[];
+  onUnblock: (userId: string) => void;
+  onClose: () => void;
+}) {
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4"
+      onClick={onClose}
+    >
+      <div
+        className="w-full max-w-sm rounded-lg border border-slate-700 bg-slate-900 p-5"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="mb-3 flex items-center justify-between">
+          <h2 className="text-base font-bold">已屏蔽的玩家</h2>
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded border border-slate-700 px-2 py-0.5 text-xs hover:bg-slate-800"
+          >
+            關閉
+          </button>
+        </div>
+        {blocked.length === 0 ? (
+          <p className="py-4 text-center text-sm text-slate-500">
+            目前沒有屏蔽任何人
+          </p>
+        ) : (
+          <ul className="flex flex-col gap-1">
+            {blocked.map((b) => (
+              <li
+                key={b.userId}
+                className="flex items-center justify-between rounded border border-slate-800 bg-slate-950 px-3 py-2 text-sm"
+              >
+                <span className="truncate text-slate-200">{b.name}</span>
+                <button
+                  type="button"
+                  onClick={() => onUnblock(b.userId)}
+                  className="ml-2 shrink-0 rounded bg-emerald-700 px-2 py-0.5 text-xs font-semibold hover:bg-emerald-600"
+                >
+                  解除
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+        <p className="mt-3 text-[10px] text-slate-500">
+          屏蔽紀錄只存在這台瀏覽器,清 cookies / 換裝置會消失。
+        </p>
+      </div>
+    </div>
+  );
 }

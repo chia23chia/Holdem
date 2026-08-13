@@ -749,6 +749,24 @@ FOLD / ALL-IN 本來就有靠 `status` 算出來的持久標籤(不受這輪動�
 
 **跟 §11.28(閒置強制站起)的互動**:按下延時按鈕會 `resetIdleStreak`(跟真的下注同樣算「有互動」)。如果玩家延時完仍然無操作到過期,`runAutoAction` 一樣 fire,idle streak 一樣 +1 —— 邏輯完全共用,不用改。
 
+### 11.31 個人屏蔽 + 4-color deck(2026-08-08 起)
+
+兩個純 client-side 的個人化 UI 選項,共用 `web/lib/prefs.ts` 存 localStorage、不上 server。
+
+**屏蔽**:玩家 A 可以在自己畫面把玩家 B 的內容藏起來,B 完全不知道也沒被禁言 —— 只是 A 看不到而已。實作:
+- Storage key `holdem:blocked-users`,存 `BlockedUser[] = {userId, name}[]`;name 存起來給「管理」清單顯示
+- `RoomPage` 頂層 state + `blockedIdsRef`,socket handler 用 ref 讀最新集合(不然改屏蔽要重掛 handler)
+- **Chat**:訊息全部存進 `messages` state(解除屏蔽可以往回翻歷史訊息),渲染時 `.filter(m => !blockedIds.has(m.userId))`
+- **跑馬燈 / 未讀計數 / 貼圖**:在 socket handler 早期就 `if (blocked) return;`(這些是 transient,不用留 replay)
+- **UI**:聊天訊息的名字改成 `<button>`(自己名字不加,onNameClick 傳 null 就自然變 span),點下去開 `BlockPopover`(全螢幕居中 confirm 對話框);聊天欄下方常駐 `已屏蔽 N 人 [管理]` 小字(count > 0 才顯示),點管理開 `BlockManageModal` 逐一「解除」
+- **不涵蓋**:座位卡的名字沒改成可點(避免每個座位都變按鈕、也避免手誤在牌桌上點到);要屏蔽只能透過聊天訊息點名字
+
+**4-color deck**:♠♣ 兩個都是黑色容易搞混(玩家回報),加一個 header toggle 切成 4 色。實作:
+- Storage key `holdem:4color-deck`,預設 `true`(這功能本來就是要修這個回報,預設開)
+- 顏色:♠ 黑、♥ 紅、♦ **藍**、♣ **綠**(PokerStars 標準)
+- 因為 `CardView` / `InlineCard` 有 8 個 call site(有些包在 `SeatCard` / `HistoryList` 裡),避免 prop 一路傳,用 `FourColorContext` 在 `RoomPage` 頂層 provide,兩個 card 元件 `useContext` 讀
+- Header 加 `🎨 4色 / 🎨 2色` toggle 按鈕(mute 旁邊)
+
 ---
 
 ## 12. 環境變數
