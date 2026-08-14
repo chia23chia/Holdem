@@ -368,7 +368,7 @@ async function writeMonthSkeleton(
       data.push(
         {
           range: `${tabName}!I1`,
-          values: [[`結算 手續費 ${devFeePercent}%`]],
+          values: [[`結算`]],
         },
         // Rank 1..N in column I next to the spilled name/amount.
         { range: `${tabName}!I2`, values: [[`=SEQUENCE(${N})`]] },
