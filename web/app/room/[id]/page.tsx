@@ -39,10 +39,6 @@ import {
 // so hand it out via context set once at the top of RoomPage.
 const FourColorContext = createContext(true);
 
-// Which edge of the river card is being lifted during peek (§11.32).
-// Maps to a CSS 3D transform-origin (opposite edge) + rotate axis.
-type PeekEdge = 'top' | 'bottom' | 'left' | 'right';
-
 // Display-only estimate of the server's rebuy cap (see rebuyChips in
 // server/src/rooms.ts for the authoritative rule): rounds down to the
 // nearest 500 once the chip leader's stack exceeds the room's buyIn.
@@ -86,20 +82,6 @@ export default function RoomPage() {
   const [revealingSeatUserId, setRevealingSeatUserId] = useState<
     string | null
   >(null);
-  // River-peek modal state (§11.32). Set when server emits game:river-peek-start,
-  // cleared on game:river-revealed (or timeout auto-flip).
-  const [riverPeek, setRiverPeek] = useState<{
-    riverCard: Card;
-    peekByUserId: string;
-    deadline: number;
-  } | null>(null);
-  // Broadcast peek progress from the trailing player; non-peekers use this
-  // to render the same animation on their screen. { edge, amount } or null
-  // when the peeker isn't actively dragging.
-  const [remotePeek, setRemotePeek] = useState<{
-    edge: PeekEdge;
-    amount: number;
-  } | null>(null);
   // Most recent action per seat THIS betting round — check has no bet amount
   // to display, so without this the felt shows no feedback at all when
   // someone checks. Cleared at the start of each new street/hand so a stale
@@ -198,11 +180,6 @@ export default function RoomPage() {
   // re-registering it — see the tournament-finish race note below.
   const settlementRef = useRef(settlement);
   settlementRef.current = settlement;
-  // Live displayedCommunity for socket handlers (they close over stale
-  // values otherwise). Needed by the river-peek reveal to snapshot the
-  // pre-river board into the hand's history entry.
-  const displayedCommunityRef = useRef<Card[]>([]);
-  displayedCommunityRef.current = displayedCommunity;
   // Debounces the myturn sound to only fire on the false→true transition, so
   // re-renders while it's still my turn don't spam-play the ding.
   const prevMyTurnRef = useRef(false);
@@ -321,8 +298,6 @@ export default function RoomPage() {
           setAllInReveal(new Map());
           setRevealingSeatUserId(null);
           setLastActionBySeat({});
-          setRiverPeek(null);
-          setRemotePeek(null);
           setHands((prev) => {
             // If already have a record for this handNumber (e.g. subscribe
             // catch-up after refresh), skip; otherwise append.
@@ -390,49 +365,6 @@ export default function RoomPage() {
         // The felt display (displayedCommunity) is staggered ~700ms/street
         // via the queue below for runout drama; the history record itself
         // still updates immediately since there's no reason to delay it.
-        // River peek (§11.32) — server holds the runout at river reveal and
-        // sends this. Everyone shows the peek modal; only peekByUserId can
-        // interact. Modal closes on game:river-revealed.
-        s.on('game:river-peek-start', (data) => {
-          setRiverPeek(data);
-          setRemotePeek(null);
-        });
-        s.on('game:river-peek-progress', ({ edge, amount }) => {
-          setRemotePeek({ edge, amount });
-        });
-        s.on('game:river-revealed', () => {
-          setRiverPeek((currentPeek) => {
-            if (!currentPeek) return null;
-            // Fold the river card into the community + local history now that
-            // the modal is closing. Server already advanced to showdown +
-            // will emit game:state + game:ended right after this.
-            setDisplayedCommunity((prev) => [...prev, currentPeek.riverCard]);
-            setHands((prev) => {
-              if (prev.length === 0) return prev;
-              const last = prev[prev.length - 1];
-              if (last.history.some((h) => h.kind === 'street' && h.phase === 'river')) {
-                return prev;
-              }
-              const copy = [...prev];
-              copy[copy.length - 1] = {
-                ...last,
-                history: [
-                  ...last.history,
-                  {
-                    kind: 'street',
-                    phase: 'river',
-                    cards: [...displayedCommunityRef.current, currentPeek.riverCard],
-                    trailingUserId: currentPeek.peekByUserId,
-                  },
-                ],
-              };
-              return copy;
-            });
-            return null;
-          });
-          setRemotePeek(null);
-          playCue('street');
-        });
         s.on('game:street-log', ({ phase, cards, trailingUserId }) => {
           setHands((prev) => {
             if (prev.length === 0) return prev;
@@ -789,17 +721,6 @@ export default function RoomPage() {
     if (!socketRef.current || !roomId) return;
     setError(null);
     socketRef.current.emit('game:time-bank', { roomId }, (res) => {
-      if (!res.ok) setError(res.error);
-    });
-  }
-
-  function handleRiverPeekProgress(edge: PeekEdge, amount: number) {
-    if (!socketRef.current || !roomId) return;
-    socketRef.current.emit('game:river-peek-progress', { roomId, edge, amount });
-  }
-  function handleRiverPeekFlip() {
-    if (!socketRef.current || !roomId) return;
-    socketRef.current.emit('game:river-flip', { roomId }, (res) => {
       if (!res.ok) setError(res.error);
     });
   }
@@ -1395,17 +1316,6 @@ export default function RoomPage() {
 
       <StickerLayer stickers={stickers} />
 
-      {riverPeek && (
-        <PeekOverlay
-          riverCard={riverPeek.riverCard}
-          isPeeker={riverPeek.peekByUserId === myUserId}
-          remotePeek={remotePeek}
-          onProgress={handleRiverPeekProgress}
-          onFlip={handleRiverPeekFlip}
-          fourColor={fourColor}
-        />
-      )}
-
       {/* Mobile chat drawer */}
       {chatOpen && (
         <div className="fixed inset-0 z-40 flex flex-col sm:hidden">
@@ -1663,244 +1573,6 @@ function StickerLayer({ stickers }: { stickers: StickerEvent[] }) {
           </div>
         );
       })}
-    </div>
-  );
-}
-
-// ============================================================
-// River-peek modal (§11.32)
-// ============================================================
-
-// Where inside the card the user grabbed → which edge lifts.
-function edgeForTouch(
-  touchX: number,
-  touchY: number,
-  card: { left: number; top: number; width: number; height: number },
-): PeekEdge {
-  const cx = card.left + card.width / 2;
-  const cy = card.top + card.height / 2;
-  const dx = touchX - cx;
-  const dy = touchY - cy;
-  if (Math.abs(dx) > Math.abs(dy)) {
-    return dx > 0 ? 'right' : 'left';
-  }
-  return dy > 0 ? 'bottom' : 'top';
-}
-
-// Full-viewport peek modal. When isPeeker, the trailing player can drag
-// any edge outward to lift it (CSS 3D tilt). Non-peekers just watch — the
-// remotePeek prop is fed by the broadcast so the tilt animation stays in
-// sync across everyone. Threshold at 70% triggers the flip commit.
-function PeekOverlay({
-  riverCard,
-  isPeeker,
-  remotePeek,
-  onProgress,
-  onFlip,
-  fourColor,
-}: {
-  riverCard: Card;
-  isPeeker: boolean;
-  remotePeek: { edge: PeekEdge; amount: number } | null;
-  onProgress: (edge: PeekEdge, amount: number) => void;
-  onFlip: () => void;
-  fourColor: boolean;
-}) {
-  const cardRef = useRef<HTMLDivElement | null>(null);
-  const [localPeek, setLocalPeek] = useState<{
-    edge: PeekEdge;
-    amount: number;
-  } | null>(null);
-  // Once we've crossed the threshold and told the server, freeze interaction
-  // so a wobbly finger doesn't keep firing events. Cleared when peek modal
-  // unmounts.
-  const [committed, setCommitted] = useState(false);
-  const startRef = useRef<{
-    x: number;
-    y: number;
-    edge: PeekEdge;
-    cardRect: DOMRect;
-  } | null>(null);
-  const pointerIdRef = useRef<number | null>(null);
-  // Rate-limit progress emission to ~20fps so we don't flood the socket.
-  const lastEmitRef = useRef(0);
-
-  // Which peek to render — self drag wins over broadcast (peeker's own
-  // touch is more responsive than round-tripping through server).
-  const peek = isPeeker ? localPeek : remotePeek;
-  const edge = peek?.edge ?? null;
-  const amount = peek?.amount ?? 0;
-
-  function throttledProgress(nextEdge: PeekEdge, nextAmount: number) {
-    setLocalPeek({ edge: nextEdge, amount: nextAmount });
-    const now = Date.now();
-    if (now - lastEmitRef.current < 50) return;
-    lastEmitRef.current = now;
-    onProgress(nextEdge, nextAmount);
-  }
-
-  function handlePointerDown(e: React.PointerEvent<HTMLDivElement>) {
-    if (!isPeeker || committed) return;
-    const rect = cardRef.current?.getBoundingClientRect();
-    if (!rect) return;
-    e.currentTarget.setPointerCapture(e.pointerId);
-    pointerIdRef.current = e.pointerId;
-    const grabbedEdge = edgeForTouch(e.clientX, e.clientY, {
-      left: rect.left,
-      top: rect.top,
-      width: rect.width,
-      height: rect.height,
-    });
-    startRef.current = {
-      x: e.clientX,
-      y: e.clientY,
-      edge: grabbedEdge,
-      cardRect: rect,
-    };
-    setLocalPeek({ edge: grabbedEdge, amount: 0 });
-  }
-
-  function handlePointerMove(e: React.PointerEvent<HTMLDivElement>) {
-    if (!isPeeker || committed) return;
-    if (pointerIdRef.current !== e.pointerId) return;
-    const start = startRef.current;
-    if (!start) return;
-    const dx = e.clientX - start.x;
-    const dy = e.clientY - start.y;
-    // "Outward" direction depends on which edge was grabbed. Drag AWAY
-    // from the card past the edge = lift.
-    let outward = 0;
-    let denom = 0;
-    switch (start.edge) {
-      case 'top':
-        outward = -dy;
-        denom = start.cardRect.height;
-        break;
-      case 'bottom':
-        outward = dy;
-        denom = start.cardRect.height;
-        break;
-      case 'left':
-        outward = -dx;
-        denom = start.cardRect.width;
-        break;
-      case 'right':
-        outward = dx;
-        denom = start.cardRect.width;
-        break;
-    }
-    const pct = Math.max(0, Math.min(100, (outward / denom) * 100));
-    throttledProgress(start.edge, pct);
-    if (pct >= 70 && !committed) {
-      setCommitted(true);
-      onFlip();
-    }
-  }
-
-  function handlePointerUp(e: React.PointerEvent<HTMLDivElement>) {
-    if (!isPeeker) return;
-    if (pointerIdRef.current !== e.pointerId) return;
-    pointerIdRef.current = null;
-    startRef.current = null;
-    if (committed) return;
-    // Snap back and let peers know via the broadcast.
-    setLocalPeek(null);
-    lastEmitRef.current = 0;
-    onProgress(edge ?? 'top', 0);
-  }
-
-  // CSS 3D tilt: cover sits on top of the face card. Lifting an edge
-  // rotates cover around the OPPOSITE edge; face-up card behind becomes
-  // visible in the gap.
-  const angle = amount * 0.9; // 0-100 → 0-90 degrees roughly
-  let transform = 'rotateX(0deg)';
-  let transformOrigin = 'center';
-  switch (edge) {
-    case 'top':
-      transform = `rotateX(${angle}deg)`;
-      transformOrigin = 'top center';
-      break;
-    case 'bottom':
-      transform = `rotateX(-${angle}deg)`;
-      transformOrigin = 'bottom center';
-      break;
-    case 'left':
-      transform = `rotateY(-${angle}deg)`;
-      transformOrigin = 'center left';
-      break;
-    case 'right':
-      transform = `rotateY(${angle}deg)`;
-      transformOrigin = 'center right';
-      break;
-  }
-
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4">
-      <div
-        className="flex flex-col items-center gap-3"
-        style={{ perspective: 1200 }}
-      >
-        <div
-          ref={cardRef}
-          onPointerDown={handlePointerDown}
-          onPointerMove={handlePointerMove}
-          onPointerUp={handlePointerUp}
-          onPointerCancel={handlePointerUp}
-          className="relative"
-          style={{
-            width: 'min(60vw, 60vh)',
-            aspectRatio: '2 / 3',
-            touchAction: 'none', // suppress browser scroll during drag
-            transformStyle: 'preserve-3d',
-          }}
-        >
-          {/* Face card (river) — always sits behind, visible when cover lifts */}
-          <div
-            className={`absolute inset-0 flex items-center justify-center rounded-lg border-4 border-slate-500 bg-slate-100 text-8xl font-bold ${suitColorClass(
-              riverCard.suit,
-              fourColor,
-            )}`}
-          >
-            <span>
-              {riverCard.rank}
-              {SUIT_SYMBOL[riverCard.suit]}
-            </span>
-          </div>
-          {/* Cover — face-down back, lifts based on peek */}
-          <div
-            className="absolute inset-0 rounded-lg border-4 border-blue-950 bg-gradient-to-br from-blue-800 to-blue-950 shadow-2xl"
-            style={{
-              transform,
-              transformOrigin,
-              transition: committed
-                ? 'transform 500ms ease-out'
-                : localPeek || remotePeek
-                  ? 'none'
-                  : 'transform 200ms ease-out',
-              backgroundImage:
-                'repeating-linear-gradient(45deg, rgba(255,255,255,0.08) 0 8px, transparent 8px 16px)',
-              // After commit, animate cover fully away.
-              ...(committed
-                ? {
-                    transform:
-                      edge === 'top'
-                        ? 'rotateX(180deg)'
-                        : edge === 'bottom'
-                          ? 'rotateX(-180deg)'
-                          : edge === 'left'
-                            ? 'rotateY(-180deg)'
-                            : 'rotateY(180deg)',
-                  }
-                : {}),
-            }}
-          />
-        </div>
-        {isPeeker && !committed && (
-          <p className="text-center text-sm text-slate-300">
-            拖任一邊往外掀 —— 拖到 70% 自動翻牌
-          </p>
-        )}
-      </div>
     </div>
   );
 }
