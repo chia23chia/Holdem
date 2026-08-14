@@ -334,11 +334,14 @@ async function writeMonthSkeleton(
     });
   }
 
-  // Settlement zone — dev fee %: right of leaderboard (cols I:L, row 1
-  // for title/total, spill starting at I2). Only rendered when
-  // DEV_USER_ID is set + present in this month's roster. Pure formula:
-  // updates live as daily totals change, no server rewrite needed after
-  // subsequent settlements.
+  // Settlement zone — dev fee %: right of leaderboard (cols I:K, rows 2..N+1).
+  // Shows FINAL after-fee amount for every player, sorted by that amount
+  // DESC. Positive non-dev players keep 90% (10% goes to dev); dev collects
+  // total fees on top of their own net; negative players unchanged.
+  // Sum still nets to 0 (fees just move between rows). Only rendered when
+  // DEV_USER_ID is set + present in this month's roster. Pure formula: updates
+  // live as daily totals change, no server rewrite needed after subsequent
+  // settlements.
   const devUserId = process.env.DEV_USER_ID;
   const devFeePercent = Number(process.env.DEV_FEE_PERCENT ?? 10);
   if (devUserId && devFeePercent > 0) {
@@ -348,24 +351,28 @@ async function writeMonthSkeleton(
       const bRange = `B${dStart}:B${dEnd}`;
       const cRange = `C${dStart}:C${dEnd}`;
       const devNameRef = `${ROSTER_SHEET}!B${devRosterRow}`;
-      const feeExpr = `ROUND(${cRange}*${devFeePercent}/100)`;
-      // Spill: name + fee for every positive-net player, excluding the dev
-      // themselves. Sorted by fee DESC. IFERROR("") so an empty result
-      // (no positive players yet) just leaves the cells blank.
-      const spillFormula = `=IFERROR(SORT(FILTER({${bRange},${feeExpr}},${cRange}>0,${bRange}<>${devNameRef}),2,FALSE),"")`;
-      // Total collected (same filter as spill).
-      const totalFormula = `=IFERROR(SUM(FILTER(${feeExpr},${cRange}>0,${bRange}<>${devNameRef})),0)`;
+      // INT = floor (無條件捨棄小數部分). Only applied to positive-net
+       // players (the ones actually paying), so INT vs TRUNC vs FLOOR are
+       // all equivalent here — pick INT for clarity.
+       const feeExpr = `INT(${cRange}*${devFeePercent}/100)`;
+      // Sum of fees to redirect to dev — computed once, broadcast into
+      // the dev-branch of the per-row IF via ARRAYFORMULA.
+      const totalFees = `SUMPRODUCT((${cRange}>0)*(${bRange}<>${devNameRef})*${feeExpr})`;
+      // Per-player after-fee amount:
+      //   dev row       → own net + total fees collected
+      //   positive rest → net - fee (they pay 10%)
+      //   negative rest → net unchanged
+      const afterFeeExpr = `IF(${bRange}=${devNameRef},${cRange}+${totalFees},IF(${cRange}>0,${cRange}-${feeExpr},${cRange}))`;
+      // 2-column spill sorted by after-fee DESC (biggest winner first).
+      const spillFormula = `=IFERROR(SORT({${bRange},ARRAYFORMULA(${afterFeeExpr})},2,FALSE),"")`;
       data.push(
         {
           range: `${tabName}!I1`,
           values: [[`結算 手續費 ${devFeePercent}%`]],
         },
-        {
-          range: `${tabName}!K1`,
-          values: [[`=CONCAT("收給 ",${devNameRef}," →")`]],
-        },
-        { range: `${tabName}!L1`, values: [[totalFormula]] },
-        { range: `${tabName}!I2`, values: [[spillFormula]] },
+        // Rank 1..N in column I next to the spilled name/amount.
+        { range: `${tabName}!I2`, values: [[`=SEQUENCE(${N})`]] },
+        { range: `${tabName}!J2`, values: [[spillFormula]] },
       );
     }
   }
