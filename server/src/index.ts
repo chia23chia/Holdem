@@ -46,8 +46,10 @@ import {
   endHand,
   getEndResult,
   getHand,
+  getPendingRiverPeek,
   getPrivateFor,
   hasActiveHand,
+  resumeAfterRiverPeek,
   startHand,
   toPublicState,
   type AppliedActionLog,
@@ -102,6 +104,7 @@ async function finalizeRoomState(roomId: string, empty: boolean) {
     lastHandLogIdByRoom.delete(roomId);
     pendingRebuysByRoom.delete(roomId);
     idleStreakByRoom.delete(roomId);
+    cancelRiverPeekTimer(roomId);
     pendingForcedStandupByRoom.delete(roomId);
     await deleteHandLogsForRoom(roomId);
     await closeRoom(roomId);
@@ -128,6 +131,28 @@ const lastHandLogIdByRoom = new Map<string, string>();
 // popup for a fun feature.
 const STICKER_COOLDOWN_MS = 3_000;
 const stickerLastSentByUser = new Map<string, number>();
+
+// River-peek timeout: how long the runout waits for the trailing player to
+// commit their flip before auto-flipping. See §11.32.
+const RIVER_PEEK_TIMEOUT_MS = 10_000;
+const riverPeekTimers = new Map<string, NodeJS.Timeout>();
+
+function cancelRiverPeekTimer(roomId: string): void {
+  const t = riverPeekTimers.get(roomId);
+  if (t) {
+    clearTimeout(t);
+    riverPeekTimers.delete(roomId);
+  }
+}
+
+function scheduleRiverPeekTimeout(roomId: string): void {
+  cancelRiverPeekTimer(roomId);
+  const handle = setTimeout(() => {
+    riverPeekTimers.delete(roomId);
+    void finishRiverPeek(roomId);
+  }, RIVER_PEEK_TIMEOUT_MS);
+  riverPeekTimers.set(roomId, handle);
+}
 
 // Rebuy queue: mid-hand rebuy requests wait here. Applied to Membership
 // after the hand ends, before the next one starts. Value = the requested
@@ -232,6 +257,7 @@ async function forceStandUp(roomId: string, userId: string): Promise<void> {
       lastHandLogIdByRoom.delete(roomId);
       pendingRebuysByRoom.delete(roomId);
       idleStreakByRoom.delete(roomId);
+      cancelRiverPeekTimer(roomId);
       pendingForcedStandupByRoom.delete(roomId);
       await deleteHandLogsForRoom(roomId);
       syncSettlementSafely(outcome.settlement);
@@ -390,105 +416,151 @@ async function broadcastAfterAction(
     }
   }
 
+  // River-peek pause: the runout dealt the river but held the showdown so
+  // the trailing player can flip it dramatically (§11.32). Emit the peek-
+  // start event + arm the auto-flip timeout; the ended branch is naturally
+  // skipped because `ended = false` (phase is still 'river').
+  if (hand.pendingRiverPeek) {
+    cancelAutoAction(roomId); // no player's turn during peek
+    io.to(roomChannel(roomId)).emit('game:river-peek-start', {
+      riverCard: hand.pendingRiverPeek.riverCard,
+      peekByUserId: hand.pendingRiverPeek.trailingUserId,
+      deadline: Date.now() + RIVER_PEEK_TIMEOUT_MS,
+    });
+    scheduleRiverPeekTimeout(roomId);
+    return;
+  }
+
   if (ended) {
-    try {
-      const snap = chipsSnapshot(hand);
-      await persistHandResult(roomId, snap);
-    } catch (err) {
-      console.error('[server] persistHandResult error', err);
-    }
+    await finalizeEndedHand(roomId);
+  }
 
-    // Tournament elimination + possible finish. No-op (returns finished:
-    // false immediately) for cash rooms, so this can't affect the cash path.
-    let tournamentOutcome: { finished: boolean; settlement?: SettlementSummary } = {
-      finished: false,
-    };
-    try {
-      tournamentOutcome = await processTournamentHandEnd(roomId);
-    } catch (err) {
-      console.error('[server] processTournamentHandEnd error', err);
-    }
+  rescheduleAutoAction(roomId);
+}
 
-    const result = getEndResult(hand);
+// Extracted from broadcastAfterAction's ended branch so finishRiverPeek can
+// reuse it after resuming a peek-paused runout. Everything from "hand is
+// now phase=ended" downward: persistence, tournament tear-down, DB update,
+// game:ended broadcast, room detail refresh.
+async function finalizeEndedHand(roomId: string): Promise<void> {
+  const hand = getHand(roomId);
+  if (!hand || hand.phase !== 'ended') return;
 
-    if (tournamentOutcome.finished && tournamentOutcome.settlement) {
-      // Tournament room is already closed + memberships deleted (done inside
-      // processTournamentHandEnd's transaction). Tear down like the existing
-      // room:close / session-expiry paths instead of the normal "flip to
-      // waiting, wait for next hand" flow below — cancelAutoAction already
-      // handles timer cleanup, so skipping the final rescheduleAutoAction
-      // call at the bottom of this function (via `return`) is safe.
-      cancelAutoAction(roomId);
-      clearRoomState(roomId);
-      lastHandLogIdByRoom.delete(roomId);
-      pendingRebuysByRoom.delete(roomId);
-      idleStreakByRoom.delete(roomId);
-      pendingForcedStandupByRoom.delete(roomId);
-      try {
-        await deleteHandLogsForRoom(roomId);
-      } catch (err) {
-        console.error('[server] deleteHandLogsForRoom error', err);
-      }
-      io.to(roomChannel(roomId)).emit('game:ended', {
-        roomId,
-        result: result ?? undefined,
-      });
-      syncSettlementSafely(tournamentOutcome.settlement);
-      io.to(roomChannel(roomId)).emit('room:closed', {
-        roomId,
-        settlement: tournamentOutcome.settlement,
-      });
-      io.to(LOBBY_ROOM).emit('lobby:room-removed', { roomId });
-      return;
-    }
+  try {
+    const snap = chipsSnapshot(hand);
+    await persistHandResult(roomId, snap);
+  } catch (err) {
+    console.error('[server] persistHandResult error', err);
+  }
 
-    // Persist the completed hand to HandLog for later review / cross-session.
+  // Tournament elimination + possible finish. No-op (returns finished:
+  // false immediately) for cash rooms, so this can't affect the cash path.
+  let tournamentOutcome: { finished: boolean; settlement?: SettlementSummary } = {
+    finished: false,
+  };
+  try {
+    tournamentOutcome = await processTournamentHandEnd(roomId);
+  } catch (err) {
+    console.error('[server] processTournamentHandEnd error', err);
+  }
+
+  const result = getEndResult(hand);
+
+  if (tournamentOutcome.finished && tournamentOutcome.settlement) {
+    // Tournament room is already closed + memberships deleted (done inside
+    // processTournamentHandEnd's transaction). Tear down like the existing
+    // room:close / session-expiry paths instead of the normal "flip to
+    // waiting, wait for next hand" flow below.
+    cancelAutoAction(roomId);
+    clearRoomState(roomId);
+    lastHandLogIdByRoom.delete(roomId);
+    pendingRebuysByRoom.delete(roomId);
+    idleStreakByRoom.delete(roomId);
+    cancelRiverPeekTimer(roomId);
+    pendingForcedStandupByRoom.delete(roomId);
     try {
-      const logData = buildHandLogData(hand);
-      const { id: handLogId } = await persistHandLog(
-        roomId,
-        hand.handNumber,
-        logData,
-      );
-      lastHandLogIdByRoom.set(roomId, handLogId);
+      await deleteHandLogsForRoom(roomId);
     } catch (err) {
-      console.error('[server] persistHandLog error', err);
+      console.error('[server] deleteHandLogsForRoom error', err);
     }
-    // Flip room back to 'waiting' — owner can now close between hands.
-    try {
-      await setRoomStatus(roomId, 'waiting');
-    } catch (err) {
-      console.error('[server] setRoomStatus error', err);
-    }
-    // Apply any queued rebuys BEFORE broadcasting so clients see the updated
-    // chipsAtTable in the same room:detail push.
-    try {
-      await drainPendingRebuys(roomId);
-    } catch (err) {
-      console.error('[server] drainPendingRebuys error', err);
-    }
-    // Same for forced standups queued while the idle player was still
-    // active this hand (see AUTO_ACTION_STANDUP_THRESHOLD) — safe now that
-    // the hand is over.
-    try {
-      await drainPendingForcedStandups(roomId);
-    } catch (err) {
-      console.error('[server] drainPendingForcedStandups error', err);
-    }
-    // Always tell clients the hand ended, even if persistence above failed —
-    // otherwise their UI stays frozen on the last in-progress state forever.
     io.to(roomChannel(roomId)).emit('game:ended', {
       roomId,
       result: result ?? undefined,
     });
-    try {
-      await broadcastRoomDetail(roomId);
-    } catch (err) {
-      console.error('[server] broadcastRoomDetail error', err);
-    }
+    syncSettlementSafely(tournamentOutcome.settlement);
+    io.to(roomChannel(roomId)).emit('room:closed', {
+      roomId,
+      settlement: tournamentOutcome.settlement,
+    });
+    io.to(LOBBY_ROOM).emit('lobby:room-removed', { roomId });
+    return;
   }
 
-  rescheduleAutoAction(roomId);
+  // Persist the completed hand to HandLog for later review / cross-session.
+  try {
+    const logData = buildHandLogData(hand);
+    const { id: handLogId } = await persistHandLog(
+      roomId,
+      hand.handNumber,
+      logData,
+    );
+    lastHandLogIdByRoom.set(roomId, handLogId);
+  } catch (err) {
+    console.error('[server] persistHandLog error', err);
+  }
+  // Flip room back to 'waiting' — owner can now close between hands.
+  try {
+    await setRoomStatus(roomId, 'waiting');
+  } catch (err) {
+    console.error('[server] setRoomStatus error', err);
+  }
+  // Apply any queued rebuys BEFORE broadcasting so clients see the updated
+  // chipsAtTable in the same room:detail push.
+  try {
+    await drainPendingRebuys(roomId);
+  } catch (err) {
+    console.error('[server] drainPendingRebuys error', err);
+  }
+  // Same for forced standups queued while the idle player was still
+  // active this hand (see AUTO_ACTION_STANDUP_THRESHOLD) — safe now that
+  // the hand is over.
+  try {
+    await drainPendingForcedStandups(roomId);
+  } catch (err) {
+    console.error('[server] drainPendingForcedStandups error', err);
+  }
+  // Always tell clients the hand ended, even if persistence above failed —
+  // otherwise their UI stays frozen on the last in-progress state forever.
+  io.to(roomChannel(roomId)).emit('game:ended', {
+    roomId,
+    result: result ?? undefined,
+  });
+  try {
+    await broadcastRoomDetail(roomId);
+  } catch (err) {
+    console.error('[server] broadcastRoomDetail error', err);
+  }
+}
+
+// Runs after the trailing player commits the flip (or timeout fires).
+// Resumes the paused runout server-side (push river street + advance to
+// showdown), then broadcasts the reveal + runs the standard end-of-hand
+// finalization pipeline.
+async function finishRiverPeek(roomId: string): Promise<void> {
+  cancelRiverPeekTimer(roomId);
+  const beforeHand = getHand(roomId);
+  if (!beforeHand?.pendingRiverPeek) return; // race: already resolved
+  resumeAfterRiverPeek(roomId);
+  const hand = getHand(roomId);
+  if (!hand) return;
+  // Close the peek modal on every client + reveal the river in the community.
+  // Client uses the riverCard + trailingUserId it cached from peek-start to
+  // update its local hands history entry, so no extra payload needed here.
+  io.to(roomChannel(roomId)).emit('game:river-revealed');
+  // Broadcast updated state (phase='ended', full community) before the
+  // ended-branch finalizer emits game:ended + result.
+  io.to(roomChannel(roomId)).emit('game:state', toPublicState(hand, roomId));
+  await finalizeEndedHand(roomId);
 }
 
 type StartHandOutcome =
@@ -686,6 +758,7 @@ io.on('connection', (socket) => {
     lastHandLogIdByRoom.delete(roomId);
     pendingRebuysByRoom.delete(roomId);
     idleStreakByRoom.delete(roomId);
+    cancelRiverPeekTimer(roomId);
     pendingForcedStandupByRoom.delete(roomId);
     await deleteHandLogsForRoom(roomId);
     const settlement = await buildOwnerCloseSettlement(roomId, players);
@@ -794,6 +867,35 @@ io.on('connection', (socket) => {
     }
   });
 
+  // ---- River peek (§11.32) ----
+  socket.on('game:river-peek-progress', ({ roomId, edge, amount }) => {
+    const peek = getPendingRiverPeek(roomId);
+    if (!peek || peek.trailingUserId !== user.userId) return;
+    // Basic bounds — junk input just gets silently dropped.
+    if (
+      edge !== 'top' && edge !== 'bottom' &&
+      edge !== 'left' && edge !== 'right'
+    ) return;
+    if (typeof amount !== 'number' || amount < 0 || amount > 100) return;
+    // Relay to everyone EXCEPT the sender (they render locally from their
+    // own drag). No rate limiting on the server — client throttles to
+    // ~20fps and the room's small anyway.
+    socket.to(roomChannel(roomId)).emit('game:river-peek-progress', {
+      edge,
+      amount,
+    });
+  });
+
+  socket.on('game:river-flip', async ({ roomId }, cb) => {
+    const peek = getPendingRiverPeek(roomId);
+    if (!peek) return cb({ ok: false, error: '目前不是翻牌時機' });
+    if (peek.trailingUserId !== user.userId) {
+      return cb({ ok: false, error: '只有落後方可以翻牌' });
+    }
+    cb({ ok: true });
+    await finishRiverPeek(roomId);
+  });
+
   // Voluntary reveal — any player still recorded in this ended hand.
   socket.on('game:show-cards', async ({ roomId }) => {
     const ok = applyReveal(roomId, user.userId);
@@ -876,6 +978,7 @@ async function scanExpiredSessions() {
       if (!settlement) continue;
       syncSettlementSafely(settlement);
       cancelAutoAction(roomId);
+      cancelRiverPeekTimer(roomId);
       clearRoomState(roomId);
       lastHandLogIdByRoom.delete(roomId);
       await deleteHandLogsForRoom(roomId);

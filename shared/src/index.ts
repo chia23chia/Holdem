@@ -371,6 +371,29 @@ export interface ServerToClientEvents {
     players: Array<{ userId: string; name: string; holeCards: [Card, Card] }>;
   }) => void;
   'game:ended': (data: { roomId: string; result?: HandEndResult }) => void;
+
+  // ---- River peek (§11.32) — dramatic reveal on all-in runout ----
+  // Server holds runout right before revealing the river card. Fires
+  // once, with the trailing player designated as the peeker. Every
+  // client opens a full-screen peek modal; only the peekByUserId can
+  // interact. When they flip (see below) or timeout hits, the runout
+  // resumes to showdown as normal.
+  'game:river-peek-start': (data: {
+    riverCard: Card;
+    peekByUserId: string;
+    deadline: number; // epoch ms — client shows countdown/auto-fires
+  }) => void;
+  // Peeker's drag position, relayed to everyone else so all clients see
+  // the same peek animation live. Throttled ~20fps by the sender.
+  'game:river-peek-progress': (data: {
+    edge: 'top' | 'bottom' | 'left' | 'right';
+    amount: number; // 0-100 — how far this edge is lifted
+  }) => void;
+  // Broadcast when the peek ends (flip committed or timeout). Modal
+  // closes on all clients + river card takes its normal place in the
+  // community board; showdown follows on the usual game:state /
+  // game:ended path.
+  'game:river-revealed': () => void;
 }
 
 export interface ClientToServerEvents {
@@ -407,6 +430,20 @@ export interface ClientToServerEvents {
   // extends the deadline by min(30s, remainingBank), deducts the same
   // from bank. One activation per turn max. See §11.30.
   'game:time-bank': (
+    data: { roomId: string },
+    cb: (res: GameActionResult) => void,
+  ) => void;
+
+  // ---- River peek (§11.32) ----
+  // Peeker's throttled drag position. Server just relays to the room.
+  'game:river-peek-progress': (data: {
+    roomId: string;
+    edge: 'top' | 'bottom' | 'left' | 'right';
+    amount: number;
+  }) => void;
+  // Peeker committed the flip (drag past threshold). Server broadcasts
+  // game:river-revealed + resumes the runout to showdown.
+  'game:river-flip': (
     data: { roomId: string },
     cb: (res: GameActionResult) => void,
   ) => void;

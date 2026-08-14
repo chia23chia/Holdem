@@ -66,6 +66,11 @@ interface HandState {
   // is purely a live/transient signal for early hole-card reveal + the
   // "trailing player" river highlight.
   allInRevealPayload?: Array<{ userId: string; name: string; holeCards: [Card, Card] }>;
+  // Set when the runout has dealt the river card but is holding the showdown
+  // until the peek is committed. Contains the trailingUserId (the "peeker")
+  // and the actual river card. Cleared after resumeAfterRiverPeek runs.
+  // See §11.32.
+  pendingRiverPeek?: { trailingUserId: string; riverCard: Card };
 }
 
 // Per-player time bank (see §11.30). Persists across hands within a room —
@@ -548,6 +553,10 @@ function advancePhase(hand: HandState): void {
     nextPhase === 'river'
   ) {
     maybeRevealAllIn(hand);
+    // River peek pause — if applicable, DON'T push street to history and
+    // DON'T advance further; index.ts will notice pendingRiverPeek and
+    // hold the runout open for the trailing player to flip (§11.32).
+    if (nextPhase === 'river' && tryStartRiverPeek(hand)) return;
     hand.history.push({
       kind: 'street',
       phase: nextPhase,
@@ -605,6 +614,9 @@ function maybeAdvanceIfNoAction(hand: HandState): void {
       nextPhase === 'river'
     ) {
       maybeRevealAllIn(hand);
+      // River peek pause — same guard as in advancePhase; break the
+      // fast-forward loop and leave pendingRiverPeek set for index.ts.
+      if (nextPhase === 'river' && tryStartRiverPeek(hand)) return;
       hand.history.push({
         kind: 'street',
         phase: nextPhase,
@@ -649,6 +661,53 @@ function maybeRevealAllIn(hand: HandState): void {
       holeCards: p.holeCards,
     }));
   }
+}
+
+// Called right after the river card has been dealt into hand.community, but
+// BEFORE it's pushed to history / anyone knows. If we're mid all-in runout
+// AND there's a distinct trailing player, transition into the peek pause:
+// stash the river card + trailing player in pendingRiverPeek, and signal
+// callers to skip the normal "push street history + advance to showdown"
+// path. resumeAfterRiverPeek finishes the runout later (see index.ts —
+// fires on client's game:river-flip or a server-side timeout).
+// Returns true if the peek pause was engaged.
+function tryStartRiverPeek(hand: HandState): boolean {
+  if (hand.phase !== 'river') return false;
+  if (!hand.allInRevealPayload) return false;
+  if (hand.community.length < 5) return false; // river dealt but incomplete somehow
+  const trailingUserId = computeTrailingUserId(hand);
+  if (!trailingUserId) return false;
+  const riverCard = hand.community[hand.community.length - 1];
+  hand.pendingRiverPeek = { trailingUserId, riverCard };
+  // No one's on the clock while the peek modal is up.
+  hand.currentPlayerIdx = null;
+  return true;
+}
+
+// Public accessor for the peek metadata (index.ts uses it to emit
+// game:river-peek-start after applyAction returns).
+export function getPendingRiverPeek(
+  roomId: string,
+): { trailingUserId: string; riverCard: Card } | undefined {
+  return hands.get(roomId)?.pendingRiverPeek;
+}
+
+// Resume the runout after the peek finishes (flip event or timeout).
+// Pushes the held-back river street to history, clears the pending
+// state, and advances the hand to showdown → endWithShowdown. Idempotent:
+// no-op if pendingRiverPeek isn't set.
+export function resumeAfterRiverPeek(roomId: string): void {
+  const hand = hands.get(roomId);
+  if (!hand?.pendingRiverPeek) return;
+  hand.history.push({
+    kind: 'street',
+    phase: 'river',
+    cards: hand.community.slice(),
+    trailingUserId: hand.pendingRiverPeek.trailingUserId,
+  });
+  hand.pendingRiverPeek = undefined;
+  hand.phase = 'showdown';
+  endWithShowdown(hand);
 }
 
 // Who's currently behind, for the river-flip highlight. Only meaningful (and
