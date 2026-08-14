@@ -39,6 +39,8 @@ services:
       NEXTAUTH_SECRET: ${NEXTAUTH_SECRET}
       GOOGLE_SHEETS_SA_KEY: ${GOOGLE_SHEETS_SA_KEY}
       GOOGLE_SHEETS_SPREADSHEET_ID: ${GOOGLE_SHEETS_SPREADSHEET_ID}
+      DEV_USER_ID: ${DEV_USER_ID}
+      DEV_FEE_PERCENT: ${DEV_FEE_PERCENT}
     depends_on:
       postgres:
         condition: service_healthy
