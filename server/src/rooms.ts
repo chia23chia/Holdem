@@ -1,4 +1,5 @@
 import { prisma, Prisma } from '@holdem/db';
+import { isHandLogData } from '@holdem/shared';
 import type {
   HandEndResult,
   HandLogData,
@@ -8,6 +9,7 @@ import type {
   RoomType,
   SettlementSummary,
 } from '@holdem/shared';
+import { log } from './logger.js';
 
 export const displayName = (u: { nickname: string | null; name: string | null }) =>
   u.nickname ?? u.name ?? 'unknown';
@@ -452,18 +454,38 @@ export async function startSessionIfNeeded(roomId: string): Promise<boolean> {
 
 // After a hand ends, sync each seated player's chipsAtTable to the in-memory
 // hand result. Called before broadcasting a fresh room:detail.
+//
+// T2 (docs/AUDIT_2026-10-20.md): per-row update with explicit missing-row
+// handling. Previous `updateMany` silently returned count:0 when a
+// Membership had vanished (e.g. tournament bust-mid-hand deleted the row),
+// so the chip delta disappeared without a trace. Now each row's absence is
+// logged with roomId + userId. Deliberately NOT wrapped in a single
+// transaction — one missing row shouldn't block the other players' chip
+// writes.
 export async function persistHandResult(
   roomId: string,
   snapshot: Array<{ userId: string; chips: number }>,
 ): Promise<void> {
-  await prisma.$transaction(
-    snapshot.map((s) =>
-      prisma.membership.updateMany({
-        where: { roomId, userId: s.userId },
+  for (const s of snapshot) {
+    try {
+      await prisma.membership.update({
+        where: { userId_roomId: { userId: s.userId, roomId } },
         data: { chipsAtTable: s.chips },
-      }),
-    ),
-  );
+      });
+    } catch (err) {
+      if (
+        err instanceof Prisma.PrismaClientKnownRequestError &&
+        err.code === 'P2025'
+      ) {
+        log.warn(
+          { roomId, userId: s.userId, chips: s.chips },
+          'persistHandResult: membership missing — chip delta lost',
+        );
+        continue;
+      }
+      throw err;
+    }
+  }
 }
 
 // Persist a completed hand's snapshot with a caller-supplied handNumber.
@@ -512,7 +534,11 @@ export async function updateHandLogEndResult(
     select: { data: true },
   });
   if (!row) return;
-  const data = row.data as unknown as HandLogData;
+  if (!isHandLogData(row.data)) {
+    log.warn({ handLogId }, 'updateHandLogEndResult: stored HandLog.data shape invalid');
+    return;
+  }
+  const data = row.data;
   data.endResult = endResult;
   await prisma.handLog.update({
     where: { id: handLogId },
@@ -538,13 +564,19 @@ export async function listHandLogs(
     orderBy: { handNumber: 'desc' },
     take: limit,
   });
-  return rows.map((r) => ({
-    id: r.id,
-    handNumber: r.handNumber,
-    startedAt: r.startedAt.toISOString(),
-    endedAt: r.endedAt.toISOString(),
-    data: r.data as unknown as HandLogData,
-  }));
+  return rows
+    .filter((r) => {
+      if (isHandLogData(r.data)) return true;
+      log.warn({ handLogId: r.id, roomId }, 'listHandLogs: skipping row with invalid data shape');
+      return false;
+    })
+    .map((r) => ({
+      id: r.id,
+      handNumber: r.handNumber,
+      startedAt: r.startedAt.toISOString(),
+      endedAt: r.endedAt.toISOString(),
+      data: r.data as unknown as HandLogData,
+    }));
 }
 
 // Returns rooms with a non-null sessionEndsAt in the past that aren't yet closed.

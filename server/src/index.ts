@@ -43,7 +43,6 @@ import {
   buildHandLogData,
   chipsSnapshot,
   clearRoomState,
-  endHand,
   getEndResult,
   getHand,
   getPrivateFor,
@@ -525,9 +524,18 @@ async function broadcastAfterAction(
   rescheduleAutoAction(roomId);
 }
 
+// T5: discriminated error branch. Adding a new error reason forces every
+// consumer to think about it (switch exhaustiveness), rather than relying on
+// an optional `needsRebuy?: true` flag that's easy to forget to set/clear.
+type StartHandFailureKind =
+  | 'not-found'
+  | 'already-in-progress'
+  | 'session-expired'
+  | 'too-few'
+  | 'needs-rebuy';
 type StartHandOutcome =
   | { ok: true }
-  | { ok: false; error: string; needsRebuy?: true };
+  | { ok: false; kind: StartHandFailureKind; error: string };
 
 // Core hand-start logic: validates funded-player count, deals a new hand,
 // and broadcasts it. Shared by the owner-triggered `game:start` handler and
@@ -535,15 +543,17 @@ type StartHandOutcome =
 // to manually retry once a busted player has rebought in.
 async function startHandForRoom(roomId: string): Promise<StartHandOutcome> {
   const detail = await getRoomDetail(roomId);
-  if (!detail) return { ok: false, error: '房間不存在' };
-  if (hasActiveHand(roomId)) return { ok: false, error: '已在牌局中' };
+  if (!detail) return { ok: false, kind: 'not-found', error: '房間不存在' };
+  if (hasActiveHand(roomId)) {
+    return { ok: false, kind: 'already-in-progress', error: '已在牌局中' };
+  }
   // Block new hands after session expiry — scanExpiredSessions can lag up to
   // 30s so without this a client-side auto-next-hand emit could sneak past.
   // Tournaments don't set sessionEndsAt, so this only applies to cash rooms.
   if (detail.sessionEndsAt) {
     const endsAt = new Date(detail.sessionEndsAt).getTime();
     if (endsAt <= Date.now()) {
-      return { ok: false, error: '房間時間已到,無法開新手' };
+      return { ok: false, kind: 'session-expired', error: '房間時間已到,無法開新手' };
     }
   }
   // Players with 0 chips sit out — they aren't dealt in. Cash game: they
@@ -552,16 +562,16 @@ async function startHandForRoom(roomId: string): Promise<StartHandOutcome> {
   const playersWithChips = detail.seats.filter((s) => s.chipsAtTable > 0);
   if (playersWithChips.length < 2) {
     return detail.roomType === 'tournament'
-      ? { ok: false, error: '需要至少 2 位玩家才能開始錦標賽' }
+      ? { ok: false, kind: 'too-few', error: '需要至少 2 位玩家才能開始錦標賽' }
       : {
           ok: false,
+          kind: 'needs-rebuy',
           error: '需要至少 2 位有籌碼的玩家(0 籌碼玩家請先加值)',
-          needsRebuy: true,
         };
   }
 
-  // Wipe any prior ended-hand state before starting fresh.
-  endHand(roomId);
+  // S1: no explicit wipe needed — startHand() unconditionally overwrites
+  // the hands map entry below, so any prior ended-hand state is replaced.
   // Determine the next hand number now (server authoritative) so the
   // HandStatePublic broadcast and the eventual HandLog write agree.
   const priorCount = await countHandLogs(roomId);
@@ -785,10 +795,11 @@ io.on('connection', (socket) => {
       return cb({ ok: false, error: '只有房主可以開牌局' });
     }
     const outcome = await startHandForRoom(roomId);
-    cb(outcome);
+    // cb expects { ok, error? } — strip the discriminator before responding.
+    cb(outcome.ok ? { ok: true } : { ok: false, error: outcome.error });
     // Let everyone (not just the owner) know why nothing's happening —
     // the busted-out player specifically needs to see this to know to rebuy.
-    if (!outcome.ok && outcome.needsRebuy) {
+    if (!outcome.ok && outcome.kind === 'needs-rebuy') {
       io.to(roomChannel(roomId)).emit('room:error', { message: outcome.error });
     }
   });
@@ -806,7 +817,10 @@ io.on('connection', (socket) => {
       return cb({ ok: false, error: '目前有牌進行中,等本手結束再試' });
     }
     cancelAutoAction(roomId);
-    endHand(roomId);
+    // S1: owner-triggered end — clearRoomState wipes hand + dealer rotation
+    // + time bank. Losing dealer rotation across a manual owner-end is
+    // acceptable (next hand is a fresh session anyway).
+    clearRoomState(roomId);
     await setRoomStatus(roomId, 'waiting');
     cb({ ok: true });
     io.to(roomChannel(roomId)).emit('game:ended', { roomId });

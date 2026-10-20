@@ -197,10 +197,6 @@ function isEnded(hand: HandState): boolean {
   return hand.phase === 'ended';
 }
 
-export function endHand(roomId: string): void {
-  hands.delete(roomId);
-}
-
 export function clearRoomState(roomId: string): void {
   hands.delete(roomId);
   lastDealerByRoom.delete(roomId);
@@ -386,7 +382,14 @@ export function applyAction(
       break;
     }
     case 'raise': {
-      const totalTarget = Math.floor(action.amount);
+      // T3: require integer amount at the boundary. Zod schema already
+      // enforces this at the Socket entry; this is defense-in-depth for
+      // any future caller that reaches applyAction without going through
+      // the socket schema (e.g. an internal auto-action path).
+      if (!Number.isInteger(action.amount)) {
+        return { ok: false, error: '加注金額必須為整數' };
+      }
+      const totalTarget = action.amount;
       if (!Number.isFinite(totalTarget)) {
         return { ok: false, error: '加注金額無效' };
       }
@@ -856,12 +859,12 @@ export function getPrivateFor(
   };
 }
 
-// Compute pokersolver `name` for hole + community. Preflop (0 community cards)
-// falls back to a 2-card check because pokersolver requires ≥5 cards.
+// Compute pokersolver `name` for hole + community. Preflop (0 community
+// cards) returns '' — the player already sees their two hole cards, so a
+// "Pair"/"High Card" label adds no information (S4 in audit). The client
+// conditionally renders when handRank is non-empty.
 function evalHandRank(hole: [Card, Card], community: Card[]): string {
-  if (community.length === 0) {
-    return hole[0].rank === hole[1].rank ? 'Pair' : 'High Card';
-  }
+  if (community.length === 0) return '';
   const cards = [...hole.map(cardToStr), ...community.map(cardToStr)];
   return PokerHand.solve(cards).name;
 }

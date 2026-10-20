@@ -158,6 +158,30 @@ export interface HandLogData {
   endResult: HandEndResult;
 }
 
+// Structural validator for HandLogData coming back from Prisma Json columns
+// (T1 in docs/AUDIT_2026-10-20.md). If the shared type evolves and historical
+// DB rows lack the new field, this returns false instead of silently handing
+// back a half-populated object that crashes the renderer.
+//
+// Deliberately shallow: top-level key presence + primitive types only. The
+// nested shapes (HandHistoryEntry union etc.) aren't checked exhaustively —
+// zod would be overkill for a one-way read of trusted server-written data.
+export function isHandLogData(raw: unknown): raw is HandLogData {
+  if (!raw || typeof raw !== 'object') return false;
+  const d = raw as Record<string, unknown>;
+  return (
+    typeof d.startedAt === 'number' &&
+    typeof d.endedAt === 'number' &&
+    typeof d.dealerSeat === 'number' &&
+    typeof d.smallBlind === 'number' &&
+    typeof d.bigBlind === 'number' &&
+    typeof d.actionTimeoutSeconds === 'number' &&
+    Array.isArray(d.players) &&
+    Array.isArray(d.history) &&
+    d.endResult !== undefined && d.endResult !== null
+  );
+}
+
 export type GameActionResult =
   | { ok: true }
   | { ok: false; error: string };
