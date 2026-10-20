@@ -33,6 +33,7 @@ import {
   saveFourColorDeck,
   type BlockedUser,
 } from '@/lib/prefs';
+import { useEscape } from '@/lib/useEscape';
 
 // Deck color scheme is read deep in CardView / InlineCard — passing a prop
 // through 8 call sites (some inside SeatCard/HistoryList) would be noisy,
@@ -62,6 +63,16 @@ export default function RoomPage() {
   const [error, setError] = useState<string | null>(null);
   const [showCloseConfirm, setShowCloseConfirm] = useState(false);
   const [closing, setClosing] = useState(false);
+  // Esc closes the close-room confirm (U-3 A4). Inline here because the
+  // dialog isn't an extracted component yet.
+  useEffect(() => {
+    if (!showCloseConfirm) return;
+    const h = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setShowCloseConfirm(false);
+    };
+    window.addEventListener('keydown', h);
+    return () => window.removeEventListener('keydown', h);
+  }, [showCloseConfirm]);
   const [showRebuyConfirm, setShowRebuyConfirm] = useState(false);
   const [gameState, setGameState] = useState<HandStatePublic | null>(null);
   const [holeCards, setHoleCards] = useState<[Card, Card] | null>(null);
@@ -1436,8 +1447,13 @@ export default function RoomPage() {
 
       {showCloseConfirm && room && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
-          <div className="w-full max-w-md rounded-lg border border-slate-700 bg-slate-900 p-6">
-            <h2 className="mb-3 text-lg font-bold">關閉房間?</h2>
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="close-room-modal-title"
+            className="w-full max-w-md rounded-lg border border-slate-700 bg-slate-900 p-6"
+          >
+            <h2 id="close-room-modal-title" className="mb-3 text-lg font-bold">關閉房間?</h2>
             <p className="mb-4 text-sm text-slate-300">
               將踢出房內 {room.currentPlayers} 位玩家,桌上籌碼會退回各自餘額。此動作無法復原。
             </p>
@@ -2073,6 +2089,22 @@ function SeatCard({
   );
 }
 
+// Small keyboard-shortcut badge; desktop-only so phones aren't littered
+// with hints they can't press. `dark` variant for use on amber buttons.
+function KbdHint({ k, dark = false }: { k: string; dark?: boolean }) {
+  return (
+    <span
+      className={`ml-2 hidden rounded border px-1 text-[10px] sm:inline-block ${
+        dark
+          ? 'border-slate-700 text-slate-700'
+          : 'border-slate-500 text-slate-400'
+      }`}
+    >
+      {k}
+    </span>
+  );
+}
+
 function ActionBar({
   secondsLeft,
   extended,
@@ -2100,6 +2132,32 @@ function ActionBar({
   const maxTotal = myBet + myChips; // = all-in
   const [showRaiseModal, setShowRaiseModal] = useState(false);
 
+  // Desktop hotkeys (U-3 D): F = fold, C = check/call, R = open raise.
+  // Only active while ActionBar is mounted (which is only when it's your
+  // turn) so there's no "fired at wrong moment" concern. Ignored while
+  // typing in a chat input or when the raise modal is already open.
+  useEffect(() => {
+    const h = (e: KeyboardEvent) => {
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      const el = document.activeElement as HTMLElement | null;
+      if (el && ['INPUT', 'TEXTAREA'].includes(el.tagName)) return;
+      if (showRaiseModal) return;
+      const key = e.key.toLowerCase();
+      if (key === 'f') {
+        e.preventDefault();
+        onAction({ type: 'fold' });
+      } else if (key === 'c') {
+        e.preventDefault();
+        onAction(canCheck ? { type: 'check' } : { type: 'call' });
+      } else if (key === 'r') {
+        e.preventDefault();
+        setShowRaiseModal(true);
+      }
+    };
+    window.addEventListener('keydown', h);
+    return () => window.removeEventListener('keydown', h);
+  }, [onAction, canCheck, showRaiseModal]);
+
   return (
     <div className="mt-4 rounded border border-slate-700 bg-slate-950 p-3">
       <div className="mb-2 flex items-center justify-between text-xs">
@@ -2126,6 +2184,7 @@ function ActionBar({
           className="rounded bg-slate-700 px-3 py-2 text-sm font-semibold hover:bg-slate-600"
         >
           棄牌
+          <KbdHint k="F" />
         </button>
         {canCheck ? (
           <button
@@ -2133,6 +2192,7 @@ function ActionBar({
             className="rounded bg-emerald-700 px-3 py-2 text-sm font-semibold hover:bg-emerald-600"
           >
             過牌
+            <KbdHint k="C" />
           </button>
         ) : (
           <button
@@ -2140,6 +2200,7 @@ function ActionBar({
             className="rounded bg-emerald-700 px-3 py-2 text-sm font-semibold hover:bg-emerald-600"
           >
             跟注 {toCall}
+            <KbdHint k="C" />
           </button>
         )}
         <button
@@ -2147,6 +2208,7 @@ function ActionBar({
           className="rounded bg-amber-600 px-3 py-2 text-sm font-semibold text-slate-950 hover:bg-amber-500"
         >
           加註
+          <KbdHint k="R" dark />
         </button>
       </div>
 
@@ -2191,6 +2253,7 @@ function RaiseModal({
   const [raiseInput, setRaiseInput] = useState(
     String(Math.min(minTotalRaise, maxTotal)),
   );
+  useEscape(onCancel);
 
   function presetFraction(fraction: number) {
     // "1/3 pot" means raise TO currentBet + pot*fraction.
@@ -2205,7 +2268,8 @@ function RaiseModal({
     setRaiseInput(String(maxTotal));
   }
 
-  function submit() {
+  function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
     const n = Number(raiseInput);
     if (!Number.isFinite(n)) return;
     onConfirm(Math.floor(n));
@@ -2213,8 +2277,14 @@ function RaiseModal({
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
-      <div className="w-full max-w-sm rounded-lg border border-slate-700 bg-slate-900 p-6">
-        <h2 className="mb-3 text-lg font-bold">加註金額</h2>
+      <form
+        onSubmit={handleSubmit}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="raise-modal-title"
+        className="w-full max-w-sm rounded-lg border border-slate-700 bg-slate-900 p-6"
+      >
+        <h2 id="raise-modal-title" className="mb-3 text-lg font-bold">加註金額</h2>
         <div className="mb-3 flex flex-wrap gap-2">
           <button
             onClick={() => presetFraction(1 / 3)}
@@ -2264,14 +2334,13 @@ function RaiseModal({
             取消
           </button>
           <button
-            type="button"
-            onClick={submit}
+            type="submit"
             className="rounded bg-amber-600 px-4 py-2 font-semibold text-slate-950 hover:bg-amber-500"
           >
             送出
           </button>
         </div>
-      </div>
+      </form>
     </div>
   );
 }
@@ -2292,16 +2361,24 @@ function RebuyModal({
 }) {
   const cap = Math.max(500, capEstimate);
   const [amount, setAmount] = useState(cap);
+  useEscape(onCancel);
 
-  function submit() {
+  function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
     if (!Number.isFinite(amount) || amount <= 0 || amount % 500 !== 0) return;
     onConfirm(amount);
   }
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
-      <div className="w-full max-w-sm rounded-lg border border-slate-700 bg-slate-900 p-6">
-        <h2 className="mb-3 text-lg font-bold">加碼金額</h2>
+      <form
+        onSubmit={handleSubmit}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="rebuy-modal-title"
+        className="w-full max-w-sm rounded-lg border border-slate-700 bg-slate-900 p-6"
+      >
+        <h2 id="rebuy-modal-title" className="mb-3 text-lg font-bold">加碼金額</h2>
         <div className="mb-3 flex flex-wrap gap-2">
           <button
             onClick={() => setAmount(500)}
@@ -2351,14 +2428,13 @@ function RebuyModal({
             取消
           </button>
           <button
-            type="button"
-            onClick={submit}
+            type="submit"
             className="rounded bg-emerald-600 px-4 py-2 font-semibold hover:bg-emerald-500"
           >
             確定加碼
           </button>
         </div>
-      </div>
+      </form>
     </div>
   );
 }
@@ -2423,14 +2499,20 @@ function SettlementModal({
   summary: SettlementSummary;
   onDismiss: () => void;
 }) {
+  useEscape(onDismiss);
   if (summary.reason === 'tournament-finished') {
     const ranked = [...summary.players].sort(
       (a, b) => (a.finishRank ?? 999) - (b.finishRank ?? 999),
     );
     return (
       <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
-        <div className="w-full max-w-md rounded-lg border border-slate-700 bg-slate-900 p-6">
-          <h2 className="mb-4 text-lg font-bold">
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="settlement-modal-title"
+          className="w-full max-w-md rounded-lg border border-slate-700 bg-slate-900 p-6"
+        >
+          <h2 id="settlement-modal-title" className="mb-4 text-lg font-bold">
             錦標賽結束 · {summary.roomName}
           </h2>
           <ul className="mb-4 flex flex-col gap-1 text-sm">
@@ -2482,8 +2564,13 @@ function SettlementModal({
   );
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
-      <div className="w-full max-w-md rounded-lg border border-slate-700 bg-slate-900 p-6">
-        <h2 className="mb-2 text-lg font-bold">結算 · {summary.roomName}</h2>
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="settlement-cash-modal-title"
+        className="w-full max-w-md rounded-lg border border-slate-700 bg-slate-900 p-6"
+      >
+        <h2 id="settlement-cash-modal-title" className="mb-2 text-lg font-bold">結算 · {summary.roomName}</h2>
         <p className="mb-3 text-sm text-slate-400">{reasonLabel}</p>
         {summary.players.length === 0 ? (
           <p className="mb-4 text-sm text-slate-500">房內無人就座</p>
@@ -2745,12 +2832,15 @@ function BlockPopover({
   onConfirm: () => void;
   onCancel: () => void;
 }) {
+  useEscape(onCancel);
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
       onClick={onCancel}
     >
       <div
+        role="dialog"
+        aria-modal="true"
         className="w-full max-w-xs rounded-lg border border-slate-700 bg-slate-900 p-4"
         onClick={(e) => e.stopPropagation()}
       >
@@ -2794,17 +2884,21 @@ function BlockManageModal({
   onUnblock: (userId: string) => void;
   onClose: () => void;
 }) {
+  useEscape(onClose);
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4"
       onClick={onClose}
     >
       <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="block-manage-modal-title"
         className="w-full max-w-sm rounded-lg border border-slate-700 bg-slate-900 p-5"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="mb-3 flex items-center justify-between">
-          <h2 className="text-base font-bold">已習禁屏的玩家</h2>
+          <h2 id="block-manage-modal-title" className="text-base font-bold">已習禁屏的玩家</h2>
           <button
             type="button"
             onClick={onClose}

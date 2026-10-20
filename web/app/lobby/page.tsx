@@ -5,6 +5,7 @@ import { signOut, useSession } from 'next-auth/react';
 import { useRouter } from 'next/navigation';
 import type { RoomSummary } from '@holdem/shared';
 import { connectSocket, type TypedSocket } from '@/lib/socket';
+import { useEscape } from '@/lib/useEscape';
 
 export default function LobbyPage() {
   const { data: session, status } = useSession();
@@ -206,6 +207,7 @@ function NicknameModal({
   const [nickname, setNickname] = useState(initial);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  useEscape(onCancel);
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
@@ -232,8 +234,13 @@ function NicknameModal({
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
-      <div className="w-full max-w-md rounded-lg border border-slate-700 bg-slate-900 p-6">
-        <h2 className="mb-4 text-lg font-bold">修改暱稱</h2>
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="nickname-modal-title"
+        className="w-full max-w-md rounded-lg border border-slate-700 bg-slate-900 p-6"
+      >
+        <h2 id="nickname-modal-title" className="mb-4 text-lg font-bold">修改暱稱</h2>
         <form onSubmit={submit} className="flex flex-col gap-3 text-sm">
           <label className="flex flex-col gap-1">
             <span className="text-slate-300">新暱稱</span>
@@ -303,11 +310,17 @@ function CreateRoomModal({
   const [blindLevelMinutes, setBlindLevelMinutes] = useState(15);
   const [actionTimeoutSeconds, setActionTimeoutSeconds] = useState(30);
   const isTournament = roomType === 'tournament';
+  useEscape(onCancel);
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
-      <div className="w-full max-w-md rounded-lg border border-slate-700 bg-slate-900 p-6">
-        <h2 className="mb-4 text-lg font-bold">建立房間</h2>
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="create-room-modal-title"
+        className="w-full max-w-md rounded-lg border border-slate-700 bg-slate-900 p-6"
+      >
+        <h2 id="create-room-modal-title" className="mb-4 text-lg font-bold">建立房間</h2>
         <form
           onSubmit={(e) => {
             e.preventDefault();
