@@ -31,7 +31,7 @@ export interface Player {
   holeCards: [Card, Card];
 }
 
-interface HandState {
+export interface HandState {
   handNumber: number;         // Server-assigned sequential number within room
   phase: 'preflop' | 'flop' | 'turn' | 'river' | 'showdown' | 'ended';
   deck: Card[];
@@ -524,13 +524,17 @@ function nextIdxInToAct(hand: HandState, fromIdx: number): number | null {
   return null;
 }
 
-function advancePhase(hand: HandState): void {
-  // Reset per-round bets, keep currentBet=0 for next round.
-  for (const p of hand.players) p.bet = 0;
-  hand.currentBet = 0;
-  hand.minRaise = hand.bigBlind;
-  hand.toAct.clear();
-
+// R4: Shared street-advance primitive used by advancePhase (normal action
+// completion) and maybeAdvanceIfNoAction (all-in runout). Transitions phase
+// by one step according to the street table, deals the matching community
+// cards, pushes the street history + all-in reveal, and runs showdown if
+// we've landed there. Returns the new phase so the caller can early-exit on
+// 'showdown' / 'ended'.
+//
+// Deliberately does NOT touch toAct / minRaise / currentPlayerIdx — those
+// decisions belong to the caller (normal advance clears them for a new
+// betting round; runout doesn't).
+function dealNextStreet(hand: HandState): HandState['phase'] {
   const nextPhase = ({
     preflop: 'flop',
     flop: 'turn',
@@ -561,8 +565,20 @@ function advancePhase(hand: HandState): void {
 
   if (nextPhase === 'showdown') {
     endWithShowdown(hand);
-    return;
   }
+
+  return nextPhase;
+}
+
+function advancePhase(hand: HandState): void {
+  // Reset per-round bets, keep currentBet=0 for next round.
+  for (const p of hand.players) p.bet = 0;
+  hand.currentBet = 0;
+  hand.minRaise = hand.bigBlind;
+  hand.toAct.clear();
+
+  const newPhase = dealNextStreet(hand);
+  if (newPhase === 'showdown' || newPhase === 'ended') return;
 
   // Every active player owes an action this new round.
   for (let i = 0; i < hand.players.length; i++) {
@@ -583,49 +599,16 @@ function maybeAdvanceIfNoAction(hand: HandState): void {
     hand.phase !== 'showdown' &&
     hand.players.filter((p) => p.status === 'active').length <= 1
   ) {
-    const active = hand.players.filter((p) => p.status === 'active');
-    // If 1 active player still, they auto-check to end of hand (no raise possible
-    // when everyone else is all-in, since betting can't reopen).
+    // If 1 active player still, they auto-check to end of hand (no raise
+    // possible when everyone else is all-in, since betting can't reopen).
     // Just advance phase without further actions.
     for (const p of hand.players) p.bet = 0;
     hand.currentBet = 0;
-    const nextPhase = ({
-      preflop: 'flop',
-      flop: 'turn',
-      turn: 'river',
-      river: 'showdown',
-      showdown: 'ended',
-      ended: 'ended',
-    } as const)[hand.phase];
-    hand.phase = nextPhase;
 
-    if (nextPhase === 'flop') dealCommunity(hand, 3);
-    else if (nextPhase === 'turn') dealCommunity(hand, 1);
-    else if (nextPhase === 'river') dealCommunity(hand, 1);
-    if (
-      nextPhase === 'flop' ||
-      nextPhase === 'turn' ||
-      nextPhase === 'river'
-    ) {
-      maybeRevealAllIn(hand);
-      hand.history.push({
-        kind: 'street',
-        phase: nextPhase,
-        cards: hand.community.slice(),
-        trailingUserId: computeTrailingUserId(hand),
-      });
-    }
-    if (nextPhase === 'showdown') {
-      endWithShowdown(hand);
-      return;
-    }
-    // Loop again in case we're still in "no action possible" state.
-    // (active length still <=1 across streets → keep advancing)
-    if (active.length === 1) {
-      // The lone active can technically bet, but with no callers there's no
-      // point. Just fast-forward — this matches standard "run it out" behavior.
-      continue;
-    }
+    const newPhase = dealNextStreet(hand);
+    if (newPhase === 'showdown') return;
+    // Loop again — still "no action possible" state (active still <=1)
+    // keeps advancing all the way through showdown.
   }
   // Otherwise leave currentPlayerIdx as set by caller.
 }

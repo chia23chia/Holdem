@@ -50,6 +50,7 @@ import {
   startHand,
   toPublicState,
   type AppliedActionLog,
+  type HandState,
 } from './hands.js';
 import type { PlayerAction } from '@holdem/shared';
 import {
@@ -99,21 +100,38 @@ async function broadcastRoomDetail(roomId: string) {
   }
 }
 
+// R1: Shared room-teardown. Centralizes the identical in-memory wipe +
+// HandLog delete + room:closed/lobby:room-removed emits used by three paths
+// (finalizeRoomState-empty, room:close owner, tournament-finish inside
+// handleHandEnded, scanExpiredSessions). deleteHandLogsForRoom + settlement
+// sync are tolerant of failure — a hiccup there must still let the emits
+// fire so clients don't get stuck on a stale screen.
+async function teardownRoom(
+  roomId: string,
+  settlement: SettlementSummary | undefined,
+): Promise<void> {
+  clearRoomState(roomId);
+  disposeRoomState(roomId);
+  try {
+    await deleteHandLogsForRoom(roomId);
+  } catch (err) {
+    log.error({ err, roomId }, 'deleteHandLogsForRoom error');
+  }
+  if (settlement) syncSettlementSafely(settlement);
+  io.to(roomChannel(roomId)).emit('room:closed', {
+    roomId,
+    settlement: settlement ?? undefined,
+  });
+  io.to(LOBBY_ROOM).emit('lobby:room-removed', { roomId });
+}
+
 // Called after any unseat that might have emptied the room.
 // If empty → close + kick all subscribers (including spectators).
 // Otherwise → broadcast new detail and lobby list.
 async function finalizeRoomState(roomId: string, empty: boolean) {
   if (empty) {
-    cancelAutoAction(roomId);
-    clearRoomState(roomId);
-    lastHandLogIdByRoom.delete(roomId);
-    pendingRebuysByRoom.delete(roomId);
-    idleStreakByRoom.delete(roomId);
-    pendingForcedStandupByRoom.delete(roomId);
-    await deleteHandLogsForRoom(roomId);
     await closeRoom(roomId);
-    io.to(roomChannel(roomId)).emit('room:closed', { roomId });
-    io.to(LOBBY_ROOM).emit('lobby:room-removed', { roomId });
+    await teardownRoom(roomId, undefined);
   } else {
     await broadcastRoomDetail(roomId);
     await broadcastLobbyList();
@@ -124,10 +142,59 @@ async function finalizeRoomState(roomId: string, empty: boolean) {
 // Auto-action timer (Milestone 2.4)
 // ============================================================
 
-const autoActionTimers = new Map<string, NodeJS.Timeout>();
-// Latest persisted HandLog row id per room; used to patch endResult when a
-// voluntary reveal fires after the hand was already persisted.
-const lastHandLogIdByRoom = new Map<string, string>();
+// R2: All transient per-room server state consolidated here. Previously
+// scattered across six Maps that had to be torn down together in four places
+// — one of those (scanExpiredSessions) was already missing three deletes
+// before Batch 1 patched it. One record + one disposeRoomState() call means
+// adding a seventh per-room field doesn't require remembering four cleanup
+// sites.
+//
+// `timeBankByRoom` lives in hands.ts (closures over hand-engine state) and
+// is cleared by clearRoomState() — not folded here to keep that module
+// self-contained.
+interface RoomRuntimeState {
+  // Scheduled auto-fold/auto-check for the current turn, if any.
+  autoActionTimer: NodeJS.Timeout | null;
+  // Latest persisted HandLog row id; used to patch endResult when a
+  // voluntary reveal fires after the hand was already persisted.
+  lastHandLogId: string | null;
+  // Mid-hand rebuy requests. userId → requested amount. Applied after the
+  // hand ends, re-validated by rebuyChips() at apply time.
+  pendingRebuys: Map<string, number>;
+  // Consecutive auto-resolved actions per user. Reset to 0 on a real click;
+  // thresholded ejects AFK players. Persists across hands on purpose.
+  idleStreak: Map<string, number>;
+  // Idle-threshold ejections queued while the player was still 'active'
+  // in the current hand — flushed at hand-end so the standup doesn't yank
+  // a live player mid-hand.
+  pendingForcedStandup: Set<string>;
+}
+
+const runtime = new Map<string, RoomRuntimeState>();
+
+function getRuntime(roomId: string): RoomRuntimeState {
+  let r = runtime.get(roomId);
+  if (!r) {
+    r = {
+      autoActionTimer: null,
+      lastHandLogId: null,
+      pendingRebuys: new Map(),
+      idleStreak: new Map(),
+      pendingForcedStandup: new Set(),
+    };
+    runtime.set(roomId, r);
+  }
+  return r;
+}
+
+// Clears every transient field for the room and drops the record itself.
+// Must be called from every room-teardown path alongside clearRoomState().
+function disposeRoomState(roomId: string): void {
+  const r = runtime.get(roomId);
+  if (!r) return;
+  if (r.autoActionTimer) clearTimeout(r.autoActionTimer);
+  runtime.delete(roomId);
+}
 
 // Sticker cooldown: per-user timestamp of last accepted sticker. Prevents a
 // single user from spamming reactions and drowning out the felt. Silently
@@ -168,19 +235,12 @@ function allowEvent(
 // `rebuyChips` at apply time, so a stale/no-longer-valid request is rejected
 // rather than silently over-granting). A later request from the same player
 // overwrites an earlier one — only their latest choice matters.
-const pendingRebuysByRoom = new Map<string, Map<string, number>>();
-
 function queuePendingRebuy(roomId: string, userId: string, amount: number): void {
-  let byUser = pendingRebuysByRoom.get(roomId);
-  if (!byUser) {
-    byUser = new Map();
-    pendingRebuysByRoom.set(roomId, byUser);
-  }
-  byUser.set(userId, amount);
+  getRuntime(roomId).pendingRebuys.set(userId, amount);
 }
 
 async function drainPendingRebuys(roomId: string): Promise<void> {
-  const byUser = pendingRebuysByRoom.get(roomId);
+  const byUser = runtime.get(roomId)?.pendingRebuys;
   if (!byUser || byUser.size === 0) return;
   const entries = [...byUser.entries()];
   byUser.clear();
@@ -200,44 +260,34 @@ async function drainPendingRebuys(roomId: string): Promise<void> {
 // player is AFK regardless of hand boundaries); cleared alongside the room's
 // other per-room state whenever the room itself goes away.
 const AUTO_ACTION_STANDUP_THRESHOLD = 2;
-const idleStreakByRoom = new Map<string, Map<string, number>>();
 
 function bumpIdleStreak(roomId: string, userId: string): number {
-  let byUser = idleStreakByRoom.get(roomId);
-  if (!byUser) {
-    byUser = new Map();
-    idleStreakByRoom.set(roomId, byUser);
-  }
-  const next = (byUser.get(userId) ?? 0) + 1;
-  byUser.set(userId, next);
+  const idle = getRuntime(roomId).idleStreak;
+  const next = (idle.get(userId) ?? 0) + 1;
+  idle.set(userId, next);
   return next;
 }
 
-// Also cancels any already-queued forced standup (see below) — a real
-// action proves they're back, so a stale "was idle" ejection queued from an
-// earlier streak in this same hand shouldn't still fire once it ends.
+// Also cancels any already-queued forced standup — a real action proves
+// they're back, so a stale "was idle" ejection queued from an earlier
+// streak in this same hand shouldn't still fire once it ends.
 function resetIdleStreak(roomId: string, userId: string): void {
-  idleStreakByRoom.get(roomId)?.delete(userId);
-  pendingForcedStandupByRoom.get(roomId)?.delete(userId);
+  const r = runtime.get(roomId);
+  if (!r) return;
+  r.idleStreak.delete(userId);
+  r.pendingForcedStandup.delete(userId);
 }
 
 // Forced standups queued from an idle streak hitting the threshold while the
 // player is still 'active' (auto-checked, not auto-folded) — standing them
 // up immediately would pull a still-live player out of the hand, so this
 // waits for the hand to end instead (drained alongside pending rebuys).
-const pendingForcedStandupByRoom = new Map<string, Set<string>>();
-
 function queuePendingForcedStandup(roomId: string, userId: string): void {
-  let byUser = pendingForcedStandupByRoom.get(roomId);
-  if (!byUser) {
-    byUser = new Set();
-    pendingForcedStandupByRoom.set(roomId, byUser);
-  }
-  byUser.add(userId);
+  getRuntime(roomId).pendingForcedStandup.add(userId);
 }
 
 async function drainPendingForcedStandups(roomId: string): Promise<void> {
-  const byUser = pendingForcedStandupByRoom.get(roomId);
+  const byUser = runtime.get(roomId)?.pendingForcedStandup;
   if (!byUser || byUser.size === 0) return;
   const userIds = [...byUser];
   byUser.clear();
@@ -260,12 +310,8 @@ async function forceStandUp(roomId: string, userId: string): Promise<void> {
     const outcome = await eliminateStandingPlayer(userId, roomId);
     if (!outcome.removed) return;
     if (outcome.finished) {
-      cancelAutoAction(roomId);
       clearRoomState(roomId);
-      lastHandLogIdByRoom.delete(roomId);
-      pendingRebuysByRoom.delete(roomId);
-      idleStreakByRoom.delete(roomId);
-      pendingForcedStandupByRoom.delete(roomId);
+      disposeRoomState(roomId);
       await deleteHandLogsForRoom(roomId);
       syncSettlementSafely(outcome.settlement);
       io.to(roomChannel(roomId)).emit('room:closed', {
@@ -293,10 +339,10 @@ function syncSettlementSafely(summary: SettlementSummary): void {
 }
 
 function cancelAutoAction(roomId: string): void {
-  const t = autoActionTimers.get(roomId);
-  if (t) {
-    clearTimeout(t);
-    autoActionTimers.delete(roomId);
+  const r = runtime.get(roomId);
+  if (r?.autoActionTimer) {
+    clearTimeout(r.autoActionTimer);
+    r.autoActionTimer = null;
   }
 }
 
@@ -308,10 +354,11 @@ function rescheduleAutoAction(roomId: string): void {
   if (!hand || hand.phase === 'ended' || hand.deadline === null) return;
   const delay = Math.max(0, hand.deadline - Date.now());
   const handle = setTimeout(() => {
-    autoActionTimers.delete(roomId);
+    const r = runtime.get(roomId);
+    if (r) r.autoActionTimer = null;
     void runAutoAction(roomId);
   }, delay);
-  autoActionTimers.set(roomId, handle);
+  getRuntime(roomId).autoActionTimer = handle;
 }
 
 // Called when a player's action deadline expires. Auto-check if legal, else fold.
@@ -423,105 +470,92 @@ async function broadcastAfterAction(
     }
   }
 
-  if (ended) {
-    try {
-      const snap = chipsSnapshot(hand);
-      await persistHandResult(roomId, snap);
-    } catch (err) {
-      log.error({ err, roomId, handNumber: hand.handNumber }, 'persistHandResult error');
-    }
+  if (ended) await handleHandEnded(roomId, hand);
 
-    // Tournament elimination + possible finish. No-op (returns finished:
-    // false immediately) for cash rooms, so this can't affect the cash path.
-    let tournamentOutcome: { finished: boolean; settlement?: SettlementSummary } = {
-      finished: false,
-    };
-    try {
-      tournamentOutcome = await processTournamentHandEnd(roomId);
-    } catch (err) {
-      log.error({ err, roomId }, 'processTournamentHandEnd error');
-    }
+  rescheduleAutoAction(roomId);
+}
 
-    const result = getEndResult(hand);
+// R1: Everything that happens when applyAction returns ended=true. Each step
+// has its own try/catch — a transient failure (DB hiccup, slow socket under
+// lag) in any one of them must not stop the others from running. Both the
+// cash and tournament end paths broadcast game:ended so a frozen client
+// never gets stuck on the last in-progress state.
+async function handleHandEnded(roomId: string, hand: HandState): Promise<void> {
+  try {
+    await persistHandResult(roomId, chipsSnapshot(hand));
+  } catch (err) {
+    log.error({ err, roomId, handNumber: hand.handNumber }, 'persistHandResult error');
+  }
 
-    if (tournamentOutcome.finished && tournamentOutcome.settlement) {
-      // Tournament room is already closed + memberships deleted (done inside
-      // processTournamentHandEnd's transaction). Tear down like the existing
-      // room:close / session-expiry paths instead of the normal "flip to
-      // waiting, wait for next hand" flow below — cancelAutoAction already
-      // handles timer cleanup, so skipping the final rescheduleAutoAction
-      // call at the bottom of this function (via `return`) is safe.
-      cancelAutoAction(roomId);
-      clearRoomState(roomId);
-      lastHandLogIdByRoom.delete(roomId);
-      pendingRebuysByRoom.delete(roomId);
-      idleStreakByRoom.delete(roomId);
-      pendingForcedStandupByRoom.delete(roomId);
-      try {
-        await deleteHandLogsForRoom(roomId);
-      } catch (err) {
-        log.error({ err, roomId }, 'deleteHandLogsForRoom error');
-      }
-      io.to(roomChannel(roomId)).emit('game:ended', {
-        roomId,
-        result: result ?? undefined,
-      });
-      syncSettlementSafely(tournamentOutcome.settlement);
-      io.to(roomChannel(roomId)).emit('room:closed', {
-        roomId,
-        settlement: tournamentOutcome.settlement,
-      });
-      io.to(LOBBY_ROOM).emit('lobby:room-removed', { roomId });
-      return;
-    }
+  // Tournament elimination + possible finish. No-op (returns finished:
+  // false immediately) for cash rooms, so this can't affect the cash path.
+  let tournamentOutcome: { finished: boolean; settlement?: SettlementSummary } = {
+    finished: false,
+  };
+  try {
+    tournamentOutcome = await processTournamentHandEnd(roomId);
+  } catch (err) {
+    log.error({ err, roomId }, 'processTournamentHandEnd error');
+  }
 
-    // Persist the completed hand to HandLog for later review / cross-session.
-    try {
-      const logData = buildHandLogData(hand);
-      const { id: handLogId } = await persistHandLog(
-        roomId,
-        hand.handNumber,
-        logData,
-      );
-      lastHandLogIdByRoom.set(roomId, handLogId);
-    } catch (err) {
-      log.error({ err, roomId, handNumber: hand.handNumber }, 'persistHandLog error');
-    }
-    // Flip room back to 'waiting' — owner can now close between hands.
-    try {
-      await setRoomStatus(roomId, 'waiting');
-    } catch (err) {
-      log.error({ err, roomId }, 'setRoomStatus error');
-    }
-    // Apply any queued rebuys BEFORE broadcasting so clients see the updated
-    // chipsAtTable in the same room:detail push.
-    try {
-      await drainPendingRebuys(roomId);
-    } catch (err) {
-      log.error({ err, roomId }, 'drainPendingRebuys error');
-    }
-    // Same for forced standups queued while the idle player was still
-    // active this hand (see AUTO_ACTION_STANDUP_THRESHOLD) — safe now that
-    // the hand is over.
-    try {
-      await drainPendingForcedStandups(roomId);
-    } catch (err) {
-      log.error({ err, roomId }, 'drainPendingForcedStandups error');
-    }
-    // Always tell clients the hand ended, even if persistence above failed —
-    // otherwise their UI stays frozen on the last in-progress state forever.
+  const result = getEndResult(hand);
+
+  if (tournamentOutcome.finished && tournamentOutcome.settlement) {
+    // Tournament room was already closed + memberships deleted inside
+    // processTournamentHandEnd's transaction — teardown reuses the same
+    // room:close / session-expiry path.
     io.to(roomChannel(roomId)).emit('game:ended', {
       roomId,
       result: result ?? undefined,
     });
-    try {
-      await broadcastRoomDetail(roomId);
-    } catch (err) {
-      log.error({ err, roomId }, 'broadcastRoomDetail error');
-    }
+    await teardownRoom(roomId, tournamentOutcome.settlement);
+    return;
   }
 
-  rescheduleAutoAction(roomId);
+  // Persist the completed hand to HandLog for later review / cross-session.
+  try {
+    const logData = buildHandLogData(hand);
+    const { id: handLogId } = await persistHandLog(
+      roomId,
+      hand.handNumber,
+      logData,
+    );
+    getRuntime(roomId).lastHandLogId = handLogId;
+  } catch (err) {
+    log.error({ err, roomId, handNumber: hand.handNumber }, 'persistHandLog error');
+  }
+  // Flip room back to 'waiting' — owner can now close between hands.
+  try {
+    await setRoomStatus(roomId, 'waiting');
+  } catch (err) {
+    log.error({ err, roomId }, 'setRoomStatus error');
+  }
+  // Apply any queued rebuys BEFORE broadcasting so clients see the updated
+  // chipsAtTable in the same room:detail push.
+  try {
+    await drainPendingRebuys(roomId);
+  } catch (err) {
+    log.error({ err, roomId }, 'drainPendingRebuys error');
+  }
+  // Same for forced standups queued while the idle player was still
+  // active this hand (see AUTO_ACTION_STANDUP_THRESHOLD) — safe now that
+  // the hand is over.
+  try {
+    await drainPendingForcedStandups(roomId);
+  } catch (err) {
+    log.error({ err, roomId }, 'drainPendingForcedStandups error');
+  }
+  // Always tell clients the hand ended, even if persistence above failed —
+  // otherwise their UI stays frozen on the last in-progress state forever.
+  io.to(roomChannel(roomId)).emit('game:ended', {
+    roomId,
+    result: result ?? undefined,
+  });
+  try {
+    await broadcastRoomDetail(roomId);
+  } catch (err) {
+    log.error({ err, roomId }, 'broadcastRoomDetail error');
+  }
 }
 
 // T5: discriminated error branch. Adding a new error reason forces every
@@ -733,21 +767,9 @@ io.on('connection', (socket) => {
       cb({ ok: false, error: outcome.error });
       return;
     }
-    cancelAutoAction(roomId);
-    clearRoomState(roomId);
-    lastHandLogIdByRoom.delete(roomId);
-    pendingRebuysByRoom.delete(roomId);
-    idleStreakByRoom.delete(roomId);
-    pendingForcedStandupByRoom.delete(roomId);
-    await deleteHandLogsForRoom(roomId);
     const settlement = await buildOwnerCloseSettlement(roomId, players);
-    if (settlement) syncSettlementSafely(settlement);
     cb({ ok: true });
-    io.to(roomChannel(roomId)).emit('room:closed', {
-      roomId,
-      settlement: settlement ?? undefined,
-    });
-    io.to(LOBBY_ROOM).emit('lobby:room-removed', { roomId });
+    await teardownRoom(roomId, settlement ?? undefined);
   });
 
   // Rebuy: only allowed once chipsAtTable hits 0; caller picks the amount,
@@ -888,7 +910,7 @@ io.on('connection', (socket) => {
       result: hand.endResult,
     });
     // Patch the persisted HandLog so refreshed clients see the reveal too.
-    const handLogId = lastHandLogIdByRoom.get(roomId);
+    const handLogId = runtime.get(roomId)?.lastHandLogId;
     if (handLogId) {
       try {
         await updateHandLogEndResult(handLogId, hand.endResult);
@@ -965,19 +987,7 @@ async function scanExpiredSessions() {
         'session-expired',
       );
       if (!settlement) continue;
-      syncSettlementSafely(settlement);
-      cancelAutoAction(roomId);
-      clearRoomState(roomId);
-      lastHandLogIdByRoom.delete(roomId);
-      pendingRebuysByRoom.delete(roomId);
-      idleStreakByRoom.delete(roomId);
-      pendingForcedStandupByRoom.delete(roomId);
-      await deleteHandLogsForRoom(roomId);
-      io.to(roomChannel(roomId)).emit('room:closed', {
-        roomId,
-        settlement,
-      });
-      io.to(LOBBY_ROOM).emit('lobby:room-removed', { roomId });
+      await teardownRoom(roomId, settlement);
       log.info({ roomId }, 'auto-closed expired room');
     }
   } catch (err) {
