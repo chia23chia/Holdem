@@ -156,6 +156,8 @@ model HandLog {
 
   room Room @relation(fields: [roomId], references: [id], onDelete: Cascade)
 
+  // The unique constraint already creates a composite index on
+  // (roomId, handNumber), which covers the "list recent hands by room"
+  // query — a separate @@index on the same columns would be redundant.
   @@unique([roomId, handNumber])
-  @@index([roomId, handNumber])
 }

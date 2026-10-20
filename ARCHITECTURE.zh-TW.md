@@ -211,9 +211,11 @@ Unique 約束:`(userId, roomId)`(同一玩家在同一房只能坐一個位)+ `(
 | `endedAt` | DateTime | 寫入時 |
 | `data` | Json | 完整快照:startedAt/endedAt/dealerSeat/blinds/actionTimeoutSeconds/players (含 startingChips + finalChips)/history/endResult(照 shared 的 `HandLogData` 型別) |
 
-Unique 約束:`(roomId, handNumber)`。索引:`(roomId, handNumber)`。
+Unique 約束 `(roomId, handNumber)` 本身就建了複合索引,查「某房間最近 N 手牌」直接走這個索引,不需要再加 `@@index`。
 
 隱私:`endResult.revealedHoles` 只含 showdown 揭牌 + 自願秀牌者;蓋牌沒秀的 hole cards **不寫進 log**(muck stays muck)。
+
+Retention:HandLog 在房間 `room:close`(session 到期、owner 關房、SNG 冠軍產生)時由 `deleteHandLogsForRoom` 一併刪除,所以活資料只在房間 open 期間存在。磁碟空間/隱私風險都靠這個路徑限制,無額外 TTL(見 F audit M7 說明)。
 
 ### 5.5 Auth.js 相關 tables
 
