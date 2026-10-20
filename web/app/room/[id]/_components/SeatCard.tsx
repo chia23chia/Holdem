@@ -1,9 +1,14 @@
 'use client';
+import { memo } from 'react';
 import type { ActionLogEntry, Card } from '@holdem/shared';
 import { CardView } from './CardView';
 import { chineseHandRank } from '../_lib/utils';
 
-export function SeatCard({
+// R-3b perf: wrapped in React.memo so a game:state broadcast that doesn't
+// touch THIS seat's props doesn't re-render it. Props are all primitives
+// or stable references (reveal is null or a tuple that's not re-created
+// unless a reveal happens), so default shallow compare is correct.
+export const SeatCard = memo(function SeatCard({
   seatNum,
   name,
   chips,
@@ -149,4 +154,4 @@ export function SeatCard({
       )}
     </div>
   );
-}
+});

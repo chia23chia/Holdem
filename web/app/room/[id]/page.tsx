@@ -55,6 +55,7 @@ import { SeatCard } from './_components/SeatCard';
 import { ActionBar } from './_components/ActionBar';
 import { RebuyModal } from './_components/RebuyModal';
 import { TurnIndicator, SidePotsPanel } from './_components/TableOverlays';
+import { usePokerState } from './_hooks/usePokerState';
 
 export default function RoomPage() {
   const { data: session, status } = useSession();
@@ -80,15 +81,12 @@ export default function RoomPage() {
     return () => window.removeEventListener('keydown', h);
   }, [showCloseConfirm]);
   const [showRebuyConfirm, setShowRebuyConfirm] = useState(false);
-  const [gameState, setGameState] = useState<HandStatePublic | null>(null);
-  const [holeCards, setHoleCards] = useState<[Card, Card] | null>(null);
-  const [handRank, setHandRank] = useState<string | null>(null);
-  // Community cards actually shown on the felt — decoupled from
-  // gameState.community so an all-in runout can reveal flop/turn/river one
-  // street at a time instead of jumping straight to the final board. Set
-  // instantly (no animation) on game:started/reconnect; staggered in by the
-  // game:street-log queue below otherwise.
-  const [displayedCommunity, setDisplayedCommunity] = useState<Card[]>([]);
+  // R-3b: 4 tightly-coupled "live hand" states merged into one reducer.
+  // Destructure for readability; existing code reads gameState / holeCards /
+  // handRank / displayedCommunity directly as before.
+  const [poker, dispatchPoker] = usePokerState();
+  const { gameState, holeCards, handRank, displayedCommunity } = poker;
+  // displayedCommunity now lives in `poker` via usePokerState (R-3b).
   // Hole cards revealed early during an all-in runout (before real showdown).
   // Folded players never appear here — only players still in the hand who
   // have no more decisions left.
@@ -162,6 +160,14 @@ export default function RoomPage() {
   // without re-registering handlers.
   const blockedIdsRef = useRef<Set<string>>(blockedIds);
   blockedIdsRef.current = blockedIds;
+  // R-3b perf: filtered chat list computed once per messages/blocked change
+  // (audit P2). Previously the .filter(...).map(...) ran twice per render
+  // (desktop + mobile drawer) × every game:state tick — wasteful at 200+
+  // messages × 30 ticks/hand.
+  const visibleMessages = useMemo(
+    () => messages.filter((m) => !blockedIds.has(m.userId)),
+    [messages, blockedIds],
+  );
   function toggleBlock(userId: string, name: string) {
     const next = blocked.some((b) => b.userId === userId)
       ? blocked.filter((b) => b.userId !== userId)
@@ -174,6 +180,13 @@ export default function RoomPage() {
   // computed above them.
   const currentHand = hands.length > 0 ? hands[hands.length - 1] : null;
   const currentEndResult = currentHand?.endResult ?? null;
+  // R-3b perf: ring positions are a pure function of maxPlayers (fixed for
+  // the lifetime of a room). Memo so a game:state tick doesn't recompute
+  // 10 trig calls that always return the same array.
+  const seatPositions = useMemo(
+    () => (room ? computeRingPositionsPercent(room.maxPlayers) : []),
+    [room?.maxPlayers],
+  );
   const displayedHand =
     hands.length === 0
       ? null
@@ -231,7 +244,7 @@ export default function RoomPage() {
       // sends hand.community.slice(), not just the newly-dealt cards) — set
       // it directly, don't append, or flop/turn/river stack on top of each
       // other into one giant duplicated row.
-      setDisplayedCommunity(next.cards);
+      dispatchPoker({ type: 'display-community', community: next.cards });
       playCue('street');
       if (next.phase === 'river' && next.trailingUserId) {
         const userId = next.trailingUserId;
@@ -297,9 +310,7 @@ export default function RoomPage() {
         });
         s.on('game:started', (state) => {
           setError(null); // clear any stale "等待補值" banner now that a hand began
-          setGameState(state);
-          setHoleCards(null);
-          setHandRank(null);
+          dispatchPoker({ type: 'started', state });
           setSelectedIdx(null); // Snap back to newest on each new hand
           // New hand: drop any leftover reveal/animation state from the
           // previous one. Community is set instantly here (not staggered) —
@@ -311,7 +322,6 @@ export default function RoomPage() {
           if (revealTimeoutRef.current) clearTimeout(revealTimeoutRef.current);
           streetQueueRef.current = [];
           streetPlayingRef.current = false;
-          setDisplayedCommunity(state.community);
           setAllInReveal(new Map());
           setRevealingSeatUserId(null);
           setLastActionBySeat({});
@@ -331,10 +341,9 @@ export default function RoomPage() {
           });
           playCue('deal');
         });
-        s.on('game:state', (state) => setGameState(state));
+        s.on('game:state', (state) => dispatchPoker({ type: 'state', state }));
         s.on('game:hole', ({ holeCards: cards, handRank: hr }) => {
-          setHoleCards(cards);
-          setHandRank(hr);
+          dispatchPoker({ type: 'hole', holeCards: cards, handRank: hr });
         });
         s.on('game:action-log', (entry) => {
           setHands((prev) => {
@@ -420,9 +429,7 @@ export default function RoomPage() {
           } else {
             // Manual owner debug end → clear active game display AND drop the
             // last hand record if it never finished (no natural endResult).
-            setGameState(null);
-            setHoleCards(null);
-            setHandRank(null);
+            dispatchPoker({ type: 'ended-manual' });
             setHands((prev) => {
               if (prev.length === 0) return prev;
               const last = prev[prev.length - 1];
@@ -1059,7 +1066,7 @@ export default function RoomPage() {
                 )}
               </div>
 
-              {computeRingPositionsPercent(room.maxPlayers).map((pos) => {
+              {seatPositions.map((pos) => {
                 const seatNum = pos.seat;
                 const occupant = room.seats.find((s) => s.seat === seatNum);
                 const handPlayer = gameState?.players.find(
@@ -1250,8 +1257,7 @@ export default function RoomPage() {
                 {messages.length === 0 && (
                   <p className="text-slate-500">尚無訊息</p>
                 )}
-                {messages
-                  .filter((m) => !blockedIds.has(m.userId))
+                {visibleMessages
                   .map((m, i) => (
                     <ChatMessageRow
                       key={i}
@@ -1397,8 +1403,7 @@ export default function RoomPage() {
                   {messages.length === 0 && (
                     <p className="text-slate-500">尚無訊息</p>
                   )}
-                  {messages
-                    .filter((m) => !blockedIds.has(m.userId))
+                  {visibleMessages
                     .map((m, i) => (
                       <ChatMessageRow
                         key={i}
