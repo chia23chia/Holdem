@@ -5,7 +5,9 @@ import { signOut, useSession } from 'next-auth/react';
 import { useRouter } from 'next/navigation';
 import type { RoomSummary } from '@holdem/shared';
 import { connectSocket, type TypedSocket } from '@/lib/socket';
-import { useEscape } from '@/lib/useEscape';
+import { Button } from '@/components/ui/Button';
+import { Panel } from '@/components/ui/Panel';
+import { Modal } from '@/components/ui/Modal';
 
 export default function LobbyPage() {
   const { data: session, status } = useSession();
@@ -110,22 +112,24 @@ export default function LobbyPage() {
           </p>
         </div>
         <div className="flex gap-2">
-          <button
+          <Button
+            variant="secondary"
+            size="sm"
             onClick={() => setShowCreate(true)}
-            className="rounded bg-emerald-600 px-3 py-1 text-sm font-semibold hover:bg-emerald-500"
           >
             + 建立房間
-          </button>
-          <button
+          </Button>
+          <Button
+            variant="ghost"
+            size="sm"
             onClick={() => signOut({ callbackUrl: '/' })}
-            className="rounded border border-slate-700 px-3 py-1 text-sm hover:bg-slate-800"
           >
             登出
-          </button>
+          </Button>
         </div>
       </header>
 
-      <section className="rounded-lg border border-amber-900/30 bg-surface/60 shadow-sm">
+      <Panel>
         {rooms.length === 0 ? (
           <div className="p-8 text-center text-slate-500">
             {connected ? '目前沒有房間,點右上角建立一個' : '載入房間中…'}
@@ -160,19 +164,20 @@ export default function LobbyPage() {
                   <span className="text-sm text-slate-400">
                     {r.currentPlayers}/{r.maxPlayers} 人
                   </span>
-                  <button
+                  <Button
+                    variant="secondary"
+                    size="sm"
                     onClick={() => router.push(`/room/${r.id}`)}
                     disabled={r.currentPlayers >= r.maxPlayers}
-                    className="rounded bg-emerald-600 px-3 py-1 text-sm hover:bg-emerald-500 disabled:opacity-40"
                   >
                     加入
-                  </button>
+                  </Button>
                 </div>
               </li>
             ))}
           </ul>
         )}
-      </section>
+      </Panel>
 
       {showCreate && (
         <CreateRoomModal
@@ -209,7 +214,6 @@ function NicknameModal({
   const [nickname, setNickname] = useState(initial);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  useEscape(onCancel);
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
@@ -235,49 +239,39 @@ function NicknameModal({
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
-      <div
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="nickname-modal-title"
-        className="w-full max-w-md rounded-lg border border-slate-700 bg-slate-900 p-6"
-      >
-        <h2 id="nickname-modal-title" className="mb-4 text-lg font-bold">修改暱稱</h2>
-        <form onSubmit={submit} className="flex flex-col gap-3 text-sm">
-          <label className="flex flex-col gap-1">
-            <span className="text-slate-300">新暱稱</span>
-            <input
-              className="rounded border border-slate-700 bg-slate-950 px-3 py-2"
-              value={nickname}
-              onChange={(e) => setNickname(e.target.value)}
-              autoFocus
-              required
-            />
-          </label>
-          {error && (
-            <p className="rounded border border-red-700 bg-red-950 p-2 text-xs text-red-200">
-              {error}
-            </p>
-          )}
-          <div className="mt-2 flex justify-end gap-2">
-            <button
-              type="button"
-              onClick={onCancel}
-              className="rounded border border-slate-700 px-4 py-2 hover:bg-slate-800"
-            >
-              取消
-            </button>
-            <button
-              type="submit"
-              disabled={saving || !nickname.trim() || nickname.trim() === initial}
-              className="rounded bg-emerald-600 px-4 py-2 font-semibold hover:bg-emerald-500 disabled:opacity-40"
-            >
-              {saving ? '儲存中…' : '儲存'}
-            </button>
-          </div>
-        </form>
-      </div>
-    </div>
+    <Modal title="修改暱稱" onClose={onCancel}>
+      <form onSubmit={submit} className="flex flex-col gap-3 text-sm">
+        <label className="flex flex-col gap-1">
+          <span className="text-bone/70">新暱稱</span>
+          <input
+            className="rounded border border-amber-900/30 bg-bg px-3 py-2"
+            value={nickname}
+            onChange={(e) => setNickname(e.target.value)}
+            autoFocus
+            required
+            maxLength={30}
+          />
+        </label>
+        {error && (
+          <p className="rounded border border-loss/40 bg-loss/10 p-2 text-xs text-loss">
+            {error}
+          </p>
+        )}
+        <div className="mt-2 flex justify-end gap-2">
+          <Button variant="ghost" size="sm" onClick={onCancel}>
+            取消
+          </Button>
+          <Button
+            type="submit"
+            variant="secondary"
+            size="sm"
+            disabled={saving || !nickname.trim() || nickname.trim() === initial}
+          >
+            {saving ? '儲存中…' : '儲存'}
+          </Button>
+        </div>
+      </form>
+    </Modal>
   );
 }
 
@@ -312,18 +306,10 @@ function CreateRoomModal({
   const [blindLevelMinutes, setBlindLevelMinutes] = useState(15);
   const [actionTimeoutSeconds, setActionTimeoutSeconds] = useState(30);
   const isTournament = roomType === 'tournament';
-  useEscape(onCancel);
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
-      <div
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="create-room-modal-title"
-        className="w-full max-w-md rounded-lg border border-slate-700 bg-slate-900 p-6"
-      >
-        <h2 id="create-room-modal-title" className="mb-4 text-lg font-bold">建立房間</h2>
-        <form
+    <Modal title="建立房間" onClose={onCancel}>
+      <form
           onSubmit={(e) => {
             e.preventDefault();
             if (!name.trim()) return;
@@ -447,24 +433,20 @@ function CreateRoomModal({
             </select>
           </label>
           <div className="mt-2 flex justify-end gap-2">
-            <button
-              type="button"
-              onClick={onCancel}
-              className="rounded border border-slate-700 px-4 py-2 hover:bg-slate-800"
-            >
+            <Button variant="ghost" size="sm" onClick={onCancel}>
               取消
-            </button>
-            <button
+            </Button>
+            <Button
               type="submit"
+              variant="secondary"
+              size="sm"
               disabled={disabled || !name.trim()}
-              className="rounded bg-emerald-600 px-4 py-2 font-semibold hover:bg-emerald-500 disabled:opacity-40"
             >
               建立
-            </button>
+            </Button>
           </div>
         </form>
-      </div>
-    </div>
+    </Modal>
   );
 }
 
