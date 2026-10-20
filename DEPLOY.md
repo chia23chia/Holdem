@@ -185,6 +185,72 @@ docker compose -f docker-compose.prod.yml --env-file .env.prod down -v
 
 ---
 
+## 6.1 Schema changes
+
+Changed 2026-10-20 (E-4b): server now runs `prisma migrate deploy` on
+boot, not `prisma db push --accept-data-loss`. This means **any schema
+change requires a committed migration SQL file**.
+
+### Dev workflow when changing `db/prisma/schema.prisma`
+
+```bash
+cd db
+# Describe what the change does; prisma generates a migration file
+# under db/prisma/migrations/00000X_describe_change/migration.sql.
+# Requires a local dev Postgres (docker-compose up postgres) because
+# migrate dev applies it to shadow DB first.
+pnpm exec prisma migrate dev --name describe_change
+
+# Review the generated SQL. If it drops/renames a column, double-check
+# that's intended — a typo in schema.prisma can look like a rename.
+cat prisma/migrations/*_describe_change/migration.sql
+
+# Commit the schema + the migration file together.
+git add prisma/schema.prisma prisma/migrations/*_describe_change
+git commit -m "describe the change"
+```
+
+### Prod rollout
+
+```bash
+# On VM: pull + rebuild server. `prisma migrate deploy` applies the
+# new migration file during server boot.
+cd ~/Holdem
+git pull origin main
+docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --build server
+
+# Verify in logs:
+docker compose -f docker-compose.prod.yml --env-file .env.prod logs --tail=10 server
+# Expect: "Applying migration 00000X_describe_change" then
+# "Socket.IO server ready"
+```
+
+### If a migration fails on prod
+
+The server WILL NOT START (loud failure, unlike the old db push). Common
+causes + fixes:
+
+- **"Database schema is not empty"**: happens if someone ran a one-off
+  `prisma db push` on prod and bypassed migrations. Mark the current
+  state as applied:
+  `docker exec holdem-server pnpm --filter @holdem/db exec prisma \
+    migrate resolve --applied LAST_MIGRATION_NAME \
+    --schema=./prisma/schema.prisma`
+- **"Migration failed to apply cleanly"**: migration SQL has a bug. Fix
+  the SQL file, commit, redeploy. If the bad migration already partially
+  applied, you may need to manually revert the half-applied changes via
+  psql first.
+
+### Why not db push
+
+`db push --accept-data-loss` silently dropped columns on any schema
+drift — any typo in `schema.prisma` that looked like a column rename
+would permanently delete the real column's data on next boot. Migration
+files turn each schema change into a reviewable SQL diff, and failing
+migrations halt the boot rather than destroy data.
+
+---
+
 ## 7. Backup Postgres
 
 Cron on VM: `crontab -e`
