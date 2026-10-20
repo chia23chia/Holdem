@@ -29,7 +29,10 @@ export function authMiddleware(
     socket.data.user = { userId: payload.sub, name: payload.name };
     next();
   } catch (err) {
-    next(new Error(`Invalid token: ${(err as Error).message}`));
+    // Don't leak jwt library specifics (expired vs malformed) to the client —
+    // just log server-side and respond with a generic error (L1).
+    console.error('[auth] socket jwt verify failed:', (err as Error).message);
+    next(new Error('Invalid token'));
   }
 }
 

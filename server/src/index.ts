@@ -53,6 +53,13 @@ import {
   type AppliedActionLog,
 } from './hands.js';
 import type { PlayerAction } from '@holdem/shared';
+import {
+  ChatSendSchema,
+  GameActionSchema,
+  RoomJoinSchema,
+  RoomRebuySchema,
+  StickerSendSchema,
+} from './schemas.js';
 
 const PORT = Number(process.env.SERVER_PORT ?? 3001);
 const CORS_ORIGIN = process.env.CORS_ORIGIN ?? 'http://localhost:3000';
@@ -629,7 +636,12 @@ io.on('connection', (socket) => {
   });
 
   // ---- Rooms ----
-  socket.on('room:join', async ({ roomId, seat }, cb) => {
+  socket.on('room:join', async (payload, cb) => {
+    const parsed = RoomJoinSchema.safeParse(payload);
+    if (!parsed.success) {
+      return cb({ ok: false, error: '參數錯誤' });
+    }
+    const { roomId, seat } = parsed.data;
     if (!allowEvent(user.userId, 'room:join', 5, 10_000)) {
       return cb({ ok: false, error: '操作太頻繁,請稍候' });
     }
@@ -731,7 +743,12 @@ io.on('connection', (socket) => {
   // capped at the chip leader's stack rounded to 500 (see rebuyChips for the
   // exact rule). Mid-hand → queued for hand end. Between-hand → applied
   // immediately.
-  socket.on('room:rebuy', async ({ roomId, amount }, cb) => {
+  socket.on('room:rebuy', async (payload, cb) => {
+    const parsed = RoomRebuySchema.safeParse(payload);
+    if (!parsed.success) {
+      return cb({ ok: false, error: '參數錯誤' });
+    }
+    const { roomId, amount } = parsed.data;
     if (!allowEvent(user.userId, 'room:rebuy', 3, 10_000)) {
       return cb({ ok: false, error: '操作太頻繁,請稍候' });
     }
@@ -795,7 +812,12 @@ io.on('connection', (socket) => {
     await broadcastRoomDetail(roomId);
   });
 
-  socket.on('game:action', async ({ roomId, action }, cb) => {
+  socket.on('game:action', async (payload, cb) => {
+    const parsed = GameActionSchema.safeParse(payload);
+    if (!parsed.success) {
+      return cb({ ok: false, error: '參數錯誤' });
+    }
+    const { roomId, action } = parsed.data;
     if (!allowEvent(user.userId, 'game:action', 5, 10_000)) {
       return cb({ ok: false, error: '操作太頻繁,請稍候' });
     }
@@ -862,12 +884,18 @@ io.on('connection', (socket) => {
   });
 
   // ---- Stickers ----
-  socket.on('sticker:send', ({ roomId, emoji }) => {
+  socket.on('sticker:send', (payload) => {
+    const parsed = StickerSendSchema.safeParse(payload);
+    if (!parsed.success) return;
+    const { roomId, emoji } = parsed.data;
     if (!STICKER_EMOJIS.includes(emoji as StickerEmoji)) return;
     const now = Date.now();
-    const last = stickerLastSentByUser.get(user.userId) ?? 0;
+    // Cooldown scoped per (user, room) so a user can't flood multiple rooms
+    // within the 3s window (M3).
+    const key = `${user.userId}|${roomId}`;
+    const last = stickerLastSentByUser.get(key) ?? 0;
     if (now - last < STICKER_COOLDOWN_MS) return;
-    stickerLastSentByUser.set(user.userId, now);
+    stickerLastSentByUser.set(key, now);
     const evt: StickerEvent = {
       id: `${user.userId}-${now}`,
       userId: user.userId,
@@ -879,20 +907,23 @@ io.on('connection', (socket) => {
   });
 
   // ---- Chat ----
-  socket.on('chat:send', ({ roomId, text }) => {
+  socket.on('chat:send', (raw) => {
+    const parsed = ChatSendSchema.safeParse(raw);
+    if (!parsed.success) return;
+    const { roomId, text } = parsed.data;
     if (!allowEvent(user.userId, 'chat:send', 10, 10_000)) return;
-    const clean = String(text ?? '').trim().slice(0, 500);
+    const clean = text.trim().slice(0, 500);
     if (!clean) return;
-    const payload = {
+    const msg = {
       from: user.name,
       userId: user.userId,
       text: clean,
       ts: Date.now(),
     };
     if (roomId) {
-      io.to(roomChannel(roomId)).emit('chat:message', payload);
+      io.to(roomChannel(roomId)).emit('chat:message', msg);
     } else {
-      io.to(LOBBY_ROOM).emit('chat:message', payload);
+      io.to(LOBBY_ROOM).emit('chat:message', msg);
     }
   });
 

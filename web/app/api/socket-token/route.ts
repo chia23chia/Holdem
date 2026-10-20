@@ -19,7 +19,7 @@ export async function GET() {
   const token = jwt.sign(
     { sub: session.user.id, name: session.user.name ?? 'unknown' },
     secret,
-    { algorithm: 'HS256', expiresIn: '5m' },
+    { algorithm: 'HS256', expiresIn: '60s' },
   );
 
   return NextResponse.json({ token });
