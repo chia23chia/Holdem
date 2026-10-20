@@ -966,7 +966,7 @@ export default function RoomPage() {
       )}
 
       <div className="grid gap-4 sm:gap-6 sm:grid-cols-[2fr_1fr]">
-        <section className="rounded border border-slate-800 p-3 sm:p-4">
+        <section className="rounded-lg border border-amber-900/30 bg-surface/60 p-3 shadow-sm sm:p-4">
           <div className="mb-2 flex items-center justify-between sm:mb-3">
             <h2 className="text-base font-semibold sm:text-lg">牌桌</h2>
             {gameState && (
@@ -1000,25 +1000,39 @@ export default function RoomPage() {
               />
 
               {/* Center: community + pot, or resting label */}
-              <div className="absolute left-1/2 top-1/2 flex -translate-x-1/2 -translate-y-1/2 flex-col items-center gap-1">
+              <div className="absolute left-1/2 top-1/2 flex -translate-x-1/2 -translate-y-1/2 flex-col items-center gap-1.5">
                 {gameState ? (
                   <>
                     <div className="flex gap-1">
                       {displayedCommunity.length === 0 ? (
-                        <span className="text-[10px] text-slate-300 sm:text-xs">
-                          Preflop · 尚未翻牌
-                        </span>
+                        // Pre-flop: show 3 face-down backs occupying the
+                        // real spatial slot (U-4) so the eye already knows
+                        // where cards will land.
+                        [0, 1, 2].map((i) => (
+                          <span
+                            key={i}
+                            className="h-9 w-7 rounded-md border border-slate-500/50 shadow-md sm:h-10 sm:w-8"
+                            style={{
+                              backgroundImage:
+                                'repeating-linear-gradient(45deg, #8B1A1A 0 6px, #6B0F0F 6px 12px)',
+                            }}
+                          />
+                        ))
                       ) : (
                         displayedCommunity.map((c, i) => (
                           <CardView key={i} card={c} size="sm" />
                         ))
                       )}
                     </div>
-                    <div className="text-[10px] text-amber-300 sm:text-xs">
-                      Pot: {gameState.pot}
-                    </div>
-                    <div className="text-[9px] text-slate-400 sm:text-[10px]">
-                      每人 {gameState.actionTimeoutSeconds}s
+                    {/* Pot: the game's second-most-important number — give
+                        it center-stage weight (U-4). */}
+                    <div className="mt-0.5 flex flex-col items-center">
+                      <div className="font-sans text-xl font-bold tabular-nums leading-none text-brass">
+                        {gameState.pot.toLocaleString()}
+                      </div>
+                      <div className="mt-0.5 text-[9px] uppercase tracking-widest text-bone/50">
+                        底池
+                      </div>
                     </div>
                   </>
                 ) : (
@@ -1209,7 +1223,7 @@ export default function RoomPage() {
         </section>
 
         {/* Desktop side panel — hidden on mobile */}
-        <section className="hidden flex-col gap-3 rounded border border-slate-800 p-4 sm:flex">
+        <section className="hidden flex-col gap-3 rounded-lg border border-amber-900/30 bg-surface/60 p-4 shadow-sm sm:flex">
           <PanelTabs tab={panelTab} onChange={setPanelTab} />
           {panelTab === 'chat' ? (
             <>
@@ -1292,7 +1306,7 @@ export default function RoomPage() {
         Math.ceil((gameState.deadline - now) / 1000) <= 5 && (
           <button
             onClick={handleTimeBank}
-            className="fixed bottom-24 left-1/2 z-30 -translate-x-1/2 animate-pulse rounded-full border-2 border-purple-400 bg-purple-950 px-6 py-3 text-base font-bold text-purple-100 shadow-xl hover:bg-purple-900 sm:bottom-20"
+            className="fixed bottom-24 left-1/2 z-30 -translate-x-1/2 animate-pulse rounded-full border-2 border-brass bg-rail px-6 py-3 text-base font-bold text-brass shadow-xl transition-colors duration-150 hover:bg-rail/80 sm:bottom-20"
           >
             ⚡ 延時({Math.min(30, Math.ceil(myHandPlayer.timeBankMs / 1000))}s)
           </button>
@@ -1925,11 +1939,13 @@ function CardView({ card, size = 'md' }: { card: Card; size?: 'sm' | 'md' }) {
     size === 'sm'
       ? 'h-9 w-7 text-xs sm:h-10 sm:w-8 sm:text-sm'
       : 'h-14 w-10 text-lg';
-  // U-2 C3: card paper treatment — subtle gradient + inset highlight + drop
-  // shadow + hairline ring so cards look like physical paper on the felt
-  // rather than inline table cells. 4-color suit coloring preserved.
+  // U-2 C3 + U-4: card paper treatment + flip-in animation on mount so
+  // each new card feels dealt. 300ms is short enough to not stall the
+  // runout but long enough to register as motion. prefers-reduced-motion
+  // short-circuits the animation (see globals.css).
   return (
     <span
+      style={{ animation: 'card-flip 300ms ease-out' }}
       className={`inline-flex items-center justify-center rounded-md border border-slate-300 bg-gradient-to-b from-white to-slate-200 font-bold shadow-[0_1px_2px_rgba(0,0,0,0.5),inset_0_1px_0_rgba(255,255,255,0.9)] ring-1 ring-black/10 ${sz} ${suitColorClass(
         card.suit,
         fourColor,
@@ -2015,8 +2031,8 @@ function SeatCard({
       <div className="truncate text-[11px] font-semibold sm:text-sm">
         {name}
       </div>
-      <div className="text-[9px] text-slate-400 sm:text-[10px]">
-        {chips}
+      <div className="font-mono text-[11px] font-bold tabular-nums text-brass sm:text-sm">
+        {chips.toLocaleString()}
       </div>
       {typeof bet === 'number' && bet > 0 && (
         <div
@@ -2076,7 +2092,7 @@ function SeatCard({
         <div
           className={`mt-0.5 text-[10px] font-bold sm:text-xs ${
             extended
-              ? 'text-purple-300'
+              ? 'text-brass'
               : secondsLeft <= 5
                 ? 'text-red-400'
                 : 'text-amber-300'
@@ -2159,16 +2175,16 @@ function ActionBar({
   }, [onAction, canCheck, showRaiseModal]);
 
   return (
-    <div className="mt-4 rounded border border-slate-700 bg-slate-950 p-3">
+    <div className="mt-4 rounded-lg border border-amber-900/30 bg-surface/60 p-3 shadow-sm">
       <div className="mb-2 flex items-center justify-between text-xs">
-        <span className={extended ? 'font-bold text-purple-300' : 'text-amber-300'}>
+        <span className={extended ? 'font-bold text-brass' : 'text-brass/90'}>
           {extended ? '⚡ 時間銀行' : '輪到你行動'}
         </span>
         {typeof secondsLeft === 'number' && (
           <span
             className={`font-bold ${
               extended
-                ? 'text-purple-300'
+                ? 'text-brass'
                 : secondsLeft <= 5
                   ? 'text-red-400'
                   : 'text-amber-300'
@@ -2178,10 +2194,13 @@ function ActionBar({
           </span>
         )}
       </div>
+      {/* U-4: visual weight re-balanced — Fold least prominent (ghost),
+          Call/Check medium (felt green), Raise hero (brass). All three
+          hit the 44pt mobile-thumb minimum via min-h-[48px]. */}
       <div className="flex flex-wrap gap-2">
         <button
           onClick={() => onAction({ type: 'fold' })}
-          className="rounded bg-slate-700 px-3 py-2 text-sm font-semibold hover:bg-slate-600"
+          className="min-h-[48px] rounded border border-bone/20 bg-transparent px-4 py-2.5 text-base font-semibold text-bone/70 transition-colors duration-150 hover:bg-white/5"
         >
           棄牌
           <KbdHint k="F" />
@@ -2189,7 +2208,7 @@ function ActionBar({
         {canCheck ? (
           <button
             onClick={() => onAction({ type: 'check' })}
-            className="rounded bg-emerald-700 px-3 py-2 text-sm font-semibold hover:bg-emerald-600"
+            className="min-h-[48px] rounded bg-felt px-4 py-2.5 text-base font-semibold text-bone transition-colors duration-150 hover:bg-felt/80"
           >
             過牌
             <KbdHint k="C" />
@@ -2197,7 +2216,7 @@ function ActionBar({
         ) : (
           <button
             onClick={() => onAction({ type: 'call' })}
-            className="rounded bg-emerald-700 px-3 py-2 text-sm font-semibold hover:bg-emerald-600"
+            className="min-h-[48px] rounded bg-felt px-4 py-2.5 text-base font-semibold text-bone transition-colors duration-150 hover:bg-felt/80"
           >
             跟注 {toCall}
             <KbdHint k="C" />
@@ -2205,7 +2224,7 @@ function ActionBar({
         )}
         <button
           onClick={() => setShowRaiseModal(true)}
-          className="rounded bg-amber-600 px-3 py-2 text-sm font-semibold text-slate-950 hover:bg-amber-500"
+          className="min-h-[48px] rounded bg-brass px-4 py-2.5 text-base font-bold text-rail shadow-lg transition-colors duration-150 hover:bg-brass/90"
         >
           加註
           <KbdHint k="R" dark />
@@ -2916,7 +2935,7 @@ function BlockManageModal({
             {blocked.map((b) => (
               <li
                 key={b.userId}
-                className="flex items-center justify-between rounded border border-slate-800 bg-slate-950 px-3 py-2 text-sm"
+                className="flex items-center justify-between rounded-lg border border-amber-900/30 bg-surface/60 px-3 py-2 text-sm"
               >
                 <span className="truncate text-slate-200">{b.name}</span>
                 <button

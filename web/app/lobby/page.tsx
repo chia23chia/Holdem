@@ -125,7 +125,7 @@ export default function LobbyPage() {
         </div>
       </header>
 
-      <section className="rounded border border-slate-800">
+      <section className="rounded-lg border border-amber-900/30 bg-surface/60 shadow-sm">
         {rooms.length === 0 ? (
           <div className="p-8 text-center text-slate-500">
             {connected ? '目前沒有房間,點右上角建立一個' : '載入房間中…'}
@@ -135,7 +135,9 @@ export default function LobbyPage() {
             {rooms.map((r) => (
               <li
                 key={r.id}
-                className="flex items-center justify-between p-4 hover:bg-slate-900"
+                className={`flex items-center justify-between p-4 transition-colors duration-150 hover:bg-white/5 ${
+                  r.roomType === 'tournament' ? 'border-l-4 border-brass pl-3' : ''
+                }`}
               >
                 <div>
                   <div className="flex items-center gap-2 font-semibold">

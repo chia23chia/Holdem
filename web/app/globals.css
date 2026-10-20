@@ -69,3 +69,30 @@ body {
     transform: translateX(-100%);
   }
 }
+
+/* Card flip-in (U-4): fires on CardView mount so each new community card
+   feels dealt rather than teleported. 3D flip + scale-in + opacity. */
+@keyframes card-flip {
+  from {
+    opacity: 0;
+    transform: rotateY(90deg) scale(0.8);
+  }
+  to {
+    opacity: 1;
+    transform: rotateY(0) scale(1);
+  }
+}
+
+/* Honor OS "reduce motion" setting — kill the long animations that are
+   purely decorative. Keeps the game playable without the strobe. */
+@media (prefers-reduced-motion: reduce) {
+  @keyframes sticker-fly {
+    0%, 100% { opacity: 0; transform: none; }
+  }
+  @keyframes marquee-scroll {
+    0%, 100% { transform: none; }
+  }
+  @keyframes card-flip {
+    0%, 100% { opacity: 1; transform: none; }
+  }
+}
