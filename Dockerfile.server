@@ -29,6 +29,14 @@ COPY server ./server
 RUN pnpm --filter @holdem/db exec prisma generate --schema=./prisma/schema.prisma
 EXPOSE 3001
 
-# `prisma db push` first (idempotent — no-op if schema already matches),
-# then boot the Socket.IO server. Env vars are supplied by docker-compose.
-CMD ["sh", "-c", "pnpm --filter @holdem/db exec prisma db push --skip-generate --accept-data-loss --schema=./prisma/schema.prisma && pnpm --filter server exec tsx src/index.ts"]
+# `prisma migrate deploy` applies any pending migration files from
+# db/prisma/migrations/ in order (E-4b, migrated 2026-10-20 from the
+# previous `prisma db push --accept-data-loss` which silently dropped
+# columns on any schema drift). Boot the Socket.IO server after
+# migrations succeed. Env vars are supplied by docker-compose.
+#
+# When adding a new schema change: run `prisma migrate dev --name xxx`
+# locally to generate a new migration file, review the SQL, commit it,
+# and this prod boot will apply it. If a migration fails on prod, the
+# server won't start — see DEPLOY.md §schema-changes.
+CMD ["sh", "-c", "pnpm --filter @holdem/db exec prisma migrate deploy --schema=./prisma/schema.prisma && pnpm --filter server exec tsx src/index.ts"]
