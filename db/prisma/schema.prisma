@@ -51,9 +51,13 @@ model User {
   image         String?
 
   // Domain columns
-  // DEAD FIELD — no code reads or writes this. Kept to avoid a prod DB column
-  // drop; schedule for removal with the next real Phase-2 schema migration.
-  // Do NOT wire this up to any settlement path (M4 in docs/AUDIT_2026-10-20.md).
+  // Reserved for future cross-room long-term chip tracking (see
+  // ARCHITECTURE.zh-TW.md §11.19). No current code reads or writes this —
+  // the audit's M4 flag ("dead field") was correct about the present but
+  // not about the design intent, so we keep the column AND the three
+  // non-default historical values that exist in prod. Any future wire-up
+  // (rebuy debiting, settlement crediting) must go through a reviewed
+  // auth path — don't let an API endpoint touch chipsBalance directly.
   chipsBalance Int      @default(10000)
   createdAt    DateTime @default(now())
 
