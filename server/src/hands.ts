@@ -19,7 +19,7 @@ import { newShuffledDeck } from './deck.js';
 // Types
 // ============================================================
 
-interface Player {
+export interface Player {
   seat: number;
   userId: string;
   name: string;
@@ -704,7 +704,7 @@ interface PotLayer {
 // Folded players' chips still count toward layer sizes — they just can't be
 // eligible winners — and a layer with only one eligible player is exactly
 // how an uncalled/conceded bet gets returned to whoever put it in.
-function buildSidePots(players: Player[]): PotLayer[] {
+export function buildSidePots(players: Player[]): PotLayer[] {
   const contributors = players.filter((p) => p.totalBet > 0);
   const levels = [...new Set(contributors.map((p) => p.totalBet))].sort(
     (a, b) => a - b,

@@ -1,6 +1,7 @@
 import jwt from 'jsonwebtoken';
 import type { Socket } from 'socket.io';
 import type { SocketTokenPayload } from '@holdem/shared';
+import { log } from './logger.js';
 
 const SECRET = process.env.SOCKET_JWT_SECRET;
 if (!SECRET) {
@@ -31,7 +32,7 @@ export function authMiddleware(
   } catch (err) {
     // Don't leak jwt library specifics (expired vs malformed) to the client —
     // just log server-side and respond with a generic error (L1).
-    console.error('[auth] socket jwt verify failed:', (err as Error).message);
+    log.warn({ err: (err as Error).message }, 'socket jwt verify failed');
     next(new Error('Invalid token'));
   }
 }

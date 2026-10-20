@@ -60,6 +60,7 @@ import {
   RoomRebuySchema,
   StickerSendSchema,
 } from './schemas.js';
+import { log } from './logger.js';
 
 const PORT = Number(process.env.SERVER_PORT ?? 3001);
 const CORS_ORIGIN = process.env.CORS_ORIGIN ?? 'http://localhost:3000';
@@ -188,7 +189,7 @@ async function drainPendingRebuys(roomId: string): Promise<void> {
     try {
       await rebuyChips(userId, roomId, amount);
     } catch (err) {
-      console.error('[server] drain rebuy error', err);
+      log.error({ err, roomId, userId }, 'drain rebuy error');
     }
   }
 }
@@ -245,7 +246,7 @@ async function drainPendingForcedStandups(roomId: string): Promise<void> {
     try {
       await forceStandUp(roomId, userId);
     } catch (err) {
-      console.error('[server] drain forced standup error', err);
+      log.error({ err, roomId, userId }, 'drain forced standup error');
     }
   }
 }
@@ -288,7 +289,7 @@ async function forceStandUp(roomId: string, userId: string): Promise<void> {
 // configured) must never fail or delay a room close.
 function syncSettlementSafely(summary: SettlementSummary): void {
   void syncSettlementToSheet(summary).catch((err) => {
-    console.error('[server] syncSettlementToSheet error', err);
+    log.error({ err, roomId: summary.roomId }, 'syncSettlementToSheet error');
   });
 }
 
@@ -359,7 +360,7 @@ async function runAutoAction(roomId: string): Promise<void> {
 // Called from both the game:action socket handler and runAutoAction.
 async function broadcastAfterAction(
   roomId: string,
-  log: AppliedActionLog,
+  actionLog: AppliedActionLog,
   phaseBefore: string | undefined,
   ended: boolean,
   historyLenBefore: number,
@@ -370,11 +371,11 @@ async function broadcastAfterAction(
 
   io.to(roomChannel(roomId)).emit('game:action-log', {
     roomId,
-    seat: log.seat,
-    name: log.name,
-    phase: log.phase,
-    actionType: log.actionType,
-    amount: log.amount,
+    seat: actionLog.seat,
+    name: actionLog.name,
+    phase: actionLog.phase,
+    actionType: actionLog.actionType,
+    amount: actionLog.amount,
     ts: Date.now(),
   });
   // An all-in runout reveals everyone still in the hand's hole cards early —
@@ -419,7 +420,7 @@ async function broadcastAfterAction(
         if (priv) rs.emit('game:hole', priv);
       }
     } catch (err) {
-      console.error('[server] game:hole broadcast error', err);
+      log.error({ err, roomId }, 'game:hole broadcast error');
     }
   }
 
@@ -428,7 +429,7 @@ async function broadcastAfterAction(
       const snap = chipsSnapshot(hand);
       await persistHandResult(roomId, snap);
     } catch (err) {
-      console.error('[server] persistHandResult error', err);
+      log.error({ err, roomId, handNumber: hand.handNumber }, 'persistHandResult error');
     }
 
     // Tournament elimination + possible finish. No-op (returns finished:
@@ -439,7 +440,7 @@ async function broadcastAfterAction(
     try {
       tournamentOutcome = await processTournamentHandEnd(roomId);
     } catch (err) {
-      console.error('[server] processTournamentHandEnd error', err);
+      log.error({ err, roomId }, 'processTournamentHandEnd error');
     }
 
     const result = getEndResult(hand);
@@ -460,7 +461,7 @@ async function broadcastAfterAction(
       try {
         await deleteHandLogsForRoom(roomId);
       } catch (err) {
-        console.error('[server] deleteHandLogsForRoom error', err);
+        log.error({ err, roomId }, 'deleteHandLogsForRoom error');
       }
       io.to(roomChannel(roomId)).emit('game:ended', {
         roomId,
@@ -485,20 +486,20 @@ async function broadcastAfterAction(
       );
       lastHandLogIdByRoom.set(roomId, handLogId);
     } catch (err) {
-      console.error('[server] persistHandLog error', err);
+      log.error({ err, roomId, handNumber: hand.handNumber }, 'persistHandLog error');
     }
     // Flip room back to 'waiting' — owner can now close between hands.
     try {
       await setRoomStatus(roomId, 'waiting');
     } catch (err) {
-      console.error('[server] setRoomStatus error', err);
+      log.error({ err, roomId }, 'setRoomStatus error');
     }
     // Apply any queued rebuys BEFORE broadcasting so clients see the updated
     // chipsAtTable in the same room:detail push.
     try {
       await drainPendingRebuys(roomId);
     } catch (err) {
-      console.error('[server] drainPendingRebuys error', err);
+      log.error({ err, roomId }, 'drainPendingRebuys error');
     }
     // Same for forced standups queued while the idle player was still
     // active this hand (see AUTO_ACTION_STANDUP_THRESHOLD) — safe now that
@@ -506,7 +507,7 @@ async function broadcastAfterAction(
     try {
       await drainPendingForcedStandups(roomId);
     } catch (err) {
-      console.error('[server] drainPendingForcedStandups error', err);
+      log.error({ err, roomId }, 'drainPendingForcedStandups error');
     }
     // Always tell clients the hand ended, even if persistence above failed —
     // otherwise their UI stays frozen on the last in-progress state forever.
@@ -517,7 +518,7 @@ async function broadcastAfterAction(
     try {
       await broadcastRoomDetail(roomId);
     } catch (err) {
-      console.error('[server] broadcastRoomDetail error', err);
+      log.error({ err, roomId }, 'broadcastRoomDetail error');
     }
   }
 
@@ -619,7 +620,7 @@ async function startHandForRoom(roomId: string): Promise<StartHandOutcome> {
 
 io.on('connection', (socket) => {
   const user = getUser(socket);
-  console.log(`[connect] ${socket.id} user=${user.userId} name=${user.name}`);
+  log.info({ socketId: socket.id, userId: user.userId, name: user.name }, 'socket connected');
   socket.emit('connection:ok', { userId: user.userId, name: user.name });
 
   // Track which room this socket is subscribed to for cleanup on disconnect.
@@ -878,7 +879,7 @@ io.on('connection', (socket) => {
       try {
         await updateHandLogEndResult(handLogId, hand.endResult);
       } catch (err) {
-        console.error('[server] updateHandLogEndResult error', err);
+        log.error({ err, roomId, handLogId }, 'updateHandLogEndResult error');
       }
     }
   });
@@ -929,7 +930,7 @@ io.on('connection', (socket) => {
 
   // ---- Cleanup ----
   socket.on('disconnect', async (reason) => {
-    console.log(`[disconnect] ${socket.id} reason=${reason}`);
+    log.info({ socketId: socket.id, userId: user.userId, reason }, 'socket disconnected');
     // Milestone 2.5 model: don't unseat on disconnect. The seat + chipsAtTable
     // are preserved until the session settles. If it's the player's turn mid-
     // hand, `runAutoAction` (deadline timer) will auto-fold/check on their
@@ -963,17 +964,16 @@ async function scanExpiredSessions() {
         settlement,
       });
       io.to(LOBBY_ROOM).emit('lobby:room-removed', { roomId });
-      console.log(`[server] auto-closed expired room ${roomId}`);
+      log.info({ roomId }, 'auto-closed expired room');
     }
   } catch (err) {
-    console.error('[server] scanExpiredSessions error', err);
+    log.error({ err }, 'scanExpiredSessions error');
   }
 }
 setInterval(scanExpiredSessions, SESSION_EXPIRY_SCAN_MS);
 
 httpServer.listen(PORT, () => {
-  console.log(`[server] Socket.IO listening on http://localhost:${PORT}`);
-  console.log(`[server] CORS origin: ${CORS_ORIGIN}`);
+  log.info({ port: PORT, corsOrigin: CORS_ORIGIN }, 'Socket.IO server ready');
   // Kick off initial scan in case server restarted with already-expired rooms.
   scanExpiredSessions();
 });

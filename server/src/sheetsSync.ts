@@ -10,6 +10,7 @@
 // blocks on this.
 import { JWT } from 'google-auth-library';
 import type { SettlementSummary } from '@holdem/shared';
+import { log } from './logger.js';
 
 const SHEETS_API = 'https://sheets.googleapis.com/v4/spreadsheets';
 const ROSTER_SHEET = '人員';
@@ -528,9 +529,14 @@ export async function restoreMonthTab(
   const fullRoster = await getRoster(spreadsheetId);
   const rosterSlots = fullRoster.filter((r) => !r.hidden);
   const N = rosterSlots.length;
-  console.warn(
-    `[sheetsSync] ${tabName} RESTORE: N=${N}, date serial=${dateData.dateSerial}, ` +
-      `entries=${JSON.stringify([...dateData.entriesByUserId.entries()])}`,
+  log.warn(
+    {
+      tabName,
+      N,
+      dateSerial: dateData.dateSerial,
+      entries: [...dateData.entriesByUserId.entries()],
+    },
+    'sheets RESTORE start',
   );
 
   await clearAllValues(spreadsheetId, tabName);
@@ -545,7 +551,7 @@ export async function restoreMonthTab(
     month.rosterSlots,
     dateData.entriesByUserId,
   );
-  console.warn(`[sheetsSync] ${tabName} RESTORE done`);
+  log.warn({ tabName }, 'sheets RESTORE done');
 }
 
 // Inverse of sheetsDateSerial — reconstruct a Date from the numeric serial
@@ -689,9 +695,14 @@ async function rebuildMonthTab(
   const rosterSlots = [...physicalRoster, ...newActive];
   const N_old = physicalRoster.length;
   const N = rosterSlots.length;
-  console.warn(
-    `[sheetsSync] ${tabName} rebuild: N ${N_old}→${N} (+` +
-      `${newActive.map((r) => r.name).join('、')})`,
+  log.warn(
+    {
+      tabName,
+      nBefore: N_old,
+      nAfter: N,
+      newNames: newActive.map((r) => r.name),
+    },
+    'sheets rebuild start',
   );
 
   const dates = await snapshotMonthTab(
@@ -699,15 +710,15 @@ async function rebuildMonthTab(
     tabName,
     physicalRoster,
   );
-  console.warn(
-    `[sheetsSync] ${tabName} pre-rebuild snapshot (` +
-      `${dates.length} dates): ` +
-      JSON.stringify(
-        dates.map((d) => ({
-          serial: d.serial,
-          entries: Object.fromEntries(d.entriesByUserId),
-        })),
-      ),
+  log.warn(
+    {
+      tabName,
+      dates: dates.map((d) => ({
+        serial: d.serial,
+        entries: Object.fromEntries(d.entriesByUserId),
+      })),
+    },
+    'sheets pre-rebuild snapshot',
   );
 
   await clearAllValues(spreadsheetId, tabName);
@@ -731,7 +742,7 @@ async function rebuildMonthTab(
     );
   }
 
-  console.warn(`[sheetsSync] ${tabName} rebuild done`);
+  log.warn({ tabName }, 'sheets rebuild done');
   return month;
 }
 
@@ -812,18 +823,24 @@ export async function removeUsersFromMonthTab(
     );
   }
 
-  console.warn(
-    `[sheetsSync] ${tabName} drop-users: N ${N_old}→${N_old - dropSet.size} (` +
-      `removing ${droppedNames.join('、')})`,
+  log.warn(
+    {
+      tabName,
+      nBefore: N_old,
+      nAfter: N_old - dropSet.size,
+      removedNames: droppedNames,
+    },
+    'sheets drop-users start',
   );
-  console.warn(
-    `[sheetsSync] ${tabName} pre-drop snapshot: ` +
-      JSON.stringify(
-        dates.map((d) => ({
-          serial: d.serial,
-          entries: Object.fromEntries(d.entriesByUserId),
-        })),
-      ),
+  log.warn(
+    {
+      tabName,
+      dates: dates.map((d) => ({
+        serial: d.serial,
+        entries: Object.fromEntries(d.entriesByUserId),
+      })),
+    },
+    'sheets pre-drop snapshot',
   );
 
   // Filter each date's entries to drop the target users. Also recompute
@@ -871,7 +888,7 @@ export async function removeUsersFromMonthTab(
     );
   }
 
-  console.warn(`[sheetsSync] ${tabName} drop-users done`);
+  log.warn({ tabName }, 'sheets drop-users done');
   return { N_before: N_old, N_after: N, droppedNames };
 }
 
