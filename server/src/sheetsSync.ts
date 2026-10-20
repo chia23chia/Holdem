@@ -107,6 +107,20 @@ function colLetter(n: number): string {
   return s;
 }
 
+// Prevent Google Sheets formula injection via user-controlled strings written
+// under valueInputOption=USER_ENTERED. Leading =/+/-/@ turns the cell into a
+// live formula; prefixing with ' forces Sheets to treat it as literal text
+// (the ' is not displayed).
+function sanitizeSheetCell(value: string): string {
+  if (value.length === 0) return value;
+  const first = value.charCodeAt(0);
+  // 0x3D '=', 0x2B '+', 0x2D '-', 0x40 '@'
+  if (first === 0x3d || first === 0x2b || first === 0x2d || first === 0x40) {
+    return `'${value}`;
+  }
+  return value;
+}
+
 interface SheetMeta {
   sheetId: number;
   title: string;
@@ -213,11 +227,11 @@ async function registerAndSyncRoster(
       nextSlot += 1;
       byUserId.set(p.userId, entry);
       roster.push(entry);
-      appends.push([entry.userId, entry.name, entry.slot, '']);
+      appends.push([entry.userId, sanitizeSheetCell(entry.name), entry.slot, '']);
     } else if (existing.name !== p.name) {
       nameUpdates.push({
         range: `${ROSTER_SHEET}!B${existing.slot + 1}`,
-        values: [[p.name]],
+        values: [[sanitizeSheetCell(p.name)]],
       });
       existing.name = p.name;
     }

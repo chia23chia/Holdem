@@ -114,6 +114,7 @@ Fill in real values:
 
 - `POSTGRES_PASSWORD` — generate: `openssl rand -hex 24`
 - `NEXTAUTH_SECRET` — generate: `openssl rand -base64 48`
+- `SOCKET_JWT_SECRET` — generate: `openssl rand -base64 48` (must be different from `NEXTAUTH_SECRET`)
 - `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` — from Google Cloud Console (Section 0.2)
 - `DUCKDNS_TOKEN` — `32f4f4bf-e479-4e3b-abba-a5f139123413`
 - `GOOGLE_SHEETS_SA_KEY` / `GOOGLE_SHEETS_SPREADSHEET_ID` — optional, see

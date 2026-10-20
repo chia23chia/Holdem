@@ -2,9 +2,9 @@ import jwt from 'jsonwebtoken';
 import type { Socket } from 'socket.io';
 import type { SocketTokenPayload } from '@holdem/shared';
 
-const SECRET = process.env.NEXTAUTH_SECRET;
+const SECRET = process.env.SOCKET_JWT_SECRET;
 if (!SECRET) {
-  throw new Error('NEXTAUTH_SECRET is required (must match web)');
+  throw new Error('SOCKET_JWT_SECRET is required (must match web)');
 }
 
 export interface AuthedUser {
@@ -22,7 +22,9 @@ export function authMiddleware(
     return next(new Error('No token'));
   }
   try {
-    const payload = jwt.verify(token, SECRET!) as SocketTokenPayload;
+    const payload = jwt.verify(token, SECRET!, {
+      algorithms: ['HS256'],
+    }) as SocketTokenPayload;
     if (!payload.sub) return next(new Error('Bad token payload'));
     socket.data.user = { userId: payload.sub, name: payload.name };
     next();

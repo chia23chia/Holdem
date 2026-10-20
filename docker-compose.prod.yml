@@ -36,7 +36,7 @@ services:
       SERVER_PORT: 3001
       DATABASE_URL: postgresql://holdem:${POSTGRES_PASSWORD}@postgres:5432/holdem
       CORS_ORIGIN: https://alan-holdem.duckdns.org
-      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET}
+      SOCKET_JWT_SECRET: ${SOCKET_JWT_SECRET}
       GOOGLE_SHEETS_SA_KEY: ${GOOGLE_SHEETS_SA_KEY}
       GOOGLE_SHEETS_SPREADSHEET_ID: ${GOOGLE_SHEETS_SPREADSHEET_ID}
       DEV_USER_ID: ${DEV_USER_ID}
@@ -59,6 +59,7 @@ services:
       DATABASE_URL: postgresql://holdem:${POSTGRES_PASSWORD}@postgres:5432/holdem
       NEXTAUTH_URL: https://alan-holdem.duckdns.org
       NEXTAUTH_SECRET: ${NEXTAUTH_SECRET}
+      SOCKET_JWT_SECRET: ${SOCKET_JWT_SECRET}
       GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
       GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET}
       NEXT_PUBLIC_SOCKET_URL: https://alan-holdem.duckdns.org

@@ -16,6 +16,17 @@ export async function GET(
   }
 
   const roomId = params.id;
+
+  // Only room members can read hand history (prevents hole-card IDOR via
+  // guessed/scraped roomIds — showdown.revealedHoles would otherwise leak).
+  const membership = await prisma.membership.findFirst({
+    where: { roomId, userId: session.user.id },
+    select: { id: true },
+  });
+  if (!membership) {
+    return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
+  }
+
   const rows = await prisma.handLog.findMany({
     where: { roomId },
     orderBy: { handNumber: 'desc' },

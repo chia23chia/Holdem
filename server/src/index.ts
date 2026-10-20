@@ -878,6 +878,9 @@ async function scanExpiredSessions() {
       cancelAutoAction(roomId);
       clearRoomState(roomId);
       lastHandLogIdByRoom.delete(roomId);
+      pendingRebuysByRoom.delete(roomId);
+      idleStreakByRoom.delete(roomId);
+      pendingForcedStandupByRoom.delete(roomId);
       await deleteHandLogsForRoom(roomId);
       io.to(roomChannel(roomId)).emit('room:closed', {
         roomId,

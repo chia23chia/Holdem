@@ -104,7 +104,7 @@ shared ──(無依賴)
 | 層 | 選型 | 備註 |
 |---|---|---|
 | 前端 | Next.js 14 (App Router) + React 18 + Tailwind 3 | lobby / room 都是 Client Component |
-| 後端 | Node.js + Socket.IO 4(long-lived process) | **不是 serverless** — Auth.js JWT 跨 process 靠 `NEXTAUTH_SECRET` 一致 |
+| 後端 | Node.js + Socket.IO 4(long-lived process) | **不是 serverless** — Socket 握手 JWT 跨 process 靠 `SOCKET_JWT_SECRET` 一致 |
 | DB | PostgreSQL 16 | Dev:Neon(雲端)透過 `DATABASE_URL`;或本機 Docker `docker-compose up postgres` |
 | ORM | Prisma 5.22 | 用 `db push` 流程(無 migrations 目錄);schema 是唯一真相 |
 | 認證 | Auth.js v5(beta.22)+ Google provider | JWT session、Prisma adapter |
@@ -131,7 +131,7 @@ Browser ─┬─ HTTP  ────────────► web (Next.js) :3
 
 - Web(`:3000`)負責 OAuth、session cookie、所有 `/api/*`
 - Server(`:3001`)接受 WebSocket 握手,browser 從 `GET /api/socket-token` 拿短效 JWT
-- 兩個 process 共用 `NEXTAUTH_SECRET`,所以 JWT 能跨 process 簽/驗
+- 兩個 process 共用 `SOCKET_JWT_SECRET`,所以握手 JWT 能跨 process 簽/驗(與 `NEXTAUTH_SECRET` 刻意分開,避免單一密鑰洩漏同時攻破兩個通道)
 - 兩個 process 共用 `DATABASE_URL`(web REST 寫入 + server socket 事件寫入都到同一個 DB)
 
 ---
@@ -253,11 +253,11 @@ Browser(lobby / room 頁):
   1. connectSocket() 呼叫 GET /api/socket-token
   2. web/app/api/socket-token/route.ts:
       - await auth() → session.user.{id,name}(name 是最新 nickname,經 jwt callback DB 讀)
-      - jwt.sign({ sub: id, name }, NEXTAUTH_SECRET, { expiresIn: '5m' })
+      - jwt.sign({ sub: id, name }, SOCKET_JWT_SECRET, { algorithm: 'HS256', expiresIn: '5m' })
       - return { token }
   3. io(SOCKET_URL, { auth: { token } })
 Server(server/src/auth.ts authMiddleware):
-  4. jwt.verify(token, NEXTAUTH_SECRET) → SocketTokenPayload
+  4. jwt.verify(token, SOCKET_JWT_SECRET, { algorithms: ['HS256'] }) → SocketTokenPayload
   5. socket.data.user = { userId: payload.sub, name: payload.name }
   6. 所有後續 event handler 從 socket.data.user 拿身份
 ```
@@ -776,7 +776,8 @@ FOLD / ALL-IN 本來就有靠 `status` 算出來的持久標籤(不受這輪動�
 | 變數 | 用途 |
 |---|---|
 | `NEXTAUTH_URL` | dev 是 `http://localhost:3000` |
-| `NEXTAUTH_SECRET` | 同時簽 Auth.js session JWT 與 socket 握手 JWT — **必須跟 server/.env 一致** |
+| `NEXTAUTH_SECRET` | Auth.js session JWT 簽章用(web 本地);**不再與 server 共用** |
+| `SOCKET_JWT_SECRET` | 簽 Socket.IO 握手 JWT — **必須跟 server/.env 一致**;刻意與 NEXTAUTH_SECRET 分開 |
 | `GOOGLE_CLIENT_ID` | Google Cloud Console OAuth client |
 | `GOOGLE_CLIENT_SECRET` | Google Cloud Console OAuth client |
 | `NEXT_PUBLIC_SOCKET_URL` | Socket.IO endpoint,browser 端要看到(dev:`http://localhost:3001`) |
@@ -789,7 +790,7 @@ FOLD / ALL-IN 本來就有靠 `status` 算出來的持久標籤(不受這輪動�
 | `SERVER_PORT` | Socket.IO server port(預設 3001) |
 | `DATABASE_URL` | 跟 web 同一個 DB |
 | `CORS_ORIGIN` | 允許的 browser origin(預設 `http://localhost:3000`) |
-| `NEXTAUTH_SECRET` | 要跟 web 一致 — server 用它驗握手 JWT |
+| `SOCKET_JWT_SECRET` | 要跟 web 一致 — server 用它驗 Socket 握手 JWT(pin HS256) |
 | `GOOGLE_SHEETS_SA_KEY` | 選填,見 §11.19。Service account JSON 金鑰整份 base64 編碼成一行 |
 | `GOOGLE_SHEETS_SPREADSHEET_ID` | 選填,見 §11.19。留空則整個 Sheets 同步功能自動關閉 |
 
