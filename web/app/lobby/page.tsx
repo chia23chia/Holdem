@@ -471,6 +471,8 @@ function Field({
       <span className="text-slate-300">{label}</span>
       <input
         type="number"
+        inputMode="numeric"
+        pattern="[0-9]*"
         className="rounded border border-slate-700 bg-slate-950 px-3 py-2"
         value={value}
         onChange={(e) => onChange(Number(e.target.value))}

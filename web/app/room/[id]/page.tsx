@@ -1228,6 +1228,8 @@ export default function RoomPage() {
                   onChange={(e) => setInput(e.target.value)}
                   placeholder="輸入訊息"
                   maxLength={500}
+                  autoComplete="off"
+                  enterKeyHint="send"
                 />
                 <button
                   type="submit"
@@ -1372,6 +1374,8 @@ export default function RoomPage() {
                     onChange={(e) => setInput(e.target.value)}
                     placeholder="輸入訊息"
                     maxLength={500}
+                    autoComplete="off"
+                    enterKeyHint="send"
                   />
                   <button
                     type="submit"
@@ -2225,6 +2229,8 @@ function RaiseModal({
         </div>
         <input
           type="number"
+          inputMode="numeric"
+          pattern="[0-9]*"
           autoFocus
           className="mb-1 w-full rounded border border-slate-700 bg-slate-950 px-3 py-2 text-lg"
           value={raiseInput}
@@ -2304,6 +2310,8 @@ function RebuyModal({
         </div>
         <input
           type="number"
+          inputMode="numeric"
+          pattern="[0-9]*"
           autoFocus
           step={500}
           min={500}
