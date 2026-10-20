@@ -5,7 +5,7 @@
 // regression would quietly make a player feel cheated. endWithShowdown
 // integration coverage is deferred (needs real card fixtures + pokersolver).
 import { describe, expect, it } from 'vitest';
-import { blindsForLevel } from '@holdem/shared';
+import { blindsForLevel, computeSidePots } from '@holdem/shared';
 import { buildSidePots, type Player } from './hands.js';
 import type { Card } from '@holdem/shared';
 
@@ -138,5 +138,55 @@ describe('blindsForLevel', () => {
     // Even if base inputs would mathematically give SB < 5, output clamps.
     const { smallBlind } = blindsForLevel(5, 10, 10);
     expect(smallBlind).toBeGreaterThanOrEqual(5);
+  });
+});
+
+// computeSidePots is the client-facing version used by SidePotsPanel.
+// Mirrors the server's buildSidePots math but returns names + userIds so
+// the UI can label "可爭 Alice、Bob". These tests focus on the shape; the
+// algorithm itself is covered by the buildSidePots cases above.
+describe('computeSidePots (shared)', () => {
+  it('returns no layers when no one contributed', () => {
+    expect(
+      computeSidePots([
+        { userId: 'a', name: 'Alice', totalBet: 0, status: 'active' },
+      ]),
+    ).toEqual([]);
+  });
+
+  it('includes eligible player names + ids on the single-pot showdown case', () => {
+    const layers = computeSidePots([
+      { userId: 'a', name: 'Alice', totalBet: 100, status: 'active' },
+      { userId: 'b', name: 'Bob', totalBet: 100, status: 'active' },
+    ]);
+    expect(layers).toHaveLength(1);
+    expect(layers[0].amount).toBe(200);
+    expect(layers[0].eligibleUserIds.sort()).toEqual(['a', 'b']);
+    expect(layers[0].eligibleNames.sort()).toEqual(['Alice', 'Bob']);
+  });
+
+  it('excludes folded players from eligibleNames even if they contributed', () => {
+    const layers = computeSidePots([
+      { userId: 'a', name: 'Alice', totalBet: 50, status: 'active' },
+      { userId: 'b', name: 'Bob', totalBet: 50, status: 'folded' },
+    ]);
+    expect(layers).toHaveLength(1);
+    expect(layers[0].amount).toBe(100);
+    expect(layers[0].eligibleNames).toEqual(['Alice']);
+    expect(layers[0].eligibleUserIds).toEqual(['a']);
+  });
+
+  it('short-stack all-in creates a second layer the short stack cannot win', () => {
+    const layers = computeSidePots([
+      { userId: 'short', name: 'Short', totalBet: 50, status: 'all-in' },
+      { userId: 'deep', name: 'Deep', totalBet: 150, status: 'active' },
+      { userId: 'other', name: 'Other', totalBet: 150, status: 'active' },
+    ]);
+    expect(layers).toHaveLength(2);
+    expect(layers[0].amount).toBe(150);
+    expect(layers[0].eligibleNames.sort()).toEqual(['Deep', 'Other', 'Short']);
+    expect(layers[1].amount).toBe(200);
+    expect(layers[1].eligibleNames.sort()).toEqual(['Deep', 'Other']);
+    expect(layers[1].eligibleNames).not.toContain('Short');
   });
 });

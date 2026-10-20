@@ -186,6 +186,46 @@ export type GameActionResult =
   | { ok: true }
   | { ok: false; error: string };
 
+// Side-pot layer breakdown — a layered view of the pot that mirrors the
+// server-side buildSidePots in hands.ts. Pure function so the client can
+// compute it from HandPlayerPublic for the UI without a round-trip. Used by
+// SidePotsPanel on the client (R-1b in docs/AUDIT_2026-10-20.md).
+export interface PotLayerPublic {
+  amount: number;
+  eligibleUserIds: string[];
+  eligibleNames: string[];
+}
+
+export function computeSidePots(
+  players: Array<{
+    userId: string;
+    name: string;
+    totalBet: number;
+    status: 'active' | 'folded' | 'all-in';
+  }>,
+): PotLayerPublic[] {
+  const contributors = players.filter((p) => p.totalBet > 0);
+  const levels = [...new Set(contributors.map((p) => p.totalBet))].sort(
+    (a, b) => a - b,
+  );
+  const layers: PotLayerPublic[] = [];
+  let prevLevel = 0;
+  for (const level of levels) {
+    const atOrAbove = contributors.filter((p) => p.totalBet >= level);
+    const amount = (level - prevLevel) * atOrAbove.length;
+    if (amount > 0) {
+      const eligible = atOrAbove.filter((p) => p.status !== 'folded');
+      layers.push({
+        amount,
+        eligibleUserIds: eligible.map((p) => p.userId),
+        eligibleNames: eligible.map((p) => p.name),
+      });
+    }
+    prevLevel = level;
+  }
+  return layers;
+}
+
 // ============================================================
 // Room / Membership (Phase 1)
 // Mirrors DB shape but plain-JSON for wire transmission.
