@@ -975,7 +975,18 @@ export default function RoomPage() {
               className="relative mx-auto w-full"
               style={{ maxWidth: 500, aspectRatio: '3 / 2' }}
             >
-              <div className="absolute inset-[8%] rounded-[50%] border-4 border-emerald-800 bg-emerald-950/50" />
+              {/* Poker felt (U-2 C1): radial green gradient + warm-wood rail
+                  + inset shadows to feel like a real table rather than a
+                  tinted rectangle. Rail border is thicker + rail color. */}
+              <div
+                className="absolute inset-[6%] rounded-[50%] border-[6px] border-rail"
+                style={{
+                  backgroundImage:
+                    'radial-gradient(ellipse at center, #1E6B4F 0%, #0F4A36 70%, #0A3326 100%)',
+                  boxShadow:
+                    'inset 0 0 40px rgba(0,0,0,0.6), inset 0 0 120px rgba(0,0,0,0.4)',
+                }}
+              />
 
               {/* Center: community + pot, or resting label */}
               <div className="absolute left-1/2 top-1/2 flex -translate-x-1/2 -translate-y-1/2 flex-col items-center gap-1">
@@ -1826,7 +1837,7 @@ function InlineCard({ card }: { card: Card }) {
   const fourColor = useContext(FourColorContext);
   return (
     <span
-      className={`inline-block rounded border border-slate-500 bg-slate-100 px-1 text-[10px] font-bold leading-tight ${suitColorClass(
+      className={`inline-block rounded border border-slate-300 bg-gradient-to-b from-white to-slate-200 px-1 text-[10px] font-bold leading-tight shadow-[0_1px_1px_rgba(0,0,0,0.3)] ring-1 ring-black/10 ${suitColorClass(
         card.suit,
         fourColor,
       )}`}
@@ -1898,9 +1909,12 @@ function CardView({ card, size = 'md' }: { card: Card; size?: 'sm' | 'md' }) {
     size === 'sm'
       ? 'h-9 w-7 text-xs sm:h-10 sm:w-8 sm:text-sm'
       : 'h-14 w-10 text-lg';
+  // U-2 C3: card paper treatment — subtle gradient + inset highlight + drop
+  // shadow + hairline ring so cards look like physical paper on the felt
+  // rather than inline table cells. 4-color suit coloring preserved.
   return (
     <span
-      className={`inline-flex items-center justify-center rounded border border-slate-500 bg-slate-100 font-bold ${sz} ${suitColorClass(
+      className={`inline-flex items-center justify-center rounded-md border border-slate-300 bg-gradient-to-b from-white to-slate-200 font-bold shadow-[0_1px_2px_rgba(0,0,0,0.5),inset_0_1px_0_rgba(255,255,255,0.9)] ring-1 ring-black/10 ${sz} ${suitColorClass(
         card.suit,
         fourColor,
       )}`}
