@@ -10,11 +10,20 @@
 
 ```
 Holdem/
-├── web/                # Next.js 14 前端(App Router)
-├── server/             # Node.js Socket.IO 遊戲後端
-├── shared/             # 共享 TypeScript 型別(Card / Player / Socket events)
-├── docker-compose.yml  # 開發時起 PostgreSQL
-└── package.json        # pnpm workspace 根
+├── web/                     # Next.js 14 前端(App Router)
+│   ├── app/room/[id]/
+│   │   ├── _components/     # 牌桌 / 座位 / ActionBar 等拆分元件
+│   │   ├── _hooks/          # usePokerState 等
+│   │   └── _lib/            # 純函式、FourColorContext
+│   └── components/ui/       # 共用 Button / Panel / Modal design system
+├── server/                  # Node.js Socket.IO 遊戲後端(含 vitest)
+├── shared/                  # 共享 TypeScript 型別 + pure fn(computeSidePots 等)
+├── db/prisma/
+│   ├── schema.prisma
+│   └── migrations/          # Prisma migrate 檔(非 db push)
+├── docs/                    # 稽核報告等過程文件
+├── docker-compose.yml       # 開發時起 PostgreSQL
+└── package.json             # pnpm workspace 根
 ```
 
 ## 技術棧
@@ -72,6 +81,7 @@ pnpm dev
 | `pnpm db:down` | 停 PostgreSQL(資料保留在 volume) |
 | `pnpm db:logs` | 看 PostgreSQL log |
 | `pnpm typecheck` | 全 workspace TypeScript 檢查 |
+| `pnpm --filter server test` | 跑 server workspace 的 vitest(side-pot / blind-escalation 等 pure fn 測試) |
 
 ## 開發階段
 
@@ -85,3 +95,5 @@ pnpm dev
 ## 部署
 
 已上線於 Oracle Cloud Always Free ARM A1.Flex,Docker Compose + Caddy(HTTPS)。詳細步驟見 [DEPLOY.md](DEPLOY.md);接手者快照見 [ARCHITECTURE.zh-TW.md 的「Handoff 快照」章節](ARCHITECTURE.zh-TW.md)。
+
+**重要**:schema 變動不再走 `prisma db push`,改用 `prisma migrate deploy`(2026-10-20 起)。改 `db/prisma/schema.prisma` 時要用 `prisma migrate dev --name xxx` 產出 migration 檔並 commit —— 詳 [DEPLOY.md §6.1](DEPLOY.md)。

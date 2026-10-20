@@ -2,6 +2,86 @@
 
 所有值得記錄的變動都記在這裡,新的在最上面。日期是 commit 當天(UTC+8),不是嚴格的版本號。
 
+## 2026-10-20
+
+這一天量非常大(18 commits,跨安全 / 體質 / UI / 重構 / 資料庫),分區標題跟 2026-07-28 一致。全部純技術打磨 + 修 audit 發現的洞,無新遊戲功能。完整審查報告見 [`docs/AUDIT_2026-10-20.md`](docs/AUDIT_2026-10-20.md)。
+
+### 安全性(F batch,3 批)
+
+- **底牌 IDOR**(`c2b7891` C1):`/api/rooms/:id/hands` 加 `Membership` 檢查,之前任何登入者只要知道 `roomId` 就能看別房 showdown 底牌 + 完整下注紀錄 —— 現在非該房成員回 403。
+- **Socket JWT 拆成獨立 secret**(`c2b7891` C4):`NEXTAUTH_SECRET` 原本同時簽 Auth.js session + Socket.IO 握手,拆成獨立的 `SOCKET_JWT_SECRET`,`jwt.verify` 也 pin `algorithms: ['HS256']` 擋 algorithm-confusion。
+- **Google Sheets formula injection**(`c2b7891` L6):暱稱設 `=IMPORTRANGE(...)` 類公式,sync 到 roster 時原本會變成活公式竊取整張表(因為用 `valueInputOption: 'USER_ENTERED'`),加 `sanitizeSheetCell` 偵測 `=/+/-/@` 開頭 prefix `'` 強制當 literal。
+- **`scanExpiredSessions` Map leak**(`c2b7891` R2 bug):4 處 room teardown 應該清 7 個 per-room Map,`scanExpiredSessions` 漏掉 3 個(`pendingRebuysByRoom` / `idleStreakByRoom` / `pendingForcedStandupByRoom`)—— session 過期的房 Map entry 永久 leak。補齊。
+- **Rate limits**(`b4caf73` C2/C3):`/api/rooms` POST per-user 30 秒 cooldown;Socket `chat:send` / `game:action` / `game:time-bank` / `room:rebuy` / `room:join` 都加 token-bucket rate limit。
+- **`game:end` 中途砍手阻擋**(`b4caf73` H3):房主在手牌進行中按結束 → committed bets 跟著 `hands.delete(roomId)` 被砍、不入 ledger(可能被用來免費洗手)。現在擋 `hasActiveHand`,訊息「目前有牌進行中,等本手結束再試」。
+- **Caddy security headers**(`b4caf73` M1):HSTS / X-Frame-Options:DENY / X-Content-Type-Options / Referrer-Policy。
+- **`sheetsSync` mutex + fetch timeout**(`b4caf73` R3):兩房 30s 內關閉會 race,`getRoster` 兩邊都讀到 N 然後都分 slot N+1 給不同新 user,其中一人變 orphan 把 month tab 弄壞。加 per-spreadsheet Promise queue + 每個 fetch `AbortSignal.timeout(10_000)`。
+- **Socket zod schema**(`b6864c6` M2):5 個高風險事件(`game:action` / `room:rebuy` / `chat:send` / `sticker:send` / `room:join`)入口 `safeParse`,discriminated union 幹掉 NaN / Infinity / float / negative raise amount 在 boundary 層。
+- **Socket token TTL** 從 5 分鐘縮到 60 秒(`b6864c6` H2);**pokersolver 鎖版** `^2.1.4` → `2.1.4`(M8);**jwt error 訊息 generic 化** 不洩庫 internals(L1);**sticker cooldown 改成 per-(user, room)**(M3)。
+- **跳過 H1** Google OAuth `email_verified` check —— 10 人朋友圈 threat model 不需要擋 stranger preregistration takeover(audit doc 已標 skipped)。
+
+### 程式體質(A batch,3 批)
+
+- **A-1 refactor**(`0724d4f`,純結構無行為變化):
+  - 抽 `dealNextStreet()` 消除 `advancePhase` 和 `maybeAdvanceIfNoAction` 兩份一樣的 phase table + reveal + history-push。
+  - 5 個 per-room transient Map(autoActionTimer / lastHandLogId / pendingRebuys / idleStreak / pendingForcedStandup)收攏成 `RoomRuntimeState`,`disposeRoomState(roomId)` 取代原本 5 行 teardown。
+  - 拆 `broadcastAfterAction` 165 行 God-function 成 `handleHandEnded` + `teardownRoom` + 剩下的 orchestration。teardown 三處(`finalizeRoomState` empty / `room:close` / `scanExpiredSessions`)共用 `teardownRoom`。
+- **A-2 TS tightening + simplify**(`dccbea1`):
+  - `isHandLogData()` 結構驗證,HandLog.data 3 處 cast site 替換 —— 歷史資料跟 shared type 不符的 row 用 warn log 跳過不交給 render。
+  - `persistHandResult` `updateMany` → `update` 走 composite key,membership 消失(tournament bust mid-hand)不再 silently `count:0`。
+  - `applyAction` raise 加 `Number.isInteger` boundary check。
+  - `StartHandOutcome` 錯誤分支改成 discriminated union(`kind: 'not-found' | 'already-in-progress' | 'session-expired' | 'too-few' | 'needs-rebuy'`),加新錯誤 compiler 會逼人處理。
+  - S1 刪 `endHand`(跟 `clearRoomState` 重複);S4 preflop `evalHandRank` 回 `''`(2 張牌寫 "Pair"/"High Card" 無資訊);S2 inline `isEnded` **嘗試後 reverted**(TS narrowing 擋,wrapper 存在就是為了這個)。
+- **A-3 defensive**(`6708d88`):
+  - Vitest 進 server workspace,`hands.test.ts` 覆蓋 `buildSidePots`(6 case)+ `blindsForLevel`(4 case),10/10 pass。
+  - Pino structured logger `server/src/logger.ts`,server 內 27 處 `console.*` 轉成帶 `roomId` / `userId` / `handNumber` / `err` 的 JSON log。線上 docker log 可以 `grep` 特定房的事件。
+
+### UI 美感 + a11y(U batch,4 批)
+
+- **U-1 palette tokens + a11y quick wins**(`dd8cbcc`):`tailwind.config.ts` 加 6 色 token(felt / rail / bg / surface / bone / brass),鋪 U-2 的視覺大改。6 個金額 input 加 `inputMode="numeric"` 強制手機叫數字鍵盤;chat input 加 `enterKeyHint="send"`;全站 `focus-visible` 金色 outline;iOS Safari 聚焦 input 自動放大問題用全域 `input { font-size: 16px }` 擋掉。
+- **U-2 視覺 Top 3**(`7be9cd0`):牌氈改用徑向綠漸層 + 暖木紋邊 + 內陰影;body 從 slate-950 的 "Vercel 預設黑" 改成 `#0F1613` 暖色深 + bone 文字減螢幕眩光;卡牌 CardView + InlineCard 加紙質漸層 + 內高光 + 掉落陰影,看起來像物理牌不是 inline table cell。
+- **U-3 modal `<form>` + Esc + 熱鍵**(`44e04bc`):`useEscape` shared hook,8 個 modal 都加;RaiseModal / RebuyModal 包 `<form>` 讓 Enter 提交;8 個 modal 加 `role="dialog"` + `aria-modal` + `aria-labelledby`;ActionBar 內鍵盤 F / C / R 熱鍵(自己回合時觸發,聊天輸入焦點時停用),按鈕右邊有 `KbdHint` 小徽章(桌面才顯示)。
+- **U-4 polish**(`aa744ee`):底池改大金字 + 底下「底池」小字 tracked-widest;座位籌碼改金色 tabular-nums + `.toLocaleString()`;Fold / Call / Raise 重分權重(ghost / felt / brass hero)+ 48px thumb target;翻前 3 張紅色對角線條紋牌背佔位;CardView 300ms flip-in 動畫 + `prefers-reduced-motion` honor;4 處 panel 統一 `rounded-lg border-amber-900/30 bg-surface/60`;延時按鈕 purple → brass + rail palette;lobby 錦標賽房左側 `border-l-4 border-brass` 金條。
+
+### 大重構(R batch,3 批 + 2 features)
+
+- **R-1 新 feature + safety**(`ce31712`):
+  - `TurnIndicator` 牌桌上方浮條顯示「輪到 Alan · 25s」/「輪到你 · 25s」,倒數 ≤5 秒變紅,`aria-live="polite"`。
+  - `SidePotsPanel` 當側池 ≥2 層才出現,列「主池 $N 可爭 Alice、Bob」/「邊池1 $N 可爭 Alice」—— 不再有「我 all-in 怎麼只拿到部分 pot」的疑問。
+  - `ErrorBoundary` 包牌桌主區塊,子組件 throw 時顯示「畫面載入出錯」+ 重試 / 重載按鈕,header + chat FAB 不受影響。
+  - `computeSidePots` 進 `@holdem/shared`(搭配 R-1b 需要在 client 算),server 現有 vitest 加 4 個 test case,總計 14/14 pass。
+- **R-2 Design system**(`c4b5cd5`):`web/components/ui/{Button, Panel, Modal}.tsx`。Button 4 variants(primary / secondary / ghost / danger)× 2 sizes;Panel 一致的鍍金邊暖面;Modal 內建 useEscape + role=dialog + useId 的 aria-labelledby。Lobby 的 header / room list / NicknameModal / CreateRoomModal 都轉用。
+- **R-3a file split**(`6427914`,純搬動 811 行 code 無行為變化):`room/[id]/page.tsx` 從 3100 行縮到 2300 行,抽出:
+  - `_lib/FourColorContext.ts` + `_lib/utils.ts`(10 個 pure fn + 2 shared type)
+  - `_components/CardView.tsx`(CardView + InlineCard + suitColorClass)
+  - `_components/SeatCard.tsx`
+  - `_components/ActionBar.tsx`(ActionBar + RaiseModal + KbdHint)
+  - `_components/RebuyModal.tsx`
+  - `_components/TableOverlays.tsx`(TurnIndicator + SidePotsPanel)
+- **R-3b state refactor + 效能**(`fd10d71`):
+  - `_hooks/usePokerState.ts` `useReducer` 收攏 4 個耦合 state(gameState / holeCards / handRank / displayedCommunity)+ 5 個 action type。Socket event handler 從 7 行 `setX` 變 1 行 `dispatchPoker`。
+  - `React.memo` on `SeatCard` —— 一個 `game:state` 不再 re-render 全部 10 張座位卡(audit P1)。
+  - `useMemo` for `computeRingPositionsPercent(room.maxPlayers)` 避免每次 game:state tick 重算 10 個三角函數。
+  - `useMemo` for `visibleMessages` —— 聊天 filter 不再每 render 跑兩遍(desktop + mobile)(audit P2)。
+
+### 資料庫(E batch,4 批)
+
+- **E-1 刪 HandLog 多餘 index**(`418d68b`):`@@unique([roomId, handNumber])` 已經是複合 index,再加 `@@index` 多此一舉。
+- **E-2 (option A) `User.chipsBalance` 重分類為 reserved**(`48c9b46`):Pre-drop snapshot 發現 3 位用戶的值不是 default 10000(10228 / 8772 / 11000)—— 歷史上被寫過;且 `ARCHITECTURE.zh-TW.md §11.19` 明確保留此欄位給未來跨房 chip tracking。改成 schema 註解標 "reserved",audit M4 reclassified。
+- **E-3 文件化 index + retention**(`418d68b`):`ARCHITECTURE.zh-TW.md §5.4` 寫清楚 unique = index、HandLog 在 room close 時由 `deleteHandLogsForRoom` 刪(無額外 TTL)。
+- **E-4b `prisma db push` → `prisma migrate deploy`**(`1bc5990 + 674dde4`):
+  - 原本 Dockerfile 的 `prisma db push --accept-data-loss` 遇到 schema 不一致會**靜默丟資料**(典型場景:schema.prisma typo 看起來像 column rename → prod 整欄資料瞬間消失)。
+  - 從現有 schema 產出 `db/prisma/migrations/0_initial/migration.sql` baseline(150 行 SQL),Dockerfile CMD 改成 `prisma migrate deploy`。
+  - Prod 用 `prisma migrate resolve --applied 0_initial` 標記 baseline 已套用 —— 之後 server 重啟看到 `No pending migrations to apply` 直接 boot。
+  - DEPLOY.md §6.1 新增 schema-changes workflow 章節:改 schema 要 `prisma migrate dev --name xxx` 產 migration 檔,commit 連 schema + migration 一起,rebuild 時 server 自動套用,失敗則**不開機**(loud 不 silent)。
+
+### 其他
+
+- **稽核報告**:[`docs/AUDIT_2026-10-20.md`](docs/AUDIT_2026-10-20.md) 這天的所有 fix 都對應到裡面的 ID。
+- **測試覆蓋**:server workspace 現有 14 個 vitest case 保護 `buildSidePots` + `blindsForLevel` + `computeSidePots`。CI 還沒接 —— 下次改 `hands.ts` 時 `pnpm test` 要手動跑。
+- **ARCHITECTURE.zh-TW.md** 這天跟著更新了 §3 技術棧、§5.4 HandLog index + retention、§12 環境變數(拆出 `SOCKET_JWT_SECRET`)、Socket 握手序列。
+- **延後決定** / 保留的小項目:中文 UI「習禁屏」字詞是否 typo、Fold / Raise / Call 按鈕順序是否要重排、next/font 載入 Noto Sans TC + Inter、SettlementModal 大贏/大輸 highlight、client 端 React vitest。
+
 ## 2026-08-08
 
 - **個人屏蔽**:在聊天訊息**點名字**可以屏蔽該玩家 —— 純個人化,只影響自己畫面(對方不知道也沒被禁言,只是我看不到)。涵蓋:聊天訊息、跑馬燈、貼圖(貼圖飛過螢幕都不會出現)。聊天欄下方會顯示「已屏蔽 N 人 [管理]」,點「管理」可以解除。屏蔽紀錄存 localStorage,清 cookies / 換裝置會消失(不 sync)。細節見 §11.31。
