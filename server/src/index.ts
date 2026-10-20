@@ -129,6 +129,32 @@ const lastHandLogIdByRoom = new Map<string, string>();
 const STICKER_COOLDOWN_MS = 3_000;
 const stickerLastSentByUser = new Map<string, number>();
 
+// Per-user, per-event rate limit (A-C3). Prevents chat/action spam from a
+// scripted client. Friends-only scale so a plain Map is fine. Buckets expire
+// naturally via resetAt comparison; no eviction loop needed.
+interface RateBucket {
+  count: number;
+  resetAt: number;
+}
+const rateBuckets = new Map<string, RateBucket>();
+function allowEvent(
+  userId: string,
+  event: string,
+  limit: number,
+  windowMs: number,
+): boolean {
+  const key = `${userId}:${event}`;
+  const now = Date.now();
+  const bucket = rateBuckets.get(key);
+  if (!bucket || now >= bucket.resetAt) {
+    rateBuckets.set(key, { count: 1, resetAt: now + windowMs });
+    return true;
+  }
+  if (bucket.count >= limit) return false;
+  bucket.count += 1;
+  return true;
+}
+
 // Rebuy queue: mid-hand rebuy requests wait here. Applied to Membership
 // after the hand ends, before the next one starts. Value = the requested
 // amount (re-validated against the zero-chips + chip-leader-cap rule in
@@ -604,6 +630,9 @@ io.on('connection', (socket) => {
 
   // ---- Rooms ----
   socket.on('room:join', async ({ roomId, seat }, cb) => {
+    if (!allowEvent(user.userId, 'room:join', 5, 10_000)) {
+      return cb({ ok: false, error: '操作太頻繁,請稍候' });
+    }
     const outcome = await seatUser(user.userId, roomId, seat);
     if (!outcome.ok) {
       cb({ ok: false, error: outcome.error });
@@ -703,6 +732,9 @@ io.on('connection', (socket) => {
   // exact rule). Mid-hand → queued for hand end. Between-hand → applied
   // immediately.
   socket.on('room:rebuy', async ({ roomId, amount }, cb) => {
+    if (!allowEvent(user.userId, 'room:rebuy', 3, 10_000)) {
+      return cb({ ok: false, error: '操作太頻繁,請稍候' });
+    }
     const roomType = await getRoomType(roomId);
     if (roomType === 'tournament') {
       return cb({ ok: false, error: '錦標賽模式沒有加碼,籌碼歸零即淘汰' });
@@ -749,6 +781,12 @@ io.on('connection', (socket) => {
     if (detail.ownerId !== user.userId) {
       return cb({ ok: false, error: '只有房主可以結束牌局' });
     }
+    // Block mid-hand abort — committed bets would be deleted with the hand
+    // state and never persisted (A-H3). Owner can still close the room after
+    // the current hand reaches ended.
+    if (hasActiveHand(roomId)) {
+      return cb({ ok: false, error: '目前有牌進行中,等本手結束再試' });
+    }
     cancelAutoAction(roomId);
     endHand(roomId);
     await setRoomStatus(roomId, 'waiting');
@@ -758,6 +796,9 @@ io.on('connection', (socket) => {
   });
 
   socket.on('game:action', async ({ roomId, action }, cb) => {
+    if (!allowEvent(user.userId, 'game:action', 5, 10_000)) {
+      return cb({ ok: false, error: '操作太頻繁,請稍候' });
+    }
     const handBefore = getHand(roomId);
     const phaseBefore = handBefore?.phase;
     const historyLenBefore = handBefore?.history.length ?? 0;
@@ -778,6 +819,9 @@ io.on('connection', (socket) => {
   });
 
   socket.on('game:time-bank', async ({ roomId }, cb) => {
+    if (!allowEvent(user.userId, 'game:time-bank', 2, 10_000)) {
+      return cb({ ok: false, error: '操作太頻繁,請稍候' });
+    }
     const outcome = extendCurrentTurn(roomId, user.userId);
     if (!outcome.ok) return cb({ ok: false, error: outcome.error });
     cb({ ok: true });
@@ -836,6 +880,7 @@ io.on('connection', (socket) => {
 
   // ---- Chat ----
   socket.on('chat:send', ({ roomId, text }) => {
+    if (!allowEvent(user.userId, 'chat:send', 10, 10_000)) return;
     const clean = String(text ?? '').trim().slice(0, 500);
     if (!clean) return;
     const payload = {

@@ -6,6 +6,17 @@
 alan-holdem.duckdns.org {
   encode zstd gzip
 
+  # Security headers (A-M1 from docs/AUDIT_2026-10-20.md). CSP intentionally
+  # omitted — needs per-app tuning for Next.js inline scripts.
+  header {
+    Strict-Transport-Security "max-age=31536000; includeSubDomains"
+    X-Content-Type-Options "nosniff"
+    X-Frame-Options "DENY"
+    Referrer-Policy "strict-origin-when-cross-origin"
+    # Remove server-fingerprinting header.
+    -Server
+  }
+
   # Socket.IO endpoint (path preserved).
   reverse_proxy /socket.io/* server:3001
 

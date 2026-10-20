@@ -39,11 +39,29 @@ const VALID_SESSION_MINUTES = new Set([30, 60, 90, 120]);
 const VALID_ACTION_TIMEOUTS = new Set([15, 30, 60]);
 const VALID_BLIND_LEVEL_MINUTES = new Set([5, 10, 15, 20]);
 
+// Per-user cooldown for room creation (A-C2). Prevents unbounded DB growth
+// from a scripted client. Friends-only scale (~10 users) so a plain Map is
+// fine — no eviction needed. In-memory, resets on server restart.
+const ROOM_CREATE_COOLDOWN_MS = 30_000;
+const lastRoomCreateByUser = new Map<string, number>();
+
 // POST /api/rooms — create a new room (auth required).
 export async function POST(req: Request) {
   const session = await auth();
   if (!session?.user?.id) {
     return NextResponse.json({ error: 'Unauthenticated' }, { status: 401 });
+  }
+
+  const now = Date.now();
+  const lastAt = lastRoomCreateByUser.get(session.user.id);
+  if (lastAt !== undefined && now - lastAt < ROOM_CREATE_COOLDOWN_MS) {
+    const retryAfterSec = Math.ceil(
+      (ROOM_CREATE_COOLDOWN_MS - (now - lastAt)) / 1000,
+    );
+    return NextResponse.json(
+      { error: `建房太頻繁,請等 ${retryAfterSec} 秒再試` },
+      { status: 429, headers: { 'Retry-After': String(retryAfterSec) } },
+    );
   }
 
   let body: unknown;
@@ -132,5 +150,6 @@ export async function POST(req: Request) {
     },
   });
 
+  lastRoomCreateByUser.set(session.user.id, now);
   return NextResponse.json({ id: room.id }, { status: 201 });
 }

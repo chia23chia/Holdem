@@ -48,12 +48,15 @@ function getAuthClient(): JWT | null {
   return authClient;
 }
 
+const SHEETS_FETCH_TIMEOUT_MS = 10_000;
+
 async function sheetsRequest<T>(path: string, init?: RequestInit): Promise<T> {
   const client = getAuthClient();
   if (!client) throw new Error('Sheets sync not configured');
   const { token } = await client.getAccessToken();
   const res = await fetch(`${SHEETS_API}${path}`, {
     ...init,
+    signal: AbortSignal.timeout(SHEETS_FETCH_TIMEOUT_MS),
     headers: {
       ...(init?.headers ?? {}),
       Authorization: `Bearer ${token}`,
@@ -992,7 +995,24 @@ async function appendSessionEntries(
   await batchUpdateValues(spreadsheetId, data);
 }
 
-export async function syncSettlementToSheet(
+// Serializes concurrent settlement syncs to the same spreadsheet.
+// Without this, two rooms closing within the fetch window could both read the
+// same roster length N and assign slot N+1 to different users, orphaning one
+// (see B-R3 in docs/AUDIT_2026-10-20.md). Each sync waits for the previous
+// to settle; a previous failure does not block the next.
+let syncQueue: Promise<void> = Promise.resolve();
+
+export function syncSettlementToSheet(
+  summary: SettlementSummary,
+): Promise<void> {
+  const next = syncQueue
+    .catch(() => undefined)
+    .then(() => doSyncSettlementToSheet(summary));
+  syncQueue = next.catch(() => undefined);
+  return next;
+}
+
+async function doSyncSettlementToSheet(
   summary: SettlementSummary,
 ): Promise<void> {
   const spreadsheetId = process.env.GOOGLE_SHEETS_SPREADSHEET_ID;
